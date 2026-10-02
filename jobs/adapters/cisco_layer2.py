@@ -1,7 +1,7 @@
 """Configured 802.1Q facts from native RESTCONF JSON, with reviewed defaults.
 
 No operational VLAN membership is used to infer a port's configured mode,
-native VLAN, or allowed set. Only complete supported bundles are returned.
+native VLAN, or allowed set. Independent settings survive incomplete mappings.
 """
 
 import re
@@ -26,7 +26,7 @@ FAMILIES = (
 # scope. Augmentation-qualified child filters otherwise silently lose data.
 NATIVE_FIELDS = ";".join(family + "(name;switchport-conf;switchport-config)" for family in FAMILIES)
 VLAN_FIELDS = "vlan(id;name;status)"
-PROFILE = "c9300-48uxm-ordinary-switchport-defaults-v1"
+PROFILE = "c9300-48uxm-ordinary-switchport-defaults-v2"
 YANG_URL = (
     "https://raw.githubusercontent.com/YangModels/yang/main/"
     "vendor/cisco/xe/17131/Cisco-IOS-XE-switch.yang"
@@ -35,22 +35,30 @@ DOC_ROOT = (
     "https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/"
     "software/release/%s/command_reference/b_%s_9300_cr/"
 )
+CONFIG_DOC_ROOT = (
+    "https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/"
+    "software/release/%s/configuration_guide/int_hw/b_%s_int_and_hw_9300_cg/"
+)
 
 
 class Layer2DiscoveryError(ValueError):
     """Configured interface/VLAN facts are malformed or ambiguous."""
 
 
-def _value(mapping, name):
+def _value(mapping, name, namespace="Cisco-IOS-XE-switch"):
     if not isinstance(mapping, dict):
         return None
-    values = [v for k, v in mapping.items() if k.split(":")[-1] == name]
+    matches = [(key, value) for key, value in mapping.items() if key.split(":")[-1] == name]
+    if any(":" in key and key.split(":", 1)[0] != namespace for key, _ in matches):
+        raise Layer2DiscoveryError("Layer2 leaf belongs to an unexpected YANG module")
+    values = [value for _, value in matches]
     if len(values) > 1:
         raise Layer2DiscoveryError("Layer2 reply has duplicate namespace-qualified leaves")
     return values[0] if values else None
 
 
-def _has(mapping, name):
+def _has(mapping, name, namespace="Cisco-IOS-XE-switch"):
+    _value(mapping, name, namespace)
     return isinstance(mapping, dict) and any(k.split(":")[-1] == name for k in mapping)
 
 
@@ -118,16 +126,21 @@ def _profile(model, version):
     if model != "C9300-48UXM" or family not in ("17.9", "17.12"):
         return None
     doc_root = DOC_ROOT % (family.replace(".", "-"), family.replace(".", ""))
+    config_root = CONFIG_DOC_ROOT % (family.replace(".", "-"), family.replace(".", ""))
     return {
         "profile": PROFILE,
         "model": model,
         "software_family": family,
+        "configured_mode": "dynamic-auto",
+        "access_vid": 1,
         "native_vid": 1,
         "allowed_vlans": "all",
         "global_native_tagging": False,
         "documents": {
             "ordinary_trunk": doc_root + "vlan_commands.html",
             "global_native_tagging": doc_root + "vlan_commands.html",
+            "interface_defaults": config_root + "configuring_interface_characteristics.html",
+            "management_interface": config_root + "configuring_ethernet_management_port.html",
         },
         "meaning": "Documented defaults apply only after successful complete scoped config reads",
     }
@@ -144,18 +157,16 @@ def _global_tagging(payload, read_ok, profile, status):
     if payload is None:
         return None
     _object(payload, "Global VLAN reply")
-    container = _value(payload, "vlan")
+    container = _value(payload, "vlan", "Cisco-IOS-XE-native")
+    if _has(payload, "vlan", "Cisco-IOS-XE-native"):
+        _object(container, "Global VLAN configuration")
     if container is None:
         return None
     _object(container, "Global VLAN configuration")
-    dot1q = _value(container, "dot1q")
-    if dot1q is not None:
-        _object(dot1q, "Global dot1q configuration")
-    tag = _value(dot1q, "tag")
-    if tag is not None:
-        _object(tag, "Global native VLAN tagging")
-    if _has(tag, "native"):
-        _empty(_value(tag, "native"), "Global native tagging")
+    dot1q = _container(container, "dot1q", "Global dot1q configuration", "Cisco-IOS-XE-vlan")
+    tag = _container(dot1q, "tag", "Global native VLAN tagging", "Cisco-IOS-XE-vlan")
+    if _has(tag, "native", "Cisco-IOS-XE-vlan"):
+        _empty(_value(tag, "native", "Cisco-IOS-XE-vlan"), "Global native tagging")
         return True
     return False if profile else None
 
@@ -170,6 +181,8 @@ def _response_status(client, path):
 def _allowed(trunk, profile):
     allowed = _value(trunk, "allowed")
     if allowed is None:
+        if _has(trunk, "allowed"):
+            _object(allowed, "Allowed VLAN configuration")
         return ("all", None, "documented-default") if profile else (None, None, None)
     _object(allowed, "Allowed VLAN configuration")
     newer = _value(allowed, "vlan-v2")
@@ -186,7 +199,11 @@ def _allowed(trunk, profile):
     selected = [key for key in ("vlans", "all", "none") if _has(choices, key)]
     if len(selected) > 1:
         raise Layer2DiscoveryError("Allowed VLAN choices are ambiguous")
+    if selected and any(key.split(":")[-1] not in ("vlans", "all", "none") for key in choices):
+        raise Layer2DiscoveryError("Allowed VLAN choices include an unsupported competing selector")
     if not selected:
+        if choices:
+            return None, None, "Unsupported allowed VLAN choice requires review"
         return ("all", None, "documented-default") if profile else (None, None, None)
     key = selected[0]
     value = _value(choices, key)
@@ -201,6 +218,158 @@ def _allowed(trunk, profile):
     else:
         _empty(value, "Allowed VLAN all")
     return "all", None, "explicit-all"
+
+
+def _configured_mode(switchport, profile, physical):
+    mode = _value(switchport, "mode")
+    if mode is None:
+        if _has(switchport, "mode"):
+            _object(mode, "Switchport mode")
+        return (
+            (profile["configured_mode"], "documented-default")
+            if profile and physical
+            else (
+                None,
+                None,
+            )
+        )
+    _object(mode, "Switchport mode")
+    options = [
+        key
+        for key in ("access", "trunk", "dynamic", "private-vlan", "dot1q-tunnel")
+        if _has(mode, key)
+    ]
+    if len(options) > 1:
+        raise Layer2DiscoveryError("Switchport mode choices are ambiguous")
+    if options and any(
+        key.split(":")[-1] not in ("access", "trunk", "dynamic", "private-vlan", "dot1q-tunnel")
+        for key in mode
+    ):
+        raise Layer2DiscoveryError("Switchport mode includes an unsupported competing selector")
+    if not options:
+        # An unrecognized mode leaf is not evidence for an ordinary default.
+        if not mode and profile and physical:
+            return profile["configured_mode"], "documented-default"
+        return None, None
+    selected = options[0]
+    value = _value(mode, selected)
+    if selected == "dynamic":
+        if value not in ("auto", "desirable"):
+            raise Layer2DiscoveryError("Dynamic switchport mode must be auto or desirable")
+        return "dynamic-" + value, "explicit"
+    _object(value, "Switchport mode presence")
+    return selected, "explicit"
+
+
+def _container(parent, name, label, namespace="Cisco-IOS-XE-switch"):
+    value = _value(parent, name, namespace)
+    if _has(parent, name, namespace):
+        _object(value, label)
+    return value
+
+
+def _settings(switchport, profile, global_tagging, physical):
+    """Keep separate administrative facts, without inventing a forwarding mode."""
+    mode, mode_source = _configured_mode(switchport, profile, physical)
+    ordinary = mode in ("access", "trunk", "dynamic-auto", "dynamic-desirable", None)
+    ordinary = ordinary and not any(_has(switchport, key) for key in ("voice", "private-vlan"))
+    raw_mode = _value(switchport, "mode")
+    if raw_mode and mode is None:
+        ordinary = False
+    trunk = _container(switchport, "trunk", "Trunk configuration")
+    if _has(trunk, "encapsulation") and _value(trunk, "encapsulation") is None:
+        raise Layer2DiscoveryError("Trunk encapsulation must not be null when present")
+    ordinary = ordinary and _value(trunk, "encapsulation") in (None, "dot1q")
+    defaults = profile if ordinary else None
+    origins = {"configured_mode": mode_source} if mode_source else {}
+    access = _container(switchport, "access", "Access configuration")
+    access = _container(access, "vlan", "Access VLAN configuration")
+    raw_access = _value(access, "vlan")
+    access_vid = None
+    if _has(access, "vlan"):
+        if isinstance(raw_access, int) and not isinstance(raw_access, bool):
+            access_vid = _vid(raw_access)
+            origins["access_vid"] = "explicit"
+        elif raw_access != "dynamic":
+            raise Layer2DiscoveryError("Access VLAN must be a VLAN ID or dynamic selection")
+    elif defaults:
+        access_vid = defaults["access_vid"]
+        origins["access_vid"] = "documented-default"
+    native = _container(trunk, "native", "Native VLAN configuration")
+    native = _container(native, "vlan", "Native VLAN configuration")
+    native_vid = None
+    if _has(native, "vlan-id"):
+        native_vid = _vid(_value(native, "vlan-id"))
+        origins["native_vid"] = "explicit"
+    elif defaults:
+        native_vid = defaults["native_vid"]
+        origins["native_vid"] = "documented-default"
+    native_override = _value(native, "tag")
+    if _has(native, "tag") and not isinstance(native_override, bool):
+        raise Layer2DiscoveryError("Native VLAN tagging override must be boolean")
+    # Preserve an explicit override as evidence. Its interaction with the
+    # global command has not been reviewed, so effective tagging stays unknown.
+    native_tagging = global_tagging if native_override is None else None
+    if native_tagging is not None:
+        origins["native_tagging"] = "global-config"
+    allowed_mode, allowed_vids, allowed_source = _allowed(trunk, defaults)
+    if allowed_mode is not None:
+        origins["allowed_mode"] = allowed_source
+        if allowed_vids is not None:
+            origins["allowed_vids"] = allowed_source
+    allowed = _value(trunk, "allowed")
+    newer = _value(allowed, "vlan-v2")
+    choices = _value(newer, "vlan-choices") if newer is not None else _value(allowed, "vlan")
+    raw_allowed = {
+        key: _value(choices, key) for key in ("vlans", "all", "none") if _has(choices, key)
+    }
+    untagged = None
+    if ordinary and mode == "access":
+        untagged = access_vid
+        if untagged is not None:
+            origins["untagged_vid"] = "configured-access-vlan"
+    elif ordinary and mode == "trunk" and native_tagging is False:
+        untagged = native_vid
+        if untagged is not None:
+            origins["untagged_vid"] = "configured-native-vlan-with-tagging-disabled"
+    elif (
+        ordinary
+        and mode in ("dynamic-auto", "dynamic-desirable")
+        and access_vid is not None
+        and access_vid == native_vid
+        and native_tagging is False
+    ):
+        # Access or negotiated trunk would use the same untagged VLAN; this
+        # establishes the VLAN without establishing which forwarding mode won.
+        untagged = access_vid
+        origins["untagged_vid"] = "equal-access-and-native-vlans-with-tagging-disabled"
+    return {
+        "configured_mode": mode,
+        "access_vid": access_vid,
+        "native_vid": native_vid,
+        "native_tagging": native_tagging,
+        "allowed_mode": allowed_mode,
+        "allowed_vids": allowed_vids,
+        "untagged_vid": untagged,
+        "field_sources": origins,
+        "observations": {
+            "access_vlan_selection": raw_access,
+            "native_tag_override": native_override,
+            "global_native_tagging": global_tagging,
+            "raw_allowed": raw_allowed,
+            "allowed_unresolved_reason": allowed_source if allowed_mode is None else None,
+            "voice_vlan_present": _has(switchport, "voice"),
+            "private_vlan_present": _has(switchport, "private-vlan"),
+            "trunk_encapsulation": _value(trunk, "encapsulation"),
+            "untagged_meaning": (
+                "Equal access/native VLAN settings establish untagged VLAN independently "
+                "of negotiated access/trunk mode"
+                if origins.get("untagged_vid")
+                == "equal-access-and-native-vlans-with-tagging-disabled"
+                else None
+            ),
+        },
+    }
 
 
 def _bundle(switchport, profile, global_tagging):
@@ -228,14 +397,20 @@ def _bundle(switchport, profile, global_tagging):
         access = _value(_value(switchport, "access"), "vlan")
         vid = _value(access, "vlan")
         if vid is None:
-            return None, "Access VLAN is absent; no access VLAN default is applied"
+            if not profile:
+                return None, "Access VLAN is absent and no reviewed default profile applies"
+            vid = profile["access_vid"]
         if not isinstance(vid, int) or isinstance(vid, bool):
             return None, "Dynamic/named access VLAN requires a reviewed identity mapping"
         return {
             "mode": "access",
             "untagged_vid": _vid(vid),
             "tagged_vids": [],
-            "observations": {"configured_mode": "access", "access_vid": vid},
+            "observations": {
+                "configured_mode": "access",
+                "access_vid": vid,
+                "access_vid_source": ("explicit" if _has(access, "vlan") else "documented-default"),
+            },
         }, None
     trunk = _value(switchport, "trunk")
     if trunk is not None:
@@ -251,6 +426,8 @@ def _bundle(switchport, profile, global_tagging):
     native_tag = _value(native, "tag")
     if native_tag is not None and not isinstance(native_tag, bool):
         raise Layer2DiscoveryError("Native VLAN tagging override must be boolean")
+    if native_tag is not None:
+        return None, "Per-interface native tagging override requires a reviewed interpretation"
     vid = _value(native, "vlan-id")
     native_source = "explicit"
     if vid is None:
@@ -291,24 +468,39 @@ def _bundle(switchport, profile, global_tagging):
 
 
 def collect(client, interfaces, *, model, software_version, canonical_name, warnings):
-    """Return complete configured layer2 bundles and unresolved observations."""
-    result = {"schema_version": 1, "interfaces": [], "vlans": [], "unresolved": []}
+    """Return modelable bundles, independent facts, and explicit applicability."""
+    result = {
+        "schema_version": 1,
+        "interfaces": [],
+        "settings": [],
+        "vlans": [],
+        "catalog_complete": False,
+        "unresolved": [],
+        "not_applicable": [],
+    }
     profile = _profile(model, software_version)
     native, native_ok = _read(client, NATIVE_PATH, NATIVE_FIELDS, warnings)
     global_payload, global_ok = _read(client, GLOBAL_PATH, None, warnings)
     global_status = _response_status(client, GLOBAL_PATH)
     vlan_payload, vlan_ok = _read(client, VLAN_PATH, VLAN_FIELDS, warnings)
     global_tagging = _global_tagging(global_payload, global_ok, profile, global_status)
-    container = _value(native, "interface") if native_ok else None
-    if container is not None:
+    if native_ok and native is not None:
+        _object(native, "Native interface reply")
+    container = _value(native, "interface", "Cisco-IOS-XE-native") if native_ok else None
+    if native_ok and _has(native, "interface", "Cisco-IOS-XE-native"):
         _object(container, "Native interface configuration")
     config = {}
     for family, rows in (container or {}).items():
-        family = family.split(":")[-1]
-        if family not in FAMILIES:
+        local_family = family.split(":")[-1]
+        if local_family not in FAMILIES:
             continue
+        if ":" in family and family.split(":", 1)[0] != "Cisco-IOS-XE-native":
+            raise Layer2DiscoveryError(
+                "Native interface family belongs to an unexpected YANG module"
+            )
+        family = local_family
         for row in _rows(rows, "Native interface family"):
-            name_value = _value(row, "name")
+            name_value = _value(row, "name", "Cisco-IOS-XE-native")
             if isinstance(name_value, bool) or not isinstance(name_value, (str, int)):
                 raise Layer2DiscoveryError("Native interface requires a structured name")
             name = canonical_name(family + str(name_value))
@@ -325,36 +517,74 @@ def collect(client, interfaces, *, model, software_version, canonical_name, warn
                 "path": NATIVE_PATH,
                 "interface": name,
                 "field": "switchport-config/switchport",
+                "complete_read": native_ok and container is not None,
             }
         }
+        if interface.get("type") in ("virtual", "bridge", "tunnel") or re.fullmatch(
+            r"Vlan\d+", name
+        ):
+            result["not_applicable"].append(
+                {
+                    "name": name,
+                    "category": "virtual-interface",
+                    "reason": "Virtual/routed logical interface has no ordinary switchport mapping",
+                    "source": source,
+                }
+            )
+            continue
+        if profile and name == "GigabitEthernet0/0":
+            source["defaults"] = profile
+            result["not_applicable"].append(
+                {
+                    "name": name,
+                    "category": "dedicated-management",
+                    "reason": "Documented dedicated Ethernet management port is not a switchport",
+                    "source": source,
+                }
+            )
+            continue
+        category = "missing-data" if native_ok else "unavailable"
         if row is None:
             reason = "Scoped native configuration does not contain this interface"
             bundle = None
         else:
-            enabled_container = _value(row, "switchport-conf")
-            if enabled_container is not None:
-                _object(enabled_container, "Native switchport enable configuration")
-            enabled = _value(enabled_container, "switchport")
-            if enabled is not None and not isinstance(enabled, bool):
+            enabled_container = _container(
+                row,
+                "switchport-conf",
+                "Native switchport enable configuration",
+                "Cisco-IOS-XE-native",
+            )
+            enabled = _value(enabled_container, "switchport", "Cisco-IOS-XE-native")
+            if _has(enabled_container, "switchport", "Cisco-IOS-XE-native") and not isinstance(
+                enabled, bool
+            ):
                 raise Layer2DiscoveryError("Native switchport enable must be boolean")
-            switchport_container = _value(row, "switchport-config")
-            if switchport_container is not None:
-                _object(switchport_container, "Native switchport configuration")
-            switchport = _value(switchport_container, "switchport")
             if enabled is False:
-                bundle, reason = None, "Explicit no-switchport reports a routed interface"
-            elif switchport is None:
-                bundle, reason = (
-                    None,
-                    "Configured switchport mode is absent; access/trunk is not inferred",
+                result["not_applicable"].append(
+                    {
+                        "name": name,
+                        "category": "routed-interface",
+                        "reason": "Explicit no-switchport reports a routed interface",
+                        "source": source,
+                    }
                 )
-            else:
-                _object(switchport, "Switchport configuration")
-                bundle, reason = _bundle(switchport, profile, global_tagging)
-        if bundle is None:
-            result["unresolved"].append({"name": name, "reason": reason, "source": source})
-            continue
-        if bundle["observations"]["configured_mode"] == "trunk":
+                continue
+            switchport_container = _container(
+                row, "switchport-config", "Native switchport configuration", "Cisco-IOS-XE-native"
+            )
+            switchport = _container(
+                switchport_container,
+                "switchport",
+                "Switchport configuration",
+                "Cisco-IOS-XE-native",
+            )
+            physical = (
+                re.fullmatch(r"(?:%s)\d+/\d+/\d+" % "|".join(FAMILIES[:-1]), name) is not None
+            )
+            # Default inference requires this exact structured row in a valid,
+            # successfully read scope, and an ordinary documented interface.
+            defaults = profile if physical or enabled is True or switchport is not None else None
+            settings = _settings(switchport or {}, defaults, global_tagging, physical)
             source["global_tagging"] = {
                 "module": "Cisco-IOS-XE-vlan",
                 "path": GLOBAL_PATH,
@@ -362,29 +592,77 @@ def collect(client, interfaces, *, model, software_version, canonical_name, warn
                 "enabled": global_tagging,
                 "complete_read": global_ok,
                 "http_status": global_status,
+                "origin": (
+                    "documented-default"
+                    if global_tagging is False
+                    else "explicit"
+                    if global_tagging is True
+                    else None
+                ),
             }
-            if profile:
-                source["defaults"] = profile
+            if defaults:
+                source["defaults"] = defaults
+            bundle, reason = _bundle(switchport or {}, defaults, global_tagging)
+            if settings["configured_mode"] in ("dynamic-auto", "dynamic-desirable"):
+                reason = (
+                    "Administrative %s is known; negotiated access/trunk mode is not established"
+                    % settings["configured_mode"]
+                )
+                if (
+                    settings["access_vid"] is not None
+                    and settings["native_vid"] is not None
+                    and settings["allowed_mode"] is not None
+                    and settings["native_tagging"] is not None
+                    and not settings["observations"]["voice_vlan_present"]
+                    and not settings["observations"]["private_vlan_present"]
+                    and settings["observations"]["trunk_encapsulation"] in (None, "dot1q")
+                ):
+                    category = "dynamic-mode"
+            elif settings["configured_mode"] in ("private-vlan", "dot1q-tunnel") or any(
+                settings["observations"][key]
+                for key in ("voice_vlan_present", "private_vlan_present")
+            ):
+                category = "unsupported"
+            elif "requires" in (reason or "") or "not explicitly supported" in (reason or ""):
+                category = "unsupported"
+            settings["unresolved_reason"] = reason
+            result["settings"].append({"name": name, **settings, "source": source})
+        if bundle is None:
+            result["unresolved"].append(
+                {"name": name, "reason": reason, "category": category, "source": source}
+            )
+            continue
         result["interfaces"].append({"name": name, **bundle, "source": source})
     if vlan_ok:
-        vlans = _value(vlan_payload, "vlans")
+        if vlan_payload is not None:
+            _object(vlan_payload, "VLAN operational reply")
+        vlans = _value(vlan_payload, "vlans", "Cisco-IOS-XE-vlan-oper")
+        if _has(vlan_payload, "vlans", "Cisco-IOS-XE-vlan-oper"):
+            _object(vlans, "VLAN operational database")
         if vlans is not None:
             _object(vlans, "VLAN operational database")
+            if (
+                _has(vlans, "vlan", "Cisco-IOS-XE-vlan-oper")
+                and _value(vlans, "vlan", "Cisco-IOS-XE-vlan-oper") is None
+            ):
+                raise Layer2DiscoveryError("VLAN database rows must contain structured objects")
             seen = set()
-            for row in _rows(_value(vlans, "vlan"), "VLAN operational database"):
-                vid = _vid(_value(row, "id"))
+            for row in _rows(
+                _value(vlans, "vlan", "Cisco-IOS-XE-vlan-oper"), "VLAN operational database"
+            ):
+                vid = _vid(_value(row, "id", "Cisco-IOS-XE-vlan-oper"))
                 if vid in seen:
                     raise Layer2DiscoveryError("VLAN operational database has ambiguous IDs")
                 seen.add(vid)
-                name = _value(row, "name")
+                name = _value(row, "name", "Cisco-IOS-XE-vlan-oper")
                 if name is None or name == "":
-                    continue
-                if not isinstance(name, str) or not name.strip():
+                    name = None
+                elif not isinstance(name, str) or not name.strip():
                     raise Layer2DiscoveryError("VLAN names must be structured text")
                 result["vlans"].append(
                     {
                         "vid": vid,
-                        "name": name.strip(),
+                        "name": name.strip() if name is not None else None,
                         "source": {
                             "identity": {
                                 "module": "Cisco-IOS-XE-vlan-oper",
@@ -392,9 +670,10 @@ def collect(client, interfaces, *, model, software_version, canonical_name, warn
                                 "field": "vlan[id]/name",
                             }
                         },
-                        "observations": {"status": _value(row, "status")},
+                        "observations": {"status": _value(row, "status", "Cisco-IOS-XE-vlan-oper")},
                     }
                 )
+            result["catalog_complete"] = True
         else:
             warnings.append(
                 "VLAN identity source returned no database; missing VLAN records cannot be created"
@@ -405,8 +684,8 @@ def collect(client, interfaces, *, model, software_version, canonical_name, warn
 
 def add_revisions(layer2, modules):
     """Annotate collected field provenance after the shared module-library read."""
-    for collection in ("interfaces", "vlans", "unresolved"):
-        for row in layer2[collection]:
+    for collection in ("interfaces", "settings", "vlans", "unresolved", "not_applicable"):
+        for row in layer2.get(collection, []):
             for source in row.get("source", {}).values():
                 if isinstance(source, dict) and source.get("module"):
                     source["revision"] = modules.get(source["module"])

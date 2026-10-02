@@ -8,7 +8,7 @@ or unstructured software-banner parser is included.
 import re
 
 from ..transport_restconf import RestconfError
-from . import cisco_components, cisco_layer2
+from . import cisco_components, cisco_duplex, cisco_layer2
 from .cisco_hardware import interface_type
 
 HOSTNAME_PATH = "/data/Cisco-IOS-XE-native:native/hostname"
@@ -477,6 +477,18 @@ def collect(client):
     except cisco_layer2.Layer2DiscoveryError as exc:
         raise DiscoveryError(str(exc)) from None
     try:
+        configured_duplex = cisco_duplex.collect(
+            client,
+            interfaces,
+            model=model,
+            software_version=version,
+            member=member,
+            canonical_name=canonical_interface_name,
+            warnings=warnings,
+        )
+    except cisco_duplex.DuplexDiscoveryError as exc:
+        raise DiscoveryError(str(exc)) from None
+    try:
         components = cisco_components.collect(
             client,
             inventory,
@@ -561,10 +573,8 @@ def collect(client):
                 "mac_address": "phys-address",
                 "speed": "speed (bps)/1000; only ready physical interfaces",
                 "duplex": (
-                    "Operational observations only; configured duplex is not written. "
-                    "ether-state/negotiated-duplex-mode corroborated by "
-                    "ether-stats/dot3-counters/dot3-error-counters-v2/dot3-duplex-status; "
-                    "only ready reviewed copper interfaces"
+                    "Separate configured_duplex native source supplies the setting. "
+                    "Negotiated and MAC duplex remain operational observations only"
                 ),
                 "port_type": (
                     "ether-state/media-type=ether-media-type-rj45 on physical IANA Ethernet; "
@@ -591,6 +601,8 @@ def collect(client):
         membership["source"]["revision"] = modules.get("Cisco-IOS-XE-ethernet")
     cisco_components.add_revisions(components, modules)
     cisco_layer2.add_revisions(layer2, modules)
+    cisco_duplex.add_revisions(configured_duplex, modules)
+    sources["configured_duplex"] = configured_duplex
     sources["lag_memberships"] = {
         "module": "Cisco-IOS-XE-ethernet",
         "revision": modules.get("Cisco-IOS-XE-ethernet"),

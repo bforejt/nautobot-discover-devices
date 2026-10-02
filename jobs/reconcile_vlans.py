@@ -28,7 +28,18 @@ def _finish(plan):
         "vlans_created": sum(row["create"] for row in plan["catalog"]),
         "vlans_updated": sum(bool(row["changes"]) for row in plan["catalog"]),
         "interface_vlan_assignments_updated": len(plan["assignments"]),
-        "unresolved_switching": len(plan["unresolved"]),
+        "unresolved_switching": sum(
+            row.get("category") != "dynamic-mode" for row in plan["unresolved"]
+        ),
+        "switching_not_applicable": len(plan["not_applicable"]),
+        "switching_defaults": sum(
+            "documented-default" in row.get("field_sources", {}).values()
+            for row in plan["settings"]
+        ),
+        "switching_dynamic": sum(
+            row.get("configured_mode") in ("dynamic-auto", "dynamic-desirable")
+            for row in plan["settings"]
+        ),
     }
     return plan
 
@@ -38,8 +49,9 @@ def plan_vlans(discovery, existing, interface_plan=None):
 
     VLAN identity is selected group plus VID. A populated interface mode,
     native VLAN, or tagged set is preserved when discovery differs. No part
-    of an incompatible bundle is proposed, and its unused VLAN records are
-    never created. Tagged-all remains a mode, without M2M range expansion.
+    of an incompatible interface bundle is proposed. A verified complete VLAN
+    catalog is reconciled independently of interface assignments. Tagged-all
+    remains a mode, without M2M range expansion.
     """
     plan = {
         "schema_version": 1,
@@ -49,6 +61,8 @@ def plan_vlans(discovery, existing, interface_plan=None):
         "errors": [],
         "warnings": [],
         "unresolved": [],
+        "settings": [],
+        "not_applicable": [],
     }
     if "layer2" not in discovery:
         return _finish(plan)
@@ -66,7 +80,20 @@ def plan_vlans(discovery, existing, interface_plan=None):
     if not isinstance(source.get("unresolved", []), list):
         plan["errors"].append("Unresolved switching evidence must be a structured list")
         return _finish(plan)
-    plan["unresolved"] = list(source.get("unresolved", []))
+    for key in ("settings", "not_applicable", "unresolved"):
+        rows = source.get(key, [])
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            plan["errors"].append("Switching %s evidence must be structured objects" % key)
+            return _finish(plan)
+        plan[key] = list(rows)
+    for row in plan["settings"]:
+        if not isinstance(row.get("field_sources", {}), dict):
+            plan["settings"] = []
+            plan["errors"].append("Switching field provenance must be a structured object")
+            return _finish(plan)
+    if type(source.get("catalog_complete", False)) is not bool:
+        plan["errors"].append("VLAN catalog completeness must be an explicit boolean")
+        return _finish(plan)
 
     def error(message):
         plan["errors"].append(message)
@@ -155,8 +182,12 @@ def plan_vlans(discovery, existing, interface_plan=None):
         for name, fact in sorted(facts.items()):
             if name not in invalid_names:
                 unresolved(fact, reason)
-        if facts:
+        if facts or source.get("catalog_complete") and observed_vlans:
             plan["warnings"].append(reason)
+            if not facts:
+                plan["unresolved"].append(
+                    {"scope": "vlan", "name": "VLAN catalog", "reason": reason}
+                )
         return _finish(plan)
     allowed = inventory.get("allowed_vids")
     if not isinstance(allowed, list) or any(not _vid(vid) for vid in allowed):
@@ -354,5 +385,38 @@ def plan_vlans(discovery, existing, interface_plan=None):
                     "source": fact.get("source", {}),
                 }
             )
+    # A complete device VLAN database is useful inventory independently of
+    # whether any interface currently references a VLAN. Older discovery
+    # reports without this marker keep the original referenced-only policy.
+    if source.get("catalog_complete", False):
+        for vid in sorted(observed_vlans):
+            if str(vid) in proposed_catalog:
+                continue
+            spec, name_conflict, reason = resolve_vlan(vid)
+            if reason:
+                plan["unresolved"].append(
+                    {
+                        "scope": "vlan",
+                        "name": "VLAN %s" % vid,
+                        "vid": vid,
+                        "category": "catalog-identity",
+                        "reason": reason,
+                    }
+                )
+                continue
+            if spec["create"] or spec["changes"]:
+                peers = catalog_by_name[_text(spec["name"])] + list(proposed_catalog.values())
+                if any(
+                    row["vid"] != vid and _text(row["name"]) == _text(spec["name"]) for row in peers
+                ):
+                    error(
+                        "Proposed VLAN name %r represents several VIDs in the selected group"
+                        % spec["name"]
+                    )
+                    continue
+            proposed_catalog[spec["key"]] = spec
+            plan["catalog"].append(spec)
+            if name_conflict and name_conflict not in plan["conflicts"]:
+                plan["conflicts"].append(name_conflict)
     plan["catalog"].sort(key=lambda row: row["vid"])
     return _finish(plan)

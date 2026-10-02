@@ -14,7 +14,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.4.0-dev"
+JOB_VERSION = "0.5.0-dev"
 
 
 def _host(device):
@@ -282,17 +282,84 @@ class DiscoverDevice(Job):
                 summary["conflicts"],
                 "conflict" if summary["conflicts"] == 1 else "conflicts",
             )
+            # Only reviewed choice labels belong in the main log. Arbitrary
+            # before/observed values and complete evidence stay in the report.
+            type_labels = {"other": "Other", "virtual": "Virtual", "lag": "Link aggregation"}
+            for conflict in plan.get("conflicts", []):
+                before = (
+                    type_labels.get(conflict.get("before"))
+                    if isinstance(conflict.get("before"), str)
+                    else None
+                )
+                observed = (
+                    type_labels.get(conflict.get("observed"))
+                    if isinstance(conflict.get("observed"), str)
+                    else None
+                )
+                if (
+                    conflict.get("scope") == "interface"
+                    and conflict.get("field") == "type"
+                    and before
+                    and observed
+                ):
+                    self.logger.warning(
+                        "Interface %s: kept type %s; discovery identifies it as %s. "
+                        "This is an inventory difference; the existing interface was preserved.",
+                        conflict["name"],
+                        before,
+                        observed,
+                    )
         if summary["unresolved_components"]:
-            self.logger.warning(
-                "Skipped %s hardware %s that could not be identified safely. "
-                "Review the details under Advanced.",
-                summary["unresolved_components"],
-                "observation" if summary["unresolved_components"] == 1 else "observations",
+            missing_identity_reasons = {
+                "Serialized component model or serial number is unavailable",
+                "Component identity is unavailable; presence or occupancy "
+                "is not inferred from operational state",
+            }
+            missing_identity = sum(
+                row.get("reason") in missing_identity_reasons
+                for row in plan.get("components", {}).get("unresolved", [])
+            )
+            if missing_identity:
+                self.logger.warning(
+                    "Could not create %s serialized hardware %s: the device did not provide "
+                    "model or serial identity. Existing hardware was preserved; "
+                    "review the observations under Advanced.",
+                    missing_identity,
+                    "record" if missing_identity == 1 else "records",
+                )
+            remaining = summary["unresolved_components"] - missing_identity
+            if remaining:
+                self.logger.warning(
+                    "Left %s hardware %s unresolved because identity or placement "
+                    "could not be established safely. Existing hardware was preserved; "
+                    "review the details under Advanced.",
+                    remaining,
+                    "observation" if remaining == 1 else "observations",
+                )
+        if summary.get("switching_not_applicable"):
+            self.logger.info(
+                "Switchport VLAN mapping does not apply to %s management, routed, or "
+                "logical interfaces. This is expected.",
+                summary["switching_not_applicable"],
+            )
+        if summary.get("switching_defaults"):
+            self.logger.info(
+                "Established documented switchport defaults for %s interfaces from complete "
+                "configuration reads; their source evidence is under Advanced.",
+                summary["switching_defaults"],
+            )
+        if summary.get("switching_dynamic"):
+            self.logger.info(
+                "%s interfaces have dynamic switchport configuration. Available configuration "
+                "is retained separately; their negotiated 802.1Q mode remains blank unless "
+                "it is established by supported evidence.",
+                summary["switching_dynamic"],
             )
         if summary.get("unresolved_switching"):
             self.logger.warning(
-                "Skipped %s interface VLAN observations that could not be mapped safely. "
-                "Review the details under Advanced.",
+                "Left %s interface VLAN observations unresolved because required evidence "
+                "is missing or has no reviewed mapping. Available configuration remains "
+                "in the discovery report; review the details under Advanced.",
                 summary["unresolved_switching"],
             )
         if summary["missing_interfaces"]:

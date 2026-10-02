@@ -1,4 +1,4 @@
-"""Configured 802.1Q interpretation without operational or default guessing."""
+"""Configured 802.1Q facts with scoped, documented defaults and no mode guessing."""
 
 import unittest
 
@@ -30,10 +30,14 @@ class Layer2CollectionTests(unittest.TestCase):
     def collect(self, values=None, client=None):
         return cisco.collect(client or FixtureClient(values or payloads()))["layer2"]
 
-    def test_lab_has19_complete_bundles_and39_unknown_modes(self):
+    def test_lab_has19_complete_bundles_and34_dynamic_modes(self):
         result = self.collect()
         self.assertEqual(len(result["interfaces"]), 19)
-        self.assertEqual(len(result["unresolved"]), 39)
+        self.assertEqual(len(result["unresolved"]), 34)
+        self.assertTrue(all(row["category"] == "dynamic-mode" for row in result["unresolved"]))
+        self.assertEqual(len(result["settings"]), 53)
+        self.assertEqual(len(result["not_applicable"]), 5)
+        self.assertTrue(result["catalog_complete"])
         self.assertEqual(sum(row["mode"] == "access" for row in result["interfaces"]), 14)
         self.assertEqual(sum(row["mode"] == "tagged" for row in result["interfaces"]), 5)
         rows = {row["name"]: row for row in result["interfaces"]}
@@ -45,6 +49,282 @@ class Layer2CollectionTests(unittest.TestCase):
         self.assertEqual(uplink["observations"]["allowed_vids"], [3, 4, 999])
         self.assertEqual(uplink["observations"]["raw_allowed"], {"vlans": "3,4,999"})
         self.assertEqual(len(result["vlans"]), 9)
+
+    def test_unused_physical_ports_retain_known_defaults_without_an_access_mode_guess(self):
+        result = self.collect()
+        row = next(row for row in result["settings"] if row["name"] == "TwoGigabitEthernet1/0/15")
+        self.assertEqual(row["configured_mode"], "dynamic-auto")
+        self.assertEqual((row["access_vid"], row["native_vid"], row["untagged_vid"]), (1, 1, 1))
+        self.assertFalse(row["native_tagging"])
+        self.assertEqual(row["allowed_mode"], "all")
+        self.assertIsNone(row["allowed_vids"])
+        self.assertEqual(row["field_sources"]["configured_mode"], "documented-default")
+        self.assertEqual(row["field_sources"]["access_vid"], "documented-default")
+        self.assertEqual(row["field_sources"]["native_vid"], "documented-default")
+        self.assertEqual(
+            row["field_sources"]["untagged_vid"],
+            "equal-access-and-native-vlans-with-tagging-disabled",
+        )
+        self.assertTrue(row["source"]["config"]["complete_read"])
+        self.assertIn(
+            "configuring_interface_characteristics",
+            row["source"]["defaults"]["documents"]["interface_defaults"],
+        )
+        self.assertNotIn(row["name"], {bundle["name"] for bundle in result["interfaces"]})
+
+    def test_explicit_access_without_vid_uses_documented_default_and_provenance(self):
+        values = payloads()
+        port = switchport(values, "TwoGigabitEthernet", "1/0/1")
+        del port["Cisco-IOS-XE-switch:access"]
+        result = self.collect(values)
+        row = next(row for row in result["interfaces"] if row["name"] == "TwoGigabitEthernet1/0/1")
+        self.assertEqual((row["mode"], row["untagged_vid"]), ("access", 1))
+        self.assertEqual(row["observations"]["access_vid_source"], "documented-default")
+        self.assertEqual(row["source"]["defaults"]["access_vid"], 1)
+        self.assertIn("interface_defaults", row["source"]["defaults"]["documents"])
+
+    def test_dynamic_modes_retain_independent_explicit_vlans_without_mapping_mode(self):
+        for administrative in ("auto", "desirable"):
+            with self.subTest(administrative=administrative):
+                values = payloads()
+                port = switchport(values)
+                port["Cisco-IOS-XE-switch:mode"] = {"dynamic": administrative}
+                port["Cisco-IOS-XE-switch:access"] = {"vlan": {"vlan": 2}}
+                result = self.collect(values)
+                row = next(
+                    row for row in result["settings"] if row["name"] == "TenGigabitEthernet1/0/47"
+                )
+                self.assertEqual(row["configured_mode"], "dynamic-" + administrative)
+                self.assertEqual((row["access_vid"], row["native_vid"]), (2, 999))
+                self.assertEqual(row["allowed_vids"], [3, 4, 999])
+                self.assertIsNone(row["untagged_vid"])
+                self.assertEqual(row["field_sources"]["configured_mode"], "explicit")
+                self.assertNotIn(row["name"], {bundle["name"] for bundle in result["interfaces"]})
+
+    def test_equal_dynamic_access_native_settings_establish_only_untagged_vid(self):
+        values = payloads()
+        port = switchport(values)
+        port["Cisco-IOS-XE-switch:mode"] = {"dynamic": "auto"}
+        port["Cisco-IOS-XE-switch:access"] = {"vlan": {"vlan": 999}}
+        row = next(
+            row
+            for row in self.collect(values)["settings"]
+            if row["name"] == "TenGigabitEthernet1/0/47"
+        )
+        self.assertEqual(row["untagged_vid"], 999)
+        self.assertIn("independently", row["observations"]["untagged_meaning"])
+
+    def test_management_svis_and_explicit_routed_ports_are_not_applicable(self):
+        values = payloads()
+        native_row(values, "TenGigabitEthernet", "1/0/47")["switchport-conf"] = {
+            "switchport": False
+        }
+        result = self.collect(values)
+        rows = {row["name"]: row for row in result["not_applicable"]}
+        self.assertEqual(rows["GigabitEthernet0/0"]["category"], "dedicated-management")
+        self.assertEqual(rows["Vlan2"]["category"], "virtual-interface")
+        self.assertEqual(rows["TenGigabitEthernet1/0/47"]["category"], "routed-interface")
+        self.assertEqual(len(rows), 6)
+        self.assertNotIn("TenGigabitEthernet1/0/47", {row["name"] for row in result["settings"]})
+
+    def test_missing_row_or_unusable_native_envelope_never_applies_defaults(self):
+        values = payloads()
+        rows = values[layer2.NATIVE_PATH]["Cisco-IOS-XE-native:interface"]["TwoGigabitEthernet"]
+        rows[:] = [row for row in rows if row["name"] != "1/0/15"]
+        result = self.collect(values)
+        self.assertNotIn("TwoGigabitEthernet1/0/15", {row["name"] for row in result["settings"]})
+        unresolved = next(
+            row for row in result["unresolved"] if row["name"] == "TwoGigabitEthernet1/0/15"
+        )
+        self.assertEqual(unresolved["category"], "missing-data")
+        for envelope in (None, {}, {"unexpected": {}}):
+            with self.subTest(envelope=envelope):
+                values = payloads()
+                values[layer2.NATIVE_PATH] = envelope
+                result = self.collect(values)
+                self.assertEqual(result["settings"], [])
+                self.assertEqual(result["interfaces"], [])
+
+    def test_unreviewed_profiles_retain_explicit_settings_but_no_absent_leaf_defaults(self):
+        interfaces = cisco.collect(FixtureClient())["interfaces"]
+        for model, version in (("C9300-24T", "17.12.08"), ("C9300-48UXM", "17.15.06")):
+            with self.subTest(model=model, version=version):
+                result = layer2.collect(
+                    FixtureClient(payloads()),
+                    interfaces,
+                    model=model,
+                    software_version=version,
+                    canonical_name=cisco.canonical_interface_name,
+                    warnings=[],
+                )
+                row = next(
+                    row for row in result["settings"] if row["name"] == "TwoGigabitEthernet1/0/15"
+                )
+                self.assertIsNone(row["configured_mode"])
+                self.assertIsNone(row["access_vid"])
+                self.assertIsNone(row["native_vid"])
+                self.assertIsNone(row["allowed_mode"])
+                self.assertIsNone(row["untagged_vid"])
+                self.assertNotIn("defaults", row["source"])
+
+    def test_port_channel_does_not_receive_an_ethernet_dtp_default(self):
+        values = payloads()
+        row = native_row(values, "Port-channel", 1)
+        row.pop("switchport-config")
+        result = self.collect(values)
+        settings = next(row for row in result["settings"] if row["name"] == "Port-channel1")
+        self.assertIsNone(settings["configured_mode"])
+        self.assertIsNone(settings["access_vid"])
+        self.assertIsNone(settings["untagged_vid"])
+        self.assertNotIn("defaults", settings["source"])
+
+    def test_unsupported_modes_and_voice_retain_explicit_facts_without_untagged_claim(self):
+        for mode in ({"private-vlan": {"host": [None]}}, {"dot1q-tunnel": {}}):
+            with self.subTest(mode=mode):
+                values = payloads()
+                switchport(values)["Cisco-IOS-XE-switch:mode"] = mode
+                result = self.collect(values)
+                row = next(
+                    row for row in result["settings"] if row["name"] == "TenGigabitEthernet1/0/47"
+                )
+                self.assertEqual(row["native_vid"], 999)
+                self.assertEqual(row["allowed_vids"], [3, 4, 999])
+                self.assertIsNone(row["access_vid"])
+                self.assertIsNone(row["untagged_vid"])
+                unresolved = next(
+                    candidate
+                    for candidate in result["unresolved"]
+                    if candidate["name"] == row["name"]
+                )
+                self.assertEqual(unresolved["category"], "unsupported")
+        values = payloads()
+        port = switchport(values, "TwoGigabitEthernet", "1/0/1")
+        port["Cisco-IOS-XE-switch:voice"] = {"vlan": {"vlan": 20}}
+        row = next(
+            row
+            for row in self.collect(values)["settings"]
+            if row["name"] == "TwoGigabitEthernet1/0/1"
+        )
+        self.assertEqual(row["access_vid"], 2)
+        self.assertTrue(row["observations"]["voice_vlan_present"])
+        self.assertIsNone(row["untagged_vid"])
+
+    def test_native_tagging_override_and_global_tagging_retain_vid_without_untagged_mapping(self):
+        for override in (True, False):
+            with self.subTest(override=override):
+                values = payloads()
+                switchport(values)["Cisco-IOS-XE-switch:trunk"]["native"]["vlan"]["tag"] = override
+                result = self.collect(values)
+                row = next(
+                    row for row in result["settings"] if row["name"] == "TenGigabitEthernet1/0/47"
+                )
+                self.assertEqual(row["native_vid"], 999)
+                self.assertEqual(row["observations"]["native_tag_override"], override)
+                self.assertIsNone(row["native_tagging"])
+                self.assertIsNone(row["untagged_vid"])
+                self.assertNotIn(row["name"], {bundle["name"] for bundle in result["interfaces"]})
+
+    def test_complete_catalog_flag_requires_a_valid_successful_database_scope(self):
+        for body, expected in (
+            (None, False),
+            ({}, False),
+            ({"unexpected": {}}, False),
+            ({"Cisco-IOS-XE-vlan-oper:vlans": {}}, True),
+        ):
+            with self.subTest(body=body):
+                values = payloads()
+                values[layer2.VLAN_PATH] = body
+                result = self.collect(values)
+                self.assertEqual(result["catalog_complete"], expected)
+                self.assertEqual(result["vlans"], [])
+
+    def test_wrong_namespace_cannot_supply_default_or_explicit_vlan_evidence(self):
+        for field in ("mode", "access", "trunk"):
+            with self.subTest(field=field):
+                values = payloads()
+                port = switchport(values)
+                qualified = "Cisco-IOS-XE-switch:" + field
+                if qualified not in port:
+                    port[qualified] = {"vlan": {"vlan": 2}}
+                port["unrelated-model:" + field] = port.pop(qualified)
+                with self.assertRaises(cisco.DiscoveryError):
+                    self.collect(values)
+        values = payloads()
+        native = values[layer2.NATIVE_PATH].pop("Cisco-IOS-XE-native:interface")
+        values[layer2.NATIVE_PATH]["unrelated-model:interface"] = native
+        with self.assertRaises(cisco.DiscoveryError):
+            self.collect(values)
+
+    def test_null_present_containers_block_instead_of_enabling_defaults(self):
+        for container in ("mode", "access", "trunk"):
+            with self.subTest(container=container):
+                values = payloads()
+                switchport(values)["Cisco-IOS-XE-switch:" + container] = None
+                with self.assertRaises(cisco.DiscoveryError):
+                    self.collect(values)
+        values = payloads()
+        switchport(values)["Cisco-IOS-XE-switch:trunk"]["encapsulation"] = None
+        with self.assertRaises(cisco.DiscoveryError):
+            self.collect(values)
+        for body in (
+            {"Cisco-IOS-XE-native:vlan": None},
+            {"Cisco-IOS-XE-native:vlan": {"Cisco-IOS-XE-vlan:dot1q": None}},
+            {"Cisco-IOS-XE-native:vlan": {"Cisco-IOS-XE-vlan:dot1q": {"tag": None}}},
+        ):
+            with self.subTest(global_body=body):
+                values = payloads()
+                values[layer2.GLOBAL_PATH] = body
+                with self.assertRaises(cisco.DiscoveryError):
+                    self.collect(values)
+
+    def test_catalog_retains_vid_when_device_does_not_supply_a_name(self):
+        values = payloads()
+        rows = values[layer2.VLAN_PATH]["Cisco-IOS-XE-vlan-oper:vlans"]["vlan"]
+        rows[0].pop("name")
+        result = self.collect(values)
+        retained = next(row for row in result["vlans"] if row["vid"] == rows[0]["id"])
+        self.assertIsNone(retained["name"])
+        self.assertTrue(result["catalog_complete"])
+
+    def test_unknown_mode_or_allowed_choice_never_infers_defaults(self):
+        values = payloads()
+        switchport(values)["Cisco-IOS-XE-switch:mode"] = {"future-mode": {}}
+        row = next(
+            row
+            for row in self.collect(values)["settings"]
+            if row["name"] == "TenGigabitEthernet1/0/47"
+        )
+        self.assertIsNone(row["configured_mode"])
+        self.assertIsNone(row["access_vid"])
+        self.assertIsNone(row["untagged_vid"])
+        values = payloads()
+        switchport(values)["Cisco-IOS-XE-switch:trunk"]["allowed"] = {
+            "vlan-v2": {"vlan-choices": {"future-choice": True}}
+        }
+        row = next(
+            row
+            for row in self.collect(values)["settings"]
+            if row["name"] == "TenGigabitEthernet1/0/47"
+        )
+        self.assertIsNone(row["allowed_mode"])
+        self.assertEqual(row["native_vid"], 999)
+
+    def test_known_and_unknown_competing_selectors_block_complete_assignments(self):
+        values = payloads()
+        switchport(values)["Cisco-IOS-XE-switch:mode"] = {
+            "access": {},
+            "unexpected-mode": {},
+        }
+        with self.assertRaises(cisco.DiscoveryError):
+            self.collect(values)
+        for known_choice in ({"all": True}, {"vlans": "3,4"}):
+            with self.subTest(known_choice=known_choice):
+                values = payloads()
+                switchport(values)["Cisco-IOS-XE-switch:trunk"]["allowed"] = {
+                    "vlan-v2": {"vlan-choices": {**known_choice, "unexpected-choice": "3,4"}}
+                }
+                with self.assertRaises(cisco.DiscoveryError):
+                    self.collect(values)
 
     def test_ordinary_trunk_defaults_have_profile_and_documents(self):
         row = next(row for row in self.collect()["interfaces"] if row["name"] == "Port-channel1")
@@ -77,6 +357,12 @@ class Layer2CollectionTests(unittest.TestCase):
                 result = self.collect(client=EmptyGlobal(200, body))
                 self.assertEqual(len(result["interfaces"]), 14)
                 self.assertTrue(any("tagging" in row["reason"] for row in result["unresolved"]))
+                self.assertTrue(
+                    all(
+                        row["source"]["global_tagging"]["origin"] is None
+                        for row in result["settings"]
+                    )
+                )
 
     def test_default_profile_is_scoped_to_reviewed_chassis_and_release_families(self):
         for model, version in (("C9300-24T", "17.12.08"), ("C9300-48UXM", "17.15.06")):

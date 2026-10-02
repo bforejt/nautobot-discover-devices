@@ -411,6 +411,121 @@ class VLANReconciliationTests(unittest.TestCase):
         before["interfaces"].append({**before["interfaces"][0], "id": "duplicate"})
         self.assertTrue(planner.plan_vlans(discovery(fact()), before)["errors"])
 
+    def test_complete_catalog_loads_unused_vlans_without_interface_assignments(self):
+        observed = discovery(vlans=[{"vid": 10, "name": "Users"}, {"vid": 20, "name": "Unused"}])
+        observed["layer2"]["catalog_complete"] = True
+        before = inventory()
+        first = planner.plan_vlans(observed, before)
+        self.assertFalse(first["errors"])
+        self.assertEqual([v["vid"] for v in first["catalog"]], [10, 20])
+        self.assertEqual(first["summary"]["vlans_created"], 2)
+        self.assertFalse(first["assignments"])
+        after = apply_to_snapshot(first, before)
+        second = planner.plan_vlans(observed, after)
+        self.assertEqual(second["summary"]["vlans_created"], 0)
+        self.assertEqual(second["summary"]["vlans_updated"], 0)
+        self.assertFalse(second["assignments"])
+        self.assertEqual(after["interfaces"], before["interfaces"])
+
+    def test_full_catalog_is_independent_of_preserved_interface_conflicts(self):
+        before = inventory()
+        before["interfaces"][0]["mode"] = "tagged"
+        observed = discovery(
+            fact(), vlans=[{"vid": 10, "name": "Users"}, {"vid": 20, "name": "Unused"}]
+        )
+        observed["layer2"]["catalog_complete"] = True
+        result = planner.plan_vlans(observed, before)
+        self.assertFalse(result["assignments"])
+        self.assertTrue(result["conflicts"])
+        self.assertEqual([v["vid"] for v in result["catalog"]], [10, 20])
+
+    def test_full_catalog_requires_explicit_group_even_without_interfaces(self):
+        before = inventory()
+        before["vlan_inventory"]["group"] = None
+        observed = discovery()
+        observed["layer2"]["catalog_complete"] = True
+        result = planner.plan_vlans(observed, before)
+        self.assertFalse(result["catalog"])
+        self.assertTrue(result["warnings"])
+        self.assertEqual(result["unresolved"][0]["scope"], "vlan")
+
+    def test_full_catalog_unknown_name_range_and_location_preserve_other_vids(self):
+        observed = discovery(
+            vlans=[
+                {"vid": 10, "name": "Users"},
+                {"vid": 20, "name": ""},
+                {"vid": 30, "name": "Outside"},
+                {"vid": 40, "name": "Wrong-location"},
+            ]
+        )
+        observed["layer2"]["catalog_complete"] = True
+        before = inventory()
+        before["vlan_inventory"]["allowed_vids"] = [10, 20, 40]
+        before["vlan_inventory"]["vlans"] = [vlan(40, name="Wrong-location", applicable=False)]
+        result = planner.plan_vlans(observed, before)
+        self.assertFalse(result["errors"])
+        self.assertEqual([v["vid"] for v in result["catalog"]], [10])
+        self.assertEqual({v["vid"] for v in result["unresolved"]}, {20, 30, 40})
+
+    def test_full_catalog_preserves_names_and_rejects_identity_collisions(self):
+        observed = discovery(vlans=[{"vid": 10, "name": "Observed"}])
+        observed["layer2"]["catalog_complete"] = True
+        before = inventory()
+        before["vlan_inventory"]["vlans"] = [vlan()]
+        result = planner.plan_vlans(observed, before)
+        self.assertEqual(result["catalog"][0]["name"], "Users")
+        self.assertFalse(result["catalog"][0]["changes"])
+        self.assertEqual(result["conflicts"][0]["scope"], "vlan")
+        observed["layer2"]["vlans"] = [{"vid": 20, "name": "Users"}]
+        self.assertTrue(planner.plan_vlans(observed, before)["errors"])
+        observed["layer2"]["vlans"] = [{"vid": 10, "name": "Same"}, {"vid": 20, "name": "Same"}]
+        self.assertTrue(planner.plan_vlans(observed, inventory())["errors"])
+
+    def test_known_dynamic_defaults_are_retained_without_assigning_native_fields(self):
+        observed = discovery(vlans=[])
+        setting = {
+            "name": "Gi1/0/1",
+            "configured_mode": "dynamic-auto",
+            "access_vid": 1,
+            "native_vid": 1,
+            "untagged_vid": 1,
+            "field_sources": {
+                "configured_mode": "documented-default",
+                "access_vid": "documented-default",
+            },
+        }
+        observed["layer2"].update(
+            settings=[setting],
+            not_applicable=[{"name": "Vlan1", "reason": "SVI is not a switchport"}],
+            unresolved=[
+                {
+                    "name": "Gi1/0/1",
+                    "category": "dynamic-mode",
+                    "reason": "Negotiated mode not established",
+                }
+            ],
+        )
+        result = planner.plan_vlans(observed, inventory())
+        self.assertEqual(result["settings"], [setting])
+        self.assertFalse(result["assignments"])
+        self.assertEqual(result["summary"]["switching_dynamic"], 1)
+        self.assertEqual(result["summary"]["switching_defaults"], 1)
+        self.assertEqual(result["summary"]["switching_not_applicable"], 1)
+        self.assertEqual(result["summary"]["unresolved_switching"], 0)
+        self.assertEqual(len(result["unresolved"]), 1)
+
+    def test_report_categories_reject_malformed_data_and_keep_genuine_unresolved(self):
+        observed = discovery(vlans=[])
+        observed["layer2"]["unresolved"] = [{"name": "Gi1/0/1", "category": "unavailable"}]
+        self.assertEqual(
+            planner.plan_vlans(observed, inventory())["summary"]["unresolved_switching"], 1
+        )
+        for key, value in (("settings", [None]), ("not_applicable", {}), ("catalog_complete", 1)):
+            with self.subTest(key=key):
+                malformed = discovery(vlans=[])
+                malformed["layer2"][key] = value
+                self.assertTrue(planner.plan_vlans(malformed, inventory())["errors"])
+
     def test_absent_feature_is_a_noop_and_malformed_schema_is_an_error(self):
         self.assertFalse(planner.plan_vlans({}, inventory())["catalog"])
         for value in (None, {}, {"schema_version": True}, {"schema_version": 2}):

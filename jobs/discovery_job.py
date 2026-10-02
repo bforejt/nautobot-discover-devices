@@ -14,7 +14,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.10.0-dev"
+JOB_VERSION = "0.11.1-dev"
 
 
 def _host(device):
@@ -399,11 +399,33 @@ class DiscoverDevice(Job):
                 summary["switching_defaults"],
             )
         operational_source = plan.get("layer2", {}).get("operational_source") or {}
-        if operational_source.get("status") in ("not-advertised", "capability-unknown"):
+        if operational_source.get("status") in (
+            "not-advertised",
+            "unsupported",
+            "capability-unknown",
+        ):
             self.logger.info(
                 "Operational switchport mode source is %s. Negotiated mode stays blank "
                 "without supported evidence; configured assignments remain available.",
                 operational_source["status"],
+            )
+        if operational_source.get("status") in ("unavailable", "invalid"):
+            self.logger.warning(
+                "Optional operational switchport source is %s. Discovery continues with "
+                "independently verified configuration; source details are under Advanced.",
+                operational_source["status"],
+            )
+            if operational_source["status"] == "invalid":
+                self.logger.warning(
+                    "Rejected operational switchport data cannot be used for assignments "
+                    "or NTC mode guessing. Existing inventory is preserved."
+                )
+        if operational_source.get("status") == "available" and operational_source.get(
+            "probed_without_advertisement"
+        ):
+            self.logger.info(
+                "Operational switchport source was validated by a direct RESTCONF probe "
+                "because module-library evidence was unavailable. Its revision remains unknown."
             )
         if summary.get("switching_operational"):
             self.logger.info(

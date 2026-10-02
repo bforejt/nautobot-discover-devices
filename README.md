@@ -11,7 +11,8 @@ Only Nautobot 3.2.5 has been tested. Compatibility with older releases is not
 claimed until the same implementation has been tested on them, including native
 Module inventory and template suppression.
 
-Verified on the lab's Nautobot 3.2.5 and C9300-48UXM running IOS XE 17.12.8.
+Verified on the lab's Nautobot 3.2.5 and C9300-48UXM running IOS XE 17.12.8
+and 17.18.4.
 The live worker apply created 57 missing interfaces and enriched one existing
 interface; a second worker apply produced zero inventory changes. Real ORM
 checks verified software catalog creation, fill-only
@@ -369,7 +370,7 @@ untagged and omitted from the tagged set. An all-VLAN trunk maps to `tagged-all`
 without expanding thousands of tagged relationships. Operational membership,
 an SVI, or the absence of switchport configuration does not establish a mode.
 
-The reviewed `C9300-48UXM` profile for IOS XE 17.9, 17.12, and 17.15 permits documented
+The reviewed `C9300-48UXM` profile for IOS XE 17.9, 17.12, 17.15, and 17.18 permits documented
 defaults of dynamic auto, access VLAN 1, trunk native VLAN 1, all allowed trunk
 VLANs, and disabled global native tagging. These defaults apply only after
 successful complete reads of the relevant native configuration and an
@@ -430,23 +431,45 @@ configuration rows also retain actual
 mode and raw evidence in `discovery.layer2.settings`. Operational VLAN IDs,
 pruning, voice, and aggregation details remain observations. This adds no custom
 fields or new Interface column. `discovery.layer2.operational_source` records
-source status: `capability-unknown`, `not-advertised`, `unavailable`, or
-`available`. No request
-is made when the module is unadvertised or the library cannot establish its
-availability; older IOS XE discovery continues using the existing sources.
+source status: `not-advertised`, `unsupported`, `unavailable`, `invalid`, or
+`available`. A complete YANG library that does not advertise the module skips
+the request. If the library is unreadable or invalid, the job probes the
+endpoint directly and accepts only validated structured facts, with revision
+left unknown. `capability_status` and `probed_without_advertisement` distinguish
+library evidence from a direct probe. Partial invalid library results are
+discarded rather than supplying module revisions.
+
+The optional operational source uses a 15-second read timeout. HTTP 400 permits
+one unfiltered read of the same endpoint; HTTP 404/501 means `unsupported`,
+and other expected read failures mean `unavailable`. Successful HTTP responses
+with invalid JSON, a non-object body, or malformed or ambiguous structured
+replies mean `invalid`: the entire source is discarded, discovery
+continues, and NTC mode guessing is disabled for that invalid scope even when
+the Job's guessing flag is enabled. Independently validated explicit native
+configuration remains usable. No invalid row or partial result becomes a
+configured default. Required device identity, interfaces, collector input
+validation, cancellation, and unexpected programming errors remain fatal.
+There is no new software-version minimum, SSH transport, or CLI parser.
 Summary `switching_operational` counts positive access/trunk observations;
 `switching_dynamic_resolved` counts complete dynamic bundles resolved from
 those observations, rather than newly written assignments.
 
-The IOS XE 17.12.8 lab does not advertise this module, and a separate read-only
+Operational rows that match the mandatory interface collector's exact excluded
+names remain observations with `applicability.eligible = false`, `usable = false`,
+and no normalized operational mode. This covers explicitly absent uplink aliases
+and the internal application-hosting interface. They cannot create interfaces,
+contribute positive mode counts, or supply VLAN assignments. Every excluded row
+still receives full schema and duplicate-name validation. A genuinely unknown
+name, inconsistent input exclusion, or malformed row is not silently skipped.
+
+The earlier IOS XE 17.12.8 lab did not advertise this module, and a separate read-only
 probe returned HTTP 404. Three correctly keyed RESTCONF VTP-MIB probes timed
 out after 30 seconds each; the job does not use that alternative. OpenConfig
 VLAN `state/interface-mode` represents
 [applied configuration](https://github.com/YangModels/yang/blob/main/vendor/cisco/xe/17121/openconfig-extensions.yang#L159),
 which does not prove the negotiated DTP result. No device configuration or MIB
-access changes were made. Positive newer-model behavior is covered with
-published-schema offline fixtures and has not been verified on a live
-newer-release switch.
+access changes were made. The subsequent IOS XE 17.18.4 live validation is
+recorded below; positive 17.15 behavior remains covered by schema-based fixtures.
 
 ### Optional NTC inference
 
@@ -539,7 +562,7 @@ request `application/yang-data+json`.
 | Configured duplex | `/data/Cisco-IOS-XE-native:native/interface` with scoped qualified `Cisco-IOS-XE-ethernet:duplex` fields |
 | Configured LAG membership | `/data/Cisco-IOS-XE-native:native/interface` with qualified `Cisco-IOS-XE-ethernet:channel-group` field filters |
 | Configured 802.1Q mode, native VLAN, and allowed VLANs | `/data/Cisco-IOS-XE-native:native/interface` with complete scoped switchport containers |
-| Optional actual switchport mode, when advertised | `/data/Cisco-IOS-XE-switchport-oper:switchport-oper-data` with `switchport-info(if-name;enabled;admin-mode;hardware-present;port-details)` fields |
+| Optional actual switchport mode, advertised or directly probed when capability is unknown | `/data/Cisco-IOS-XE-switchport-oper:switchport-oper-data` with `switchport-info(if-name;enabled;admin-mode;hardware-present;port-details)` fields |
 | Global native-VLAN tagging configuration | `/data/Cisco-IOS-XE-native:native/vlan` |
 | Structured VLAN names and operational evidence | `/data/Cisco-IOS-XE-vlan-oper:vlans` |
 | Optional model revision evidence | `/data/ietf-yang-library:modules-state` |
@@ -552,8 +575,9 @@ Unavailable platform component data leaves serialized parts unresolved and
 preserves the usable Device and interface discovery. Malformed or contradictory
 serialized identity blocks discovery.
 Unavailable switching sources leave affected bundles unresolved; malformed or
-ambiguous structured switching data blocks discovery. Defaults do not replace
-failed or incomplete source reads.
+ambiguous native configuration or VLAN identity data blocks discovery. Invalid
+optional actual switchport data is discarded as described above. Defaults do
+not replace failed or incomplete source reads.
 HTTPS redirects are rejected. A legacy TLS retry is available only when the
 operator explicitly disables certificate verification.
 
@@ -735,3 +759,46 @@ preserved. A second successful worker apply reported zero inventory changes
 and identical complete snapshots, including the new SFP UUID. The previously
 documented four missing hardware identities and `Vlan2` type conflict remain
 unchanged; there are no new unresolved SFP observations on the lab switch.
+
+The `0.11.0-dev` increment makes optional operational switchport RESTCONF
+discovery best effort while retaining strict validation of required facts.
+It passed 383 offline regressions, lint/format/syntax checks, and 73 real
+Nautobot 3.2.5 ORM checks with zero persistent integration changes. Four live
+GET-only preview cases on the unchanged IOS XE 17.12.8 lab issued zero
+inventory mutation statements: normal discovery; an injected unavailable
+YANG library followed by a real endpoint probe returning HTTP 404; an invalid
+optional structured reply; and an invalid successful-HTTP JSON response.
+The invalid-source cases kept NTC guessing enabled to verify that rejected
+evidence produces zero inferred bundles. The two invalid responses and the
+unavailable library were process-local test injections, not device changes.
+Both the real worker preview and strict apply succeeded with identical
+before/after inventory snapshots and attached reports. The existing `Vlan2`
+type conflict and four unresolved hardware identities remained unchanged.
+At that stage, positive operational-mode cases on 17.15/17.18 were covered by
+offline schema-based tests, and the omitted-leaf default profile had been
+reviewed only for 17.9/17.12/17.15.
+
+The `0.11.1-dev` increment was validated live on IOS XE 17.18.4. Its advertised
+operational switchport model (revision `2024-03-01`) returned HTTP 200 and 66
+rows: 53 eligible interfaces, 12 explicitly absent uplink aliases, and one
+internal application-hosting interface. Only exact exclusions already
+established by required interface discovery are retained as observation-only
+records; unknown names, malformed rows and duplicate canonical names still
+invalidate the whole optional source. The eligible observations include
+access on `TwoGigabitEthernet1/0/1`, trunk on `TenGigabitEthernet1/0/47`, and 51
+down ports. Down dynamic ports do not establish negotiated access/trunk mode.
+The narrow C9300-48UXM configuration-default profile now includes documented
+17.18 defaults; the separate duplex and hardware profiles are unchanged.
+
+Validation passed 388 offline regressions, lint/format/syntax checks, and 73
+real Nautobot 3.2.5 ORM checks with zero persistent integration changes. Live
+strict and opt-in GET-only previews issued zero inventory mutation statements.
+A process-local unavailable-library injection also successfully probed the
+real operational endpoint, retaining an unknown revision and issuing zero
+inventory writes. Real registered worker preview and strict apply both
+succeeded with attached reports and equal before/after inventory snapshots.
+All proposed inventory changes were zero. The source produced no discovery
+warnings. Two suspended LACP member observations (ports 22 and 23) remained
+unresolved without changing their existing configuration or LAG membership;
+the previously recorded `Vlan2` type conflict and four missing hardware
+identities also remain preserved.

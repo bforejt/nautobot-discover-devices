@@ -2,7 +2,7 @@
 
 import unittest
 
-from tests._loader import load
+from tests._loader import fixture, load
 from tests.test_cisco_iosxe import FixtureClient, cisco
 from tests.test_cisco_layer2 import native_row, payloads
 from tests.test_vlan_reconcile import apply_to_snapshot
@@ -128,7 +128,7 @@ class OperationalSwitchportMappingTests(unittest.TestCase):
             "Cisco-IOS-XE-install-oper:install-location-information"
         ]:
             for version in row.get("install-version-info", []):
-                version["version"] = "17.18.1"
+                version["version"] = "17.17.1"
         native_row(values, "TwoGigabitEthernet", "1/0/35")["switchport-config"] = {
             "switchport": {"access": {"vlan": {"vlan": 2}}}
         }
@@ -140,24 +140,31 @@ class OperationalSwitchportMappingTests(unittest.TestCase):
             settings(found)["field_sources"]["configured_mode"], "device-reported-admin-mode"
         )
 
-    def test_reviewed_1715_actual_access_and_trunk_use_documented_scoped_defaults(self):
-        for mode in ("oper-dyn-acc", "oper-trunk"):
-            with self.subTest(mode=mode):
+    def test_reviewed_1715_and_1718_actual_modes_use_scoped_defaults_without_widening_duplex(self):
+        for release, mode in (
+            ("17.15.1", "oper-dyn-acc"),
+            ("17.15.1", "oper-trunk"),
+            ("17.18.4", "oper-dyn-acc"),
+            ("17.18.4", "oper-trunk"),
+        ):
+            with self.subTest(release=release, mode=mode):
                 values, _ = operational_values(mode)
                 for row in values[cisco.INSTALL_PATH][
                     "Cisco-IOS-XE-install-oper:install-location-information"
                 ]:
                     for version in row.get("install-version-info", []):
-                        version["version"] = "17.15.1"
+                        version["version"] = release
                 found = cisco.collect(FixtureClient(values))
                 mapped = bundle(found)
                 self.assertEqual(
                     mapped["mode"], "access" if mode == "oper-dyn-acc" else "tagged-all"
                 )
                 self.assertEqual(mapped["untagged_vid"], 1)
-                self.assertEqual(mapped["source"]["defaults"]["software_family"], "17.15")
+                family = ".".join(release.split(".")[:2])
+                self.assertEqual(mapped["source"]["defaults"]["software_family"], family)
                 self.assertIn(
-                    "17-15/", mapped["source"]["defaults"]["documents"]["global_native_tagging"]
+                    family.replace(".", "-") + "/",
+                    mapped["source"]["defaults"]["documents"]["global_native_tagging"],
                 )
                 self.assertNotIn("inferred", mapped)
                 # Switchport review does not widen the separate duplex profile.
@@ -334,7 +341,7 @@ class OperationalSwitchportMappingTests(unittest.TestCase):
         self.assertEqual(planned["summary"]["switching_operational"], 1)
         self.assertEqual(planned["summary"]["switching_dynamic_resolved"], 0)
 
-    def test_malformed_library_is_unknown_and_never_triggers_the_optional_get(self):
+    def test_malformed_library_triggers_a_valid_probe_without_a_claimed_revision(self):
         for entry in (
             {},
             {"name": [oper.MODULE]},
@@ -344,15 +351,298 @@ class OperationalSwitchportMappingTests(unittest.TestCase):
             with self.subTest(entry=entry):
                 values, _ = operational_values()
                 values[cisco.YANG_LIBRARY_PATH]["ietf-yang-library:modules-state"]["module"] = [
-                    entry
+                    {"name": "Cisco-IOS-XE-native", "revision": "2023-08-20"},
+                    {"name": oper.MODULE, "revision": "2024-03-01"},
+                    entry,
                 ]
                 client = FixtureClient(values)
                 found = cisco.collect(client)
+                source = found["layer2"]["operational_source"]
+                self.assertEqual(source["status"], "available")
+                self.assertEqual(source["capability_status"], "unknown")
+                self.assertTrue(source["probed_without_advertisement"])
+                self.assertIsNone(source["revision"])
+                self.assertTrue(any(path.startswith(oper.PATH) for path in client.requests))
+                self.assertEqual(bundle(found)["mode"], "access")
+                self.assertIsNone(bundle(found)["source"]["operational_mode"]["revision"])
+                self.assertEqual(found["evidence"]["modules"], {})
+
+    def test_unavailable_library_probes_valid_json_with_bounded_read_on_supported_releases(self):
+        class UnknownLibraryClient(FixtureClient):
+            def __init__(self, values):
+                super().__init__(values)
+                self.probe_options = []
+
+            def get(self, path, **kwargs):
+                if path.startswith(cisco.YANG_LIBRARY_PATH):
+                    raise cisco.RestconfError("secret-response-body", status_code=503)
+                if path.startswith(oper.PATH):
+                    self.probe_options.append(kwargs)
+                return super().get(path, **kwargs)
+
+        for release in ("17.12.8", "17.15.1", "17.18.1"):
+            with self.subTest(release=release):
+                values, _ = operational_values()
+                for row in values[cisco.INSTALL_PATH][
+                    "Cisco-IOS-XE-install-oper:install-location-information"
+                ]:
+                    for version in row.get("install-version-info", []):
+                        version["version"] = release
+                # Explicit configuration makes this test independent of release defaults.
+                native_row(values, "TwoGigabitEthernet", "1/0/35")["switchport-config"] = {
+                    "switchport": {"mode": {"dynamic": "auto"}, "access": {"vlan": {"vlan": 2}}}
+                }
+                client = UnknownLibraryClient(values)
+                found = cisco.collect(client)
+                source = found["layer2"]["operational_source"]
+                self.assertEqual(source["status"], "available")
+                self.assertEqual(source["capability_status"], "unknown")
+                self.assertTrue(source["probed_without_advertisement"])
+                self.assertIsNone(source["revision"])
+                self.assertEqual(client.probe_options, [{"timeout": 15}])
+                self.assertEqual(bundle(found)["mode"], "access")
+                self.assertEqual(bundle(found)["untagged_vid"], 2)
+                self.assertEqual(len(found["interfaces"]), 58)
+                self.assertEqual(found["evidence"]["modules"], {})
+                self.assertNotIn("secret-response-body", str(found["warnings"]))
+
+    def test_known_unadvertised_module_skips_probe_and_keeps_native_configuration(self):
+        values, _ = operational_values()
+        library = values[cisco.YANG_LIBRARY_PATH]["ietf-yang-library:modules-state"]
+        library["module"] = [row for row in library["module"] if row["name"] != oper.MODULE]
+        client = FixtureClient(values)
+        found = cisco.collect(client)
+        self.assertEqual(found["layer2"]["operational_source"]["status"], "not-advertised")
+        self.assertFalse(any(path.startswith(oper.PATH) for path in client.requests))
+        self.assertEqual(found["identity"]["software_version"], "17.12.08")
+        self.assertEqual(len(found["layer2"]["interfaces"]), 19)
+        self.assertIsNone(bundle(found))
+
+    def test_live_1718_shape_retains_known_exclusions_without_assigning_them(self):
+        values, _ = operational_values()
+        values[oper.PATH] = fixture("iosxe_1718_switchport_oper.json")
+        for row in values[cisco.INSTALL_PATH][
+            "Cisco-IOS-XE-install-oper:install-location-information"
+        ]:
+            for version in row.get("install-version-info", []):
+                version["version"] = "17.18.4"
+        found = cisco.collect(FixtureClient(values))
+        self.assertEqual(found["identity"]["software_version"], "17.18.04")
+        self.assertEqual(found["layer2"]["operational_source"]["status"], "available")
+        observed = found["layer2"]["operational_interfaces"]
+        self.assertEqual(len(observed), 66)
+        self.assertEqual(sum(row["applicability"]["eligible"] for row in observed), 53)
+        excluded = {row["name"] for row in found["excluded_interfaces"]}
+        self.assertEqual(len(excluded), 13)
+        self.assertEqual(
+            {row["name"] for row in observed if not row["applicability"]["eligible"]}, excluded
+        )
+        self.assertEqual(sum(row["operational_mode"] in ("access", "trunk") for row in observed), 2)
+        self.assertFalse(excluded & {row["name"] for row in found["layer2"]["settings"]})
+        self.assertFalse(excluded & {row["name"] for row in found["layer2"]["interfaces"]})
+        defaults = settings(found)
+        self.assertEqual(defaults["source"]["defaults"]["software_family"], "17.18")
+        self.assertEqual(
+            (defaults["access_vid"], defaults["native_vid"], defaults["allowed_mode"]),
+            (1, 1, "all"),
+        )
+        self.assertEqual(defaults["field_sources"]["access_vid"], "documented-default")
+        self.assertEqual(defaults["field_sources"]["native_vid"], "documented-default")
+        self.assertTrue(defaults["source"]["config"]["complete_read"])
+        self.assertTrue(defaults["source"]["global_tagging"]["complete_read"])
+        self.assertIsNone(next(row for row in found["interfaces"] if row["name"] == PORT)["duplex"])
+        planned = planner.plan_vlans(found, inventory(found))
+        self.assertFalse(planned["errors"])
+        self.assertEqual(planned["summary"]["switching_operational"], 2)
+        self.assertEqual(planned["summary"]["switching_inferred"], 0)
+        self.assertFalse(excluded & {row["name"] for row in planned["assignments"]})
+
+    def test_malformed_known_excluded_live_row_still_discards_source_and_blocks_guessing(self):
+        values, _ = operational_values("oper-down", ready=False)
+        values[oper.PATH] = fixture("iosxe_1718_switchport_oper.json")
+        rows = values[oper.PATH][oper.MODULE + ":switchport-oper-data"]["switchport-info"]
+        next(row for row in rows if row["if-name"] == "AppGigabitEthernet1/0/1")[
+            "hardware-present"
+        ] = True
+        found = cisco.collect(FixtureClient(values), use_ntc_defaults=True)
+        self.assertEqual(found["layer2"]["operational_source"]["status"], "invalid")
+        self.assertEqual(found["layer2"]["operational_interfaces"], [])
+        self.assertIsNone(bundle(found))
+        self.assertFalse(any(row.get("inferred") for row in found["layer2"]["interfaces"]))
+
+    def test_failed_optional_probe_preserves_core_and_explicit_native_config(self):
+        for status in (None, 200, 201, 299, 401, 403, 404, 501, 503):
+            with self.subTest(status=status):
+                values, _ = operational_values()
+                values[cisco.YANG_LIBRARY_PATH] = {}
+
+                class FailedProbeClient(FixtureClient):
+                    def __init__(self, payloads, failure_status):
+                        super().__init__(payloads)
+                        self.failure_status = failure_status
+
+                    def get(self, path, **kwargs):
+                        if path.startswith(oper.PATH):
+                            raise cisco.RestconfError(
+                                "secret-response-body", status_code=self.failure_status
+                            )
+                        return super().get(path, **kwargs)
+
+                found = cisco.collect(FailedProbeClient(values, status))
+                source = found["layer2"]["operational_source"]
                 self.assertEqual(
-                    found["layer2"]["operational_source"]["status"], "capability-unknown"
+                    source["status"],
+                    "invalid"
+                    if status is not None and 200 <= status < 300
+                    else "unsupported"
+                    if status in (404, 501)
+                    else "unavailable",
                 )
-                self.assertFalse(any(path.startswith(oper.PATH) for path in client.requests))
+                self.assertEqual(source["capability_status"], "unknown")
+                self.assertEqual(found["layer2"]["operational_interfaces"], [])
+                self.assertEqual(len(found["interfaces"]), 58)
+                self.assertEqual(len(found["layer2"]["interfaces"]), 19)
                 self.assertIsNone(bundle(found))
+                self.assertNotIn("secret-response-body", str(found["warnings"]))
+
+    def test_malformed_successful_http_body_blocks_ntc_even_after_a_filter_retry(self):
+        class MalformedBodyClient(FixtureClient):
+            def __init__(self, values, retry, body_kind):
+                super().__init__(values)
+                self.retry = retry
+                self.body_kind = body_kind
+                self.probe_requests = []
+
+            def get(self, path, **kwargs):
+                if path.startswith(oper.PATH):
+                    self.probe_requests.append(path)
+                    status = 400 if self.retry and len(self.probe_requests) == 1 else 200
+                    self.requests.append(path)
+                    self.trace.append({"path": path, "status": status})
+                    raise cisco.RestconfError(
+                        "secret-response-body: " + self.body_kind, status_code=status
+                    )
+                return super().get(path, **kwargs)
+
+        for retry in (False, True):
+            for body_kind in ("non-JSON response", "JSON array instead of object"):
+                with self.subTest(retry=retry, body_kind=body_kind):
+                    values, _ = operational_values("oper-down", ready=False)
+                    values[cisco.YANG_LIBRARY_PATH] = {}
+                    client = MalformedBodyClient(values, retry, body_kind)
+                    found = cisco.collect(client, use_ntc_defaults=True)
+                    source = found["layer2"]["operational_source"]
+                    self.assertEqual(source["status"], "invalid")
+                    self.assertEqual(source["http_status"], 200)
+                    self.assertTrue(source["reason"])
+                    self.assertEqual(found["layer2"]["operational_interfaces"], [])
+                    self.assertIsNone(bundle(found))
+                    self.assertFalse(any("inference" in row for row in found["layer2"]["settings"]))
+                    self.assertFalse(
+                        any(row.get("inferred") for row in found["layer2"]["interfaces"])
+                    )
+                    self.assertEqual(len(found["layer2"]["interfaces"]), 19)
+                    self.assertEqual(len(found["interfaces"]), 58)
+                    self.assertEqual(
+                        client.probe_requests,
+                        [oper.PATH + "?fields=" + oper.FIELDS] + ([oper.PATH] if retry else []),
+                    )
+                    self.assertNotIn("secret-response-body", str(source) + str(found["warnings"]))
+                    planned = planner.plan_vlans(found, inventory(found))
+                    self.assertFalse(planned["errors"])
+                    self.assertEqual(planned["summary"]["switching_inferred"], 0)
+                    self.assertEqual(planned["summary"]["interface_vlan_assignments_inferred"], 0)
+                    self.assertEqual(len(planned["assignments"]), 19)
+                    self.assertNotIn(PORT, {row["name"] for row in planned["assignments"]})
+
+    def test_required_core_decode_failures_still_propagate(self):
+        class BadCoreClient(FixtureClient):
+            def __init__(self, values, failed_path):
+                super().__init__(values)
+                self.failed_path = failed_path
+
+            def get(self, path, **kwargs):
+                if path.split("?", 1)[0] == self.failed_path:
+                    raise cisco.RestconfError("Malformed successful core response", status_code=200)
+                return super().get(path, **kwargs)
+
+        for path in (
+            cisco.HOSTNAME_PATH,
+            cisco.HARDWARE_PATH,
+            cisco.INSTALL_PATH,
+            cisco.INTERFACES_PATH,
+        ):
+            with self.subTest(path=path):
+                values, _ = operational_values()
+                with self.assertRaises(cisco.RestconfError):
+                    cisco.collect(BadCoreClient(values, path), use_ntc_defaults=True)
+
+    def test_invalid_late_optional_row_discards_all_facts_and_blocks_ntc_guessing(self):
+        for advertised in (False, True):
+            with self.subTest(advertised=advertised):
+                values, row = operational_values("oper-down", ready=False)
+                if not advertised:
+                    values[cisco.YANG_LIBRARY_PATH] = {}
+                rows = values[oper.PATH][oper.MODULE + ":switchport-oper-data"]["switchport-info"]
+                rows.append({**row, "if-name": "secret-response-body"})
+                found = cisco.collect(FixtureClient(values), use_ntc_defaults=True)
+                self.assertEqual(found["layer2"]["operational_source"]["status"], "invalid")
+                self.assertEqual(found["layer2"]["operational_interfaces"], [])
+                self.assertIsNone(bundle(found))
+                self.assertFalse(any(row.get("inferred") for row in found["layer2"]["interfaces"]))
+                self.assertFalse(any("inference" in row for row in found["layer2"]["settings"]))
+                self.assertEqual(len(found["layer2"]["interfaces"]), 19)
+                self.assertEqual(len(found["interfaces"]), 58)
+                self.assertNotIn("secret-response-body", str(found["layer2"]["operational_source"]))
+                self.assertNotIn("secret-response-body", str(found["warnings"]))
+                planned = planner.plan_vlans(found, inventory(found))
+                self.assertFalse(planned["errors"])
+                self.assertEqual(planned["summary"]["switching_operational"], 0)
+                self.assertEqual(planned["summary"]["switching_inferred"], 0)
+                self.assertNotIn(PORT, {row["name"] for row in planned["assignments"]})
+
+    def test_invalid_optional_source_preserves_populated_inventory(self):
+        values, _ = operational_values(ready=False)
+        # A successful 200 wrong envelope is invalid rather than evidence of defaults.
+        values[oper.PATH] = {}
+        discovered = cisco.collect(FixtureClient(values), use_ntc_defaults=True)
+        before = inventory(discovered)
+        existing = next(row for row in before["interfaces"] if row["name"] == PORT)
+        existing.update({"mode": "tagged-all", "untagged_vlan_id": "operator-vlan"})
+        planned = planner.plan_vlans(discovered, before)
+        self.assertFalse(planned["errors"])
+        self.assertNotIn(PORT, {row["name"] for row in planned["assignments"]})
+        after = apply_to_snapshot(planned, before)
+        self.assertEqual(next(row for row in after["interfaces"] if row["name"] == PORT), existing)
+
+    def test_required_core_sources_still_block_before_optional_fallback(self):
+        for path in (cisco.HOSTNAME_PATH, cisco.INSTALL_PATH, cisco.INTERFACES_PATH):
+            with self.subTest(path=path):
+                values, _ = operational_values()
+                values[path] = {}
+                values[cisco.YANG_LIBRARY_PATH] = {}
+                values[oper.PATH] = {}
+                with self.assertRaises(cisco.DiscoveryError):
+                    cisco.collect(FixtureClient(values), use_ntc_defaults=True)
+
+    def test_optional_probe_cancellation_and_programming_errors_still_propagate(self):
+        for error in (RuntimeError("worker time limit"), TypeError("programming error")):
+            with self.subTest(error=type(error).__name__):
+                values, _ = operational_values()
+                values[cisco.YANG_LIBRARY_PATH] = {}
+
+                class BrokenProbeClient(FixtureClient):
+                    def __init__(self, payloads, failure):
+                        super().__init__(payloads)
+                        self.failure = failure
+
+                    def get(self, path, **kwargs):
+                        if path.startswith(oper.PATH):
+                            raise self.failure
+                        return super().get(path, **kwargs)
+
+                with self.assertRaises(type(error)):
+                    cisco.collect(BrokenProbeClient(values, error))
 
     def test_qualified_library_leaves_still_establish_actual_capability(self):
         values, _ = operational_values()

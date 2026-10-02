@@ -368,6 +368,45 @@ class DiscoveryJobTests(unittest.TestCase):
         self.job.logger.error.assert_not_called()
         self.assertEqual(self.assert_saved_report()["plan"], self.preview_plan)
 
+    def test_optional_actual_source_failures_continue_without_exposing_raw_evidence(self):
+        for status in ("unsupported", "unavailable", "invalid"):
+            with self.subTest(status=status):
+                self.job.logger.reset_mock()
+                self.preview_plan["layer2"] = {
+                    "operational_source": {
+                        "status": status,
+                        "reason": "private-response-sentinel",
+                    }
+                }
+                self.job.run(self.device)
+                messages = "\n".join(rendered_logs(self.job.logger))
+                self.assertIn(status, messages)
+                self.assertIn("Preview complete", messages)
+                self.assertNotIn("private-response-sentinel", messages)
+                self.job.logger.error.assert_not_called()
+                if status == "invalid":
+                    self.assertIn("NTC mode guessing", messages)
+                self.assertEqual(
+                    self.assert_saved_report()["plan"]["layer2"]["operational_source"]["status"],
+                    status,
+                )
+
+    def test_valid_direct_probe_explains_unknown_revision_without_guessing(self):
+        self.preview_plan["layer2"] = {
+            "operational_source": {
+                "status": "available",
+                "capability_status": "unknown",
+                "probed_without_advertisement": True,
+                "revision": None,
+            }
+        }
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger))
+        self.assertIn("validated by a direct RESTCONF probe", messages)
+        self.assertIn("revision remains unknown", messages)
+        self.job.logger.warning.assert_not_called()
+        self.job.logger.error.assert_not_called()
+
     def test_known_type_conflict_identifies_the_preserved_interface(self):
         self.preview_plan["summary"].update(conflicts=1)
         self.preview_plan["conflicts"] = [

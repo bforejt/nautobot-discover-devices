@@ -556,6 +556,7 @@ def collect(client, *, use_ntc_defaults=False):
         # worker time limits and programming errors must propagate unchanged.
         # Optional evidence must not mask a required discovery failure, and
         # transport/provider exception bodies are never copied into artifacts.
+        modules.clear()
         status = getattr(exc, "status_code", None)
         warnings.append(
             "YANG module revision evidence unavailable%s"
@@ -568,6 +569,7 @@ def collect(client, *, use_ntc_defaults=False):
             canonical_name=canonical_interface_name,
             revisions=modules if library_known else None,
             warnings=warnings,
+            excluded_interfaces=excluded,
         )
     except cisco_switchport_oper.SwitchportOperDiscoveryError as exc:
         raise DiscoveryError(str(exc)) from None

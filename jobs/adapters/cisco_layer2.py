@@ -26,7 +26,7 @@ FAMILIES = (
 # scope. Augmentation-qualified child filters otherwise silently lose data.
 NATIVE_FIELDS = ";".join(family + "(name;switchport-conf;switchport-config)" for family in FAMILIES)
 VLAN_FIELDS = "vlan(id;name;status)"
-PROFILE = "c9300-48uxm-ordinary-switchport-defaults-v3"
+PROFILE = "c9300-48uxm-ordinary-switchport-defaults-v4"
 YANG_URL = (
     "https://raw.githubusercontent.com/YangModels/yang/main/"
     "vendor/cisco/xe/17131/Cisco-IOS-XE-switch.yang"
@@ -130,7 +130,7 @@ def _read(client, path, fields, warnings):
 
 def _profile(model, version):
     family = ".".join(version.split(".")[:2]) if isinstance(version, str) else None
-    if model != "C9300-48UXM" or family not in ("17.9", "17.12", "17.15"):
+    if model != "C9300-48UXM" or family not in ("17.9", "17.12", "17.15", "17.18"):
         return None
     doc_root = DOC_ROOT % (family.replace(".", "-"), family.replace(".", ""))
     config_root = CONFIG_DOC_ROOT % (family.replace(".", "-"), family.replace(".", ""))
@@ -676,6 +676,7 @@ def collect(
     operational = switchport_oper or {"interfaces": []}
     result["operational_source"] = operational.get("source")
     result["operational_interfaces"] = list(operational["interfaces"])
+    operational_invalid = (operational.get("source") or {}).get("status") == "invalid"
     operational_by_name = {row["name"]: row for row in operational["interfaces"]}
     lags = {row["member"]: canonical_name(row["lag"]) for row in lag_memberships}
     profile = _profile(model, software_version)
@@ -805,6 +806,12 @@ def collect(
             bundle, reason = _bundle(switchport or {}, defaults, global_tagging)
             operational_fact = operational_by_name.get(name)
             operational_reason = None
+            if operational_invalid:
+                settings["observations"]["operational_source_invalid"] = True
+                operational_reason = (
+                    "Optional operational switchport data was invalid; negotiated mode "
+                    "and guessing remain unresolved"
+                )
             if operational_fact is not None:
                 source["operational_mode"] = operational_fact["source"]
                 observed_bundle, operational_reason = _operational_bundle(
@@ -851,12 +858,15 @@ def collect(
             # A reported positive/special/unknown mode must never be replaced
             # by NTC's link-down assumption. Only an actual down report may
             # participate, and the existing independent link-down guard holds.
-            permit_inference = operational_fact is None or (
-                operational_fact["operational_mode"] == "down"
-                and _oper_enum(operational_fact["admin_mode"])
-                in ("admin-dyn-auto", "admin-dyn-des")
-                and operational_reason
-                == "Reported operational switchport mode is down, unknown, or unsupported"
+            permit_inference = not operational_invalid and (
+                operational_fact is None
+                or (
+                    operational_fact["operational_mode"] == "down"
+                    and _oper_enum(operational_fact["admin_mode"])
+                    in ("admin-dyn-auto", "admin-dyn-des")
+                    and operational_reason
+                    == "Reported operational switchport mode is down, unknown, or unsupported"
+                )
             )
             if use_ntc_defaults and bundle is None and permit_inference:
                 bundle = _ntc_down_bundle(settings, interface, physical, reason)

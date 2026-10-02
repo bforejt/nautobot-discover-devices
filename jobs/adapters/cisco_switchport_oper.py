@@ -176,7 +176,7 @@ def _read(client, warnings):
         return None, exc.status_code, False
 
 
-def collect(client, interfaces, *, canonical_name, revisions, warnings):
+def collect(client, interfaces, *, canonical_name, revisions, warnings, excluded_interfaces=()):
     """Return applicable actual modes, retaining all distinct administrative facts.
 
     A known complete module map skips an absent module. An unreadable library
@@ -209,6 +209,23 @@ def collect(client, interfaces, *, canonical_name, revisions, warnings):
         if not isinstance(name, str) or not name or name in eligible:
             raise SwitchportOperDiscoveryError("Eligible canonical interface names are ambiguous")
         eligible.add(name)
+    excluded = {}
+    for interface in excluded_interfaces:
+        name = interface.get("name") if isinstance(interface, dict) else None
+        reason = interface.get("reason") if isinstance(interface, dict) else None
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or not isinstance(reason, str)
+            or not reason
+        ):
+            raise SwitchportOperDiscoveryError(
+                "Excluded interfaces require structured names/reasons"
+            )
+        name = canonical_name(name)
+        if not isinstance(name, str) or not name or name in eligible or name in excluded:
+            raise SwitchportOperDiscoveryError("Excluded canonical interface names are ambiguous")
+        excluded[name] = reason
     payload, status, read_ok = _read(client, warnings)
     source["http_status"] = status
     if not read_ok:
@@ -220,7 +237,7 @@ def collect(client, interfaces, *, canonical_name, revisions, warnings):
         source["status"] = "available"
         return result
     try:
-        parsed = _parse(payload, eligible, canonical_name, revision)
+        parsed = _parse(payload, eligible, excluded, canonical_name, revision)
     except SwitchportOperDiscoveryError as exc:
         # Validation messages contain only fixed schema labels; never retain
         # remote response bodies. Discard the entire source, including earlier
@@ -237,7 +254,7 @@ def collect(client, interfaces, *, canonical_name, revisions, warnings):
     return result
 
 
-def _parse(payload, eligible, canonical_name, revision):
+def _parse(payload, eligible, excluded, canonical_name, revision):
     """Validate all remote rows before exposing any optional interface facts."""
     envelope = _object(payload, "Switchport operational reply")
     container = _object(_value(envelope, "switchport-oper-data"), "switchport-oper-data")
@@ -252,7 +269,7 @@ def _parse(payload, eligible, canonical_name, revision):
         if raw_name is None or not raw_name.strip():
             raise SwitchportOperDiscoveryError("Switchport operational row lacks if-name")
         name = canonical_name(raw_name)
-        if name not in eligible:
+        if name not in eligible and name not in excluded:
             raise SwitchportOperDiscoveryError(
                 "Switchport operational row has no eligible canonical interface match"
             )
@@ -265,9 +282,12 @@ def _parse(payload, eligible, canonical_name, revision):
         details = _details(_value(row, "port-details")) if _has(row, "port-details") else {}
         oper = _enum(details, "oper-mode")
         ordinary = admin in ORDINARY_ADMIN
-        usable = enabled and hardware and ordinary and oper in OPERATIONAL_MODES
+        applicable = name in eligible
+        usable = applicable and enabled and hardware and ordinary and oper in OPERATIONAL_MODES
         reason = None
-        if not enabled:
+        if not applicable:
+            reason = excluded[name]
+        elif not enabled:
             reason = "Switchport is disabled; interface is routed"
         elif not hardware:
             reason = "Switchport hardware is not reported present"
@@ -281,6 +301,7 @@ def _parse(payload, eligible, canonical_name, revision):
                 "admin_mode": _value(row, "admin-mode"),
                 "operational_mode": OPERATIONAL_MODES[oper] if usable else None,
                 "applicability": {
+                    "eligible": applicable,
                     "enabled": enabled,
                     "hardware_present": hardware,
                     "ordinary_admin": ordinary,

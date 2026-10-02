@@ -3,7 +3,8 @@
 import unittest
 from copy import deepcopy
 
-from tests._loader import load
+from tests._loader import fixture, load
+from tests.test_cisco_iosxe import FixtureClient
 
 switchport = load("adapters.cisco_switchport_oper")
 cisco = load("adapters.cisco_iosxe")
@@ -56,7 +57,9 @@ class FakeClient:
 
 
 class SwitchportOperationalTests(unittest.TestCase):
-    def collect(self, rows=None, client=None, revisions=True, interfaces=None):
+    def collect(
+        self, rows=None, client=None, revisions=True, interfaces=None, excluded_interfaces=()
+    ):
         if client is None:
             client = FakeClient(payload(rows if rows is not None else [port()]))
         self.warnings = []
@@ -66,6 +69,7 @@ class SwitchportOperationalTests(unittest.TestCase):
             canonical_name=cisco.canonical_interface_name,
             revisions={switchport.MODULE: "2024-03-01"} if revisions is True else revisions,
             warnings=self.warnings,
+            excluded_interfaces=excluded_interfaces,
         )
         return result
 
@@ -118,6 +122,7 @@ class SwitchportOperationalTests(unittest.TestCase):
         self.assertEqual(row["admin_mode"], "admin-dyn-auto")
         self.assertEqual(row["operational_mode"], "access")
         self.assertTrue(row["applicability"]["usable"])
+        self.assertTrue(row["applicability"]["eligible"])
         self.assertEqual(row["observations"], port())
         self.assertEqual(row["source"]["field"], "port-details/oper-mode")
         self.assertEqual(row["source"]["interface"], "Gi1/0/1")
@@ -301,6 +306,90 @@ class SwitchportOperationalTests(unittest.TestCase):
                 self.assert_invalid(
                     self.collect([port(), invalid], revisions=True if advertised else None)
                 )
+
+    def test_live_1718_rows_retain_53_eligible_and_13_known_excluded_observations(self):
+        core = cisco.collect(FixtureClient())
+        raw = fixture("iosxe_1718_switchport_oper.json")
+        result = self.collect(
+            client=FakeClient(raw),
+            interfaces=core["interfaces"],
+            excluded_interfaces=core["excluded_interfaces"],
+        )
+        self.assertEqual(result["source"]["status"], "available")
+        self.assertEqual(len(result["interfaces"]), 66)
+        eligible = [row for row in result["interfaces"] if row["applicability"]["eligible"]]
+        excluded = [row for row in result["interfaces"] if not row["applicability"]["eligible"]]
+        self.assertEqual((len(eligible), len(excluded)), (53, 13))
+        self.assertEqual(
+            {row["name"] for row in eligible if row["operational_mode"] in ("access", "trunk")},
+            {"TwoGigabitEthernet1/0/1", "TenGigabitEthernet1/0/47"},
+        )
+        core_reasons = {row["name"]: row["reason"] for row in core["excluded_interfaces"]}
+        raw_by_name = {
+            cisco.canonical_interface_name(row["if-name"]): row
+            for row in raw[switchport.MODULE + ":switchport-oper-data"]["switchport-info"]
+        }
+        for row in excluded:
+            self.assertIsNone(row["operational_mode"])
+            self.assertFalse(row["applicability"]["usable"])
+            self.assertEqual(row["applicability"]["reason"], core_reasons[row["name"]])
+            self.assertEqual(row["observations"], raw_by_name[row["name"]])
+        internal = next(row for row in excluded if row["name"] == "AppGigabitEthernet1/0/1")
+        self.assertEqual(internal["observations"]["port-details"]["oper-mode"], "oper-stat-acc")
+        self.assertEqual(self.warnings, [])
+
+    def test_malformed_or_duplicate_known_excluded_rows_discard_the_entire_source(self):
+        core = cisco.collect(FixtureClient())
+        for change in (
+            "malformed-empty",
+            "malformed-oper",
+            "malformed-absent-details",
+            "duplicate-alias",
+            "unknown-name",
+        ):
+            with self.subTest(change=change):
+                raw = fixture("iosxe_1718_switchport_oper.json")
+                rows = raw[switchport.MODULE + ":switchport-oper-data"]["switchport-info"]
+                internal = next(row for row in rows if row["if-name"] == "AppGigabitEthernet1/0/1")
+                if change == "malformed-empty":
+                    internal["hardware-present"] = True
+                elif change == "malformed-oper":
+                    internal["port-details"]["oper-mode"] = []
+                elif change == "malformed-absent-details":
+                    absent = next(
+                        row for row in rows if row["if-name"] == "TenGigabitEthernet1/1/1"
+                    )
+                    absent["port-details"] = {"oper-mode": []}
+                elif change == "duplicate-alias":
+                    rows.append({**deepcopy(internal), "if-name": "Ap1/0/1"})
+                else:
+                    rows.append(port("Gi9/0/99"))
+                self.assert_invalid(
+                    self.collect(
+                        client=FakeClient(raw),
+                        interfaces=core["interfaces"],
+                        excluded_interfaces=core["excluded_interfaces"],
+                    )
+                )
+
+    def test_exclusion_input_collisions_and_bad_shapes_remain_contract_errors(self):
+        for excluded in (
+            [{"name": "Gi1/0/1", "reason": "Absent"}],
+            [
+                {"name": "Ap1/0/1", "reason": "Internal"},
+                {"name": "AppGigabitEthernet1/0/1", "reason": "Internal"},
+            ],
+            [{"name": None, "reason": "Absent"}],
+            [{"name": "", "reason": "Absent"}],
+            [{"name": "Ap1/0/1", "reason": None}],
+            [{"name": "Ap1/0/1", "reason": ""}],
+            ["Ap1/0/1"],
+        ):
+            with (
+                self.subTest(excluded=excluded),
+                self.assertRaises(switchport.SwitchportOperDiscoveryError),
+            ):
+                self.collect(excluded_interfaces=excluded)
 
     def test_empty_structured_list_and_confirmed_204_are_available_empty_sources(self):
         for client in (FakeClient(payload([])), FakeClient({}, status=204)):

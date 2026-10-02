@@ -26,7 +26,7 @@ FAMILIES = (
 # scope. Augmentation-qualified child filters otherwise silently lose data.
 NATIVE_FIELDS = ";".join(family + "(name;switchport-conf;switchport-config)" for family in FAMILIES)
 VLAN_FIELDS = "vlan(id;name;status)"
-PROFILE = "c9300-48uxm-ordinary-switchport-defaults-v3"
+PROFILE = "c9300-48uxm-ordinary-switchport-defaults-v4"
 YANG_URL = (
     "https://raw.githubusercontent.com/YangModels/yang/main/"
     "vendor/cisco/xe/17131/Cisco-IOS-XE-switch.yang"
@@ -130,7 +130,7 @@ def _read(client, path, fields, warnings):
 
 def _profile(model, version):
     family = ".".join(version.split(".")[:2]) if isinstance(version, str) else None
-    if model != "C9300-48UXM" or family not in ("17.9", "17.12", "17.15"):
+    if model != "C9300-48UXM" or family not in ("17.9", "17.12", "17.15", "17.18"):
         return None
     doc_root = DOC_ROOT % (family.replace(".", "-"), family.replace(".", ""))
     config_root = CONFIG_DOC_ROOT % (family.replace(".", "-"), family.replace(".", ""))

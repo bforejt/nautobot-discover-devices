@@ -569,6 +569,7 @@ def collect(client, *, use_ntc_defaults=False):
             canonical_name=canonical_interface_name,
             revisions=modules if library_known else None,
             warnings=warnings,
+            excluded_interfaces=excluded,
         )
     except cisco_switchport_oper.SwitchportOperDiscoveryError as exc:
         raise DiscoveryError(str(exc)) from None

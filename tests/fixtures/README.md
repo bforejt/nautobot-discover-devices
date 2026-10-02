@@ -31,3 +31,12 @@ active. Stack tests combine it with reduced hardware and per-member install
 fixtures, deliberately reorder records and vary inventory indexes, and add
 provisioned absent slots. It is not a capture from a physical multi-member lab
 stack. The live lab 9300 currently reports a single ready active member.
+
+`iosxe_1718_switchport_oper.json` is a sanitized IOS XE 17.18.4 live operational
+capture. It preserves all 66 switchport rows: 53 names eligible in mandatory
+core discovery and 13 explicitly excluded names (12 absent uplink aliases and
+one internal AppGigabitEthernet interface). VLAN names are synthetic;
+administrative/operational modes, presence leaves, VLAN IDs/ranges and aggregate
+context are retained. The internal port's positive access observation must not
+become a third eligible positive mode or an inventory assignment. Excluded rows
+still require full schema and duplicate validation before evidence is retained.

@@ -2,7 +2,7 @@
 
 import unittest
 
-from tests._loader import load
+from tests._loader import fixture, load
 from tests.test_cisco_iosxe import FixtureClient, cisco
 from tests.test_cisco_layer2 import native_row, payloads
 from tests.test_vlan_reconcile import apply_to_snapshot
@@ -128,7 +128,7 @@ class OperationalSwitchportMappingTests(unittest.TestCase):
             "Cisco-IOS-XE-install-oper:install-location-information"
         ]:
             for version in row.get("install-version-info", []):
-                version["version"] = "17.18.1"
+                version["version"] = "17.17.1"
         native_row(values, "TwoGigabitEthernet", "1/0/35")["switchport-config"] = {
             "switchport": {"access": {"vlan": {"vlan": 2}}}
         }
@@ -140,24 +140,31 @@ class OperationalSwitchportMappingTests(unittest.TestCase):
             settings(found)["field_sources"]["configured_mode"], "device-reported-admin-mode"
         )
 
-    def test_reviewed_1715_actual_access_and_trunk_use_documented_scoped_defaults(self):
-        for mode in ("oper-dyn-acc", "oper-trunk"):
-            with self.subTest(mode=mode):
+    def test_reviewed_1715_and_1718_actual_modes_use_scoped_defaults_without_widening_duplex(self):
+        for release, mode in (
+            ("17.15.1", "oper-dyn-acc"),
+            ("17.15.1", "oper-trunk"),
+            ("17.18.4", "oper-dyn-acc"),
+            ("17.18.4", "oper-trunk"),
+        ):
+            with self.subTest(release=release, mode=mode):
                 values, _ = operational_values(mode)
                 for row in values[cisco.INSTALL_PATH][
                     "Cisco-IOS-XE-install-oper:install-location-information"
                 ]:
                     for version in row.get("install-version-info", []):
-                        version["version"] = "17.15.1"
+                        version["version"] = release
                 found = cisco.collect(FixtureClient(values))
                 mapped = bundle(found)
                 self.assertEqual(
                     mapped["mode"], "access" if mode == "oper-dyn-acc" else "tagged-all"
                 )
                 self.assertEqual(mapped["untagged_vid"], 1)
-                self.assertEqual(mapped["source"]["defaults"]["software_family"], "17.15")
+                family = ".".join(release.split(".")[:2])
+                self.assertEqual(mapped["source"]["defaults"]["software_family"], family)
                 self.assertIn(
-                    "17-15/", mapped["source"]["defaults"]["documents"]["global_native_tagging"]
+                    family.replace(".", "-") + "/",
+                    mapped["source"]["defaults"]["documents"]["global_native_tagging"],
                 )
                 self.assertNotIn("inferred", mapped)
                 # Switchport review does not widen the separate duplex profile.
@@ -407,8 +414,61 @@ class OperationalSwitchportMappingTests(unittest.TestCase):
         found = cisco.collect(client)
         self.assertEqual(found["layer2"]["operational_source"]["status"], "not-advertised")
         self.assertFalse(any(path.startswith(oper.PATH) for path in client.requests))
+        self.assertEqual(found["identity"]["software_version"], "17.12.08")
         self.assertEqual(len(found["layer2"]["interfaces"]), 19)
         self.assertIsNone(bundle(found))
+
+    def test_live_1718_shape_retains_known_exclusions_without_assigning_them(self):
+        values, _ = operational_values()
+        values[oper.PATH] = fixture("iosxe_1718_switchport_oper.json")
+        for row in values[cisco.INSTALL_PATH][
+            "Cisco-IOS-XE-install-oper:install-location-information"
+        ]:
+            for version in row.get("install-version-info", []):
+                version["version"] = "17.18.4"
+        found = cisco.collect(FixtureClient(values))
+        self.assertEqual(found["identity"]["software_version"], "17.18.04")
+        self.assertEqual(found["layer2"]["operational_source"]["status"], "available")
+        observed = found["layer2"]["operational_interfaces"]
+        self.assertEqual(len(observed), 66)
+        self.assertEqual(sum(row["applicability"]["eligible"] for row in observed), 53)
+        excluded = {row["name"] for row in found["excluded_interfaces"]}
+        self.assertEqual(len(excluded), 13)
+        self.assertEqual(
+            {row["name"] for row in observed if not row["applicability"]["eligible"]}, excluded
+        )
+        self.assertEqual(sum(row["operational_mode"] in ("access", "trunk") for row in observed), 2)
+        self.assertFalse(excluded & {row["name"] for row in found["layer2"]["settings"]})
+        self.assertFalse(excluded & {row["name"] for row in found["layer2"]["interfaces"]})
+        defaults = settings(found)
+        self.assertEqual(defaults["source"]["defaults"]["software_family"], "17.18")
+        self.assertEqual(
+            (defaults["access_vid"], defaults["native_vid"], defaults["allowed_mode"]),
+            (1, 1, "all"),
+        )
+        self.assertEqual(defaults["field_sources"]["access_vid"], "documented-default")
+        self.assertEqual(defaults["field_sources"]["native_vid"], "documented-default")
+        self.assertTrue(defaults["source"]["config"]["complete_read"])
+        self.assertTrue(defaults["source"]["global_tagging"]["complete_read"])
+        self.assertIsNone(next(row for row in found["interfaces"] if row["name"] == PORT)["duplex"])
+        planned = planner.plan_vlans(found, inventory(found))
+        self.assertFalse(planned["errors"])
+        self.assertEqual(planned["summary"]["switching_operational"], 2)
+        self.assertEqual(planned["summary"]["switching_inferred"], 0)
+        self.assertFalse(excluded & {row["name"] for row in planned["assignments"]})
+
+    def test_malformed_known_excluded_live_row_still_discards_source_and_blocks_guessing(self):
+        values, _ = operational_values("oper-down", ready=False)
+        values[oper.PATH] = fixture("iosxe_1718_switchport_oper.json")
+        rows = values[oper.PATH][oper.MODULE + ":switchport-oper-data"]["switchport-info"]
+        next(row for row in rows if row["if-name"] == "AppGigabitEthernet1/0/1")[
+            "hardware-present"
+        ] = True
+        found = cisco.collect(FixtureClient(values), use_ntc_defaults=True)
+        self.assertEqual(found["layer2"]["operational_source"]["status"], "invalid")
+        self.assertEqual(found["layer2"]["operational_interfaces"], [])
+        self.assertIsNone(bundle(found))
+        self.assertFalse(any(row.get("inferred") for row in found["layer2"]["interfaces"]))
 
     def test_failed_optional_probe_preserves_core_and_explicit_native_config(self):
         for status in (None, 200, 201, 299, 401, 403, 404, 501, 503):

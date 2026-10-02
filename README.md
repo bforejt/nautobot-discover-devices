@@ -11,7 +11,8 @@ Only Nautobot 3.2.5 has been tested. Compatibility with older releases is not
 claimed until the same implementation has been tested on them, including native
 Module inventory and template suppression.
 
-Verified on the lab's Nautobot 3.2.5 and C9300-48UXM running IOS XE 17.12.8.
+Verified on the lab's Nautobot 3.2.5 and C9300-48UXM running IOS XE 17.12.8
+and 17.18.4.
 The live worker apply created 57 missing interfaces and enriched one existing
 interface; a second worker apply produced zero inventory changes. Real ORM
 checks verified software catalog creation, fill-only
@@ -369,7 +370,7 @@ untagged and omitted from the tagged set. An all-VLAN trunk maps to `tagged-all`
 without expanding thousands of tagged relationships. Operational membership,
 an SVI, or the absence of switchport configuration does not establish a mode.
 
-The reviewed `C9300-48UXM` profile for IOS XE 17.9, 17.12, and 17.15 permits documented
+The reviewed `C9300-48UXM` profile for IOS XE 17.9, 17.12, 17.15, and 17.18 permits documented
 defaults of dynamic auto, access VLAN 1, trunk native VLAN 1, all allowed trunk
 VLANs, and disabled global native tagging. These defaults apply only after
 successful complete reads of the relevant native configuration and an
@@ -453,15 +454,22 @@ Summary `switching_operational` counts positive access/trunk observations;
 `switching_dynamic_resolved` counts complete dynamic bundles resolved from
 those observations, rather than newly written assignments.
 
-The IOS XE 17.12.8 lab does not advertise this module, and a separate read-only
+Operational rows that match the mandatory interface collector's exact excluded
+names remain observations with `applicability.eligible = false`, `usable = false`,
+and no normalized operational mode. This covers explicitly absent uplink aliases
+and the internal application-hosting interface. They cannot create interfaces,
+contribute positive mode counts, or supply VLAN assignments. Every excluded row
+still receives full schema and duplicate-name validation. A genuinely unknown
+name, inconsistent input exclusion, or malformed row is not silently skipped.
+
+The earlier IOS XE 17.12.8 lab did not advertise this module, and a separate read-only
 probe returned HTTP 404. Three correctly keyed RESTCONF VTP-MIB probes timed
 out after 30 seconds each; the job does not use that alternative. OpenConfig
 VLAN `state/interface-mode` represents
 [applied configuration](https://github.com/YangModels/yang/blob/main/vendor/cisco/xe/17121/openconfig-extensions.yang#L159),
 which does not prove the negotiated DTP result. No device configuration or MIB
-access changes were made. Positive newer-model behavior is covered with
-published-schema offline fixtures and has not been verified on a live
-newer-release switch.
+access changes were made. The subsequent IOS XE 17.18.4 live validation is
+recorded below; positive 17.15 behavior remains covered by schema-based fixtures.
 
 ### Optional NTC inference
 
@@ -766,6 +774,31 @@ unavailable library were process-local test injections, not device changes.
 Both the real worker preview and strict apply succeeded with identical
 before/after inventory snapshots and attached reports. The existing `Vlan2`
 type conflict and four unresolved hardware identities remained unchanged.
-Positive operational-mode cases on 17.15/17.18 remain offline schema-based
-tests; they have not been verified on a live newer-release switch. The
-omitted-leaf default profile remains reviewed only for 17.9/17.12/17.15.
+At that stage, positive operational-mode cases on 17.15/17.18 were covered by
+offline schema-based tests, and the omitted-leaf default profile had been
+reviewed only for 17.9/17.12/17.15.
+
+The `0.11.1-dev` increment was validated live on IOS XE 17.18.4. Its advertised
+operational switchport model (revision `2024-03-01`) returned HTTP 200 and 66
+rows: 53 eligible interfaces, 12 explicitly absent uplink aliases, and one
+internal application-hosting interface. Only exact exclusions already
+established by required interface discovery are retained as observation-only
+records; unknown names, malformed rows and duplicate canonical names still
+invalidate the whole optional source. The eligible observations include
+access on `TwoGigabitEthernet1/0/1`, trunk on `TenGigabitEthernet1/0/47`, and 51
+down ports. Down dynamic ports do not establish negotiated access/trunk mode.
+The narrow C9300-48UXM configuration-default profile now includes documented
+17.18 defaults; the separate duplex and hardware profiles are unchanged.
+
+Validation passed 388 offline regressions, lint/format/syntax checks, and 73
+real Nautobot 3.2.5 ORM checks with zero persistent integration changes. Live
+strict and opt-in GET-only previews issued zero inventory mutation statements.
+A process-local unavailable-library injection also successfully probed the
+real operational endpoint, retaining an unknown revision and issuing zero
+inventory writes. Real registered worker preview and strict apply both
+succeeded with attached reports and equal before/after inventory snapshots.
+All proposed inventory changes were zero. The source produced no discovery
+warnings. Two suspended LACP member observations (ports 22 and 23) remained
+unresolved without changing their existing configuration or LAG membership;
+the previously recorded `Vlan2` type conflict and four missing hardware
+identities also remain preserved.

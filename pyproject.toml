@@ -1,0 +1,9 @@
+# Development configuration only. Git Jobs datasource sync does not install dependencies.
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["UP031"]

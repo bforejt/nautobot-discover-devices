@@ -1,0 +1,20 @@
+{
+  "Cisco-IOS-XE-install-oper:install-location-information": [
+    {
+      "fru": "fru-rp",
+      "slot": 0,
+      "bay": 0,
+      "chassis": 1,
+      "install-version-info": [
+        {
+          "version": "17.12.08.0.770",
+          "current": "install-version-state-provisioned-committed"
+        },
+        {
+          "version": "17.09.06.0.123",
+          "current": "install-version-state-present"
+        }
+      ]
+    }
+  ]
+}

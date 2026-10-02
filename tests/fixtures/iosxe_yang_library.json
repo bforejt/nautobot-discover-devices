@@ -1,0 +1,31 @@
+{
+  "ietf-yang-library:modules-state": {
+    "module-set-id": "sanitized-example",
+    "module": [
+      {
+        "name": "Cisco-IOS-XE-native",
+        "revision": "2023-11-01"
+      },
+      {
+        "name": "Cisco-IOS-XE-ethernet",
+        "revision": "2023-07-01"
+      },
+      {
+        "name": "Cisco-IOS-XE-device-hardware-oper",
+        "revision": "2023-11-01"
+      },
+      {
+        "name": "Cisco-IOS-XE-install-oper",
+        "revision": "2023-11-01"
+      },
+      {
+        "name": "Cisco-IOS-XE-interfaces-oper",
+        "revision": "2023-11-01"
+      },
+      {
+        "name": "Cisco-IOS-XE-platform-oper",
+        "revision": "2023-03-01"
+      }
+    ]
+  }
+}

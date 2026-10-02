@@ -1,0 +1,14 @@
+{
+  "Cisco-IOS-XE-platform-oper:components": {
+    "component": [
+      {"cname":"Switch1","state":{"type":"comp-chassis","id":"1000","part-no":"C9300-48UXM","serial-no":"LAB93000001","version":"V02","parent":"Switch1","location":"1/0/0/0","empty":false,"removable":false}},
+      {"cname":"c93xx Stack","state":{"type":"comp-chassis","id":"1","part-no":"C9300-48UXM","serial-no":"LAB93000001","version":"V02","parent":"Switch1","location":"1/0/0/0","empty":false,"removable":false}},
+      {"cname":"FRUUplinkModule1/1","state":{"type":"comp-port","id":"1110","part-no":"C3850-NM-4-1G","serial-no":"LABUPLINK001","version":"V01","parent":"Switch1","location":"1/0/1/1","empty":false,"removable":true,"status":"status-active","status-desc":"status-desc-ok"}},
+      {"cname":"PowerSupply1/B","state":{"type":"comp-power-supply","id":"1016","part-no":"PWR-C1-1100WAC-P","serial-no":"LABPSUB0001","version":"V01","parent":"Switch1","location":"1/0/B/0","empty":false,"removable":true,"status":"status-active","status-desc":"status-desc-ok"}},
+      {"cname":"PowerSupply1/A","state":{"type":"comp-power-supply","id":"1015","part-no":"","serial-no":"","parent":"Switch1","location":"1/0/A/0","empty":false,"removable":true,"status":"status-disabled","status-desc":"status-desc-no-input"}},
+      {"cname":"Fan1/1","state":{"type":"comp-fan","id":"1017","part-no":"","serial-no":"","parent":"Switch1","location":"1/0/1/0","empty":false,"removable":true,"status":"status-active"}},
+      {"cname":"Fan1/2","state":{"type":"comp-fan","id":"1018","part-no":"","serial-no":"","parent":"Switch1","location":"1/0/2/0","empty":false,"removable":true,"status":"status-active"}},
+      {"cname":"Fan1/3","state":{"type":"comp-fan","id":"1019","part-no":"","serial-no":"","parent":"Switch1","location":"1/0/3/0","empty":false,"removable":true,"status":"status-active"}}
+    ]
+  }
+}

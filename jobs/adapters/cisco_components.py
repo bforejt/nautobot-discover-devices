@@ -3,7 +3,9 @@
 Identity comes from device-hardware-oper; platform-oper corroborates identity
 and supplies placement. Numeric inventory indexes are evidence, never joins.
 The first profile covers a C9300-48UXM, C3850-NM-4-1G uplink and
-PWR-C1-1100WAC-P power supplies. Unknown parts remain explicit observations.
+PWR-C1-1100WAC-P power supplies. A reviewed nested placement profile also
+accepts explicitly identified transceivers in the uplink's eligible SFP ports.
+Unknown parts remain explicit observations.
 
 Platform fields are documented in Cisco's published YANG model:
 https://raw.githubusercontent.com/YangModels/yang/main/vendor/cisco/xe/17111/Cisco-IOS-XE-platform-oper.yang
@@ -18,10 +20,11 @@ HARDWARE_PATH = "/data/Cisco-IOS-XE-device-hardware-oper:device-hardware-data"
 PLATFORM_PATH = "/data/Cisco-IOS-XE-platform-oper:components"
 INTERFACES_PATH = "/data/Cisco-IOS-XE-interfaces-oper:interfaces"
 PLATFORM_FIELDS = (
-    "component(cname;state(type;id;description;serial-no;part-no;version;location;"
+    "component(cname;state(type;id;description;mfg-name;serial-no;part-no;version;location;"
     "empty;removable;parent;status;status-desc);platform-subcomponents)"
 )
 PROFILE = "c9300-48uxm-serialized-components-v1"
+TRANSCEIVER_PROFILE = "c9300-48uxm-c3850-nm-4-1g-transceivers-v1"
 CATALOG = {
     "C3850-NM-4-1G": ("network-module", "hw-type-pim"),
     "PWR-C1-1100WAC-P": ("power-supply", "hw-type-pem"),
@@ -82,6 +85,7 @@ def _platform_fact(row):
         "name": _text(_value(row, "cname")),
         "model": _text(_value(state, "part-no")),
         "serial": _text(_value(state, "serial-no")),
+        "manufacturer": _text(_value(state, "mfg-name")),
         "hardware_revision": _text(_value(state, "version")),
         "platform_type": _enum(_value(state, "type")),
         "platform_id": _text(_value(state, "id")),
@@ -115,7 +119,7 @@ def _identity_source(fact):
     }
 
 
-def _placement_source(fact):
+def _placement_source(fact, *, profile=PROFILE):
     return {
         "module": "Cisco-IOS-XE-platform-oper",
         "path": PLATFORM_PATH,
@@ -124,9 +128,10 @@ def _placement_source(fact):
             "parent": "state/parent",
             "location": "state/location",
             "hardware_revision": "state/version",
+            "manufacturer": "state/mfg-name",
         },
         "identity_join_rule": "unique trimmed part-number/part-no and serial-number/serial-no",
-        "profile": PROFILE,
+        "profile": profile,
     }
 
 
@@ -175,6 +180,179 @@ def _expected_platform_name(fact, member):
     if fact["model"] == "PWR-C1-1100WAC-P" and match and int(match.group(1)) == member:
         return "PowerSupply%d/%s" % (member, match.group(2))
     return None
+
+
+def _collect_transceivers(
+    result, flat, platform, pairs, root, *, chassis_model, member, interfaces
+):
+    """Resolve SFP assets after their reviewed uplink parent, independent of input order.
+
+    The observed platform component describes the optic as comp-port and reports
+    removable=False even though hardware inventory explicitly identifies a physical,
+    field-replaceable transceiver. Preserve those observations. The shared platform
+    location corroborates uplink slot 1; only matching structured interface names
+    establish an individual SFP port, never numeric inventory indexes or location
+    segment guesses. Existing host interfaces remain owned by the uplink Module.
+    """
+    from .cisco_iosxe import canonical_interface_name
+
+    handled = set()
+    parent_key = "uplink:%d/1" % member
+    parents = [item for item in result["items"] if item["key"] == parent_key]
+    for fact in flat:
+        if fact["hw_type"] != "hw-type-transceiver":
+            continue
+        unresolved = {**fact, "source": {"identity": _identity_source(fact)}}
+        name = canonical_interface_name(fact["name"])
+        match = re.fullmatch(r"GigabitEthernet%d/1/([1-4])" % member, name or "")
+        if not fact["model"] or not fact["serial"]:
+            reason = "Serialized transceiver model or serial number is unavailable"
+        elif chassis_model != "C9300-48UXM" or match is None:
+            reason = "Transceiver chassis or port has no reviewed nested placement profile"
+        elif fact["hardware_class"] is None or fact["field_replaceable"] is None:
+            reason = "Transceiver physical or field-replaceable classification is unavailable"
+        else:
+            if (
+                fact["hardware_class"] != "hw-class-physical"
+                or fact["field_replaceable"] is not True
+            ):
+                raise ComponentDiscoveryError(
+                    "Reviewed transceiver has contradictory hardware classification"
+                )
+            if pairs[(fact["model"], fact["serial"])] != 1:
+                raise ComponentDiscoveryError(
+                    "Reviewed serialized transceiver identity occurs in multiple inventory entries"
+                )
+            matches = [
+                part
+                for part in platform
+                if (part["model"], part["serial"]) == (fact["model"], fact["serial"])
+            ]
+            if len(matches) > 1:
+                raise ComponentDiscoveryError(
+                    "Serialized transceiver identity matches multiple platform components"
+                )
+            if not matches:
+                expected = next((part for part in platform if part["name"] == name), None)
+                if expected and expected["model"] and expected["serial"]:
+                    raise ComponentDiscoveryError(
+                        "Serialized transceiver inventory and platform identities "
+                        "disagree at a reviewed port"
+                    )
+                reason = "No unique platform identity match establishes transceiver placement"
+            else:
+                part = matches[0]
+                handled.add(part["name"])
+                unresolved["observations"] = part
+                unresolved["source"]["placement"] = _placement_source(
+                    part, profile=TRANSCEIVER_PROFILE
+                )
+                if part["name"] != name:
+                    raise ComponentDiscoveryError(
+                        "Serialized transceiver identity names different "
+                        "hardware and platform ports"
+                    )
+                if root is None:
+                    reason = (
+                        "Platform chassis identity is unavailable for transceiver parent validation"
+                    )
+                elif part["parent"] != "Switch%d" % member:
+                    reason = "Transceiver platform parent does not match the reviewed chassis"
+                elif part["location"] != "%d/0/1/1" % member:
+                    reason = "Transceiver platform location does not match the reviewed uplink slot"
+                elif part["platform_type"] != "comp-port":
+                    reason = "Transceiver platform classification has no reviewed placement profile"
+                elif part["empty"] is not False or part["removable"] is not False:
+                    reason = "Transceiver presence or platform removability needs review"
+                elif part["manufacturer"] is None:
+                    reason = (
+                        "Transceiver manufacturer is unavailable from structured platform state"
+                    )
+                elif len(parents) != 1 or parents[0]["model"] != "C3850-NM-4-1G":
+                    reason = "Transceiver parent uplink module is not uniquely established"
+                elif name not in parents[0]["interfaces"]:
+                    reason = (
+                        "Transceiver port is not an eligible observed interface "
+                        "of the parent uplink"
+                    )
+                else:
+                    observed = [interface for interface in interfaces if interface["name"] == name]
+                    if len(observed) != 1:
+                        raise ComponentDiscoveryError(
+                            "Transceiver port has ambiguous eligible interface observations"
+                        )
+                    if (
+                        observed[0].get("type") != "1000base-x-sfp"
+                        or observed[0].get("type_source")
+                        != "Installed C3850-NM-4-1G 4x1G SFP uplink module"
+                    ):
+                        reason = (
+                            "Transceiver port lacks the reviewed physical SFP capability evidence"
+                        )
+                    else:
+                        result["items"].append(
+                            {
+                                "key": "transceiver:%d/1/%s" % (member, match.group(1)),
+                                "kind": "transceiver",
+                                "manufacturer": part["manufacturer"],
+                                "model": fact["model"],
+                                "part_number": fact["model"],
+                                "serial": fact["serial"],
+                                "hardware_revision": fact["hardware_revision"]
+                                or part["hardware_revision"],
+                                "parent_key": parent_key,
+                                "bay": {
+                                    "name": "SFP %s" % name,
+                                    "position": match.group(1),
+                                    "label": name,
+                                },
+                                "interfaces": [],
+                                "source": {
+                                    "identity": {
+                                        **_identity_source(fact),
+                                        "hardware_class": fact["hardware_class"],
+                                        "field_replaceable": fact["field_replaceable"],
+                                        "interface_name": fact["name"],
+                                    },
+                                    "placement": _placement_source(
+                                        part, profile=TRANSCEIVER_PROFILE
+                                    ),
+                                    "manufacturer": {
+                                        "module": "Cisco-IOS-XE-platform-oper",
+                                        "path": PLATFORM_PATH,
+                                        "field": "state/mfg-name",
+                                        "component": part["name"],
+                                        "value": part["manufacturer"],
+                                        "profile": TRANSCEIVER_PROFILE,
+                                    },
+                                    "ownership": {
+                                        "method": "reviewed-profile",
+                                        "profile": TRANSCEIVER_PROFILE,
+                                        "rule": (
+                                            "C3850-NM-4-1G uplink slot 1 contains SFP bays "
+                                            "for GigabitEthernet<member>/1/1-4"
+                                        ),
+                                        "parent_key": parent_key,
+                                        "parent_model": parents[0]["model"],
+                                        "parent_serial": parents[0]["serial"],
+                                        "interface": name,
+                                        "module": "Cisco-IOS-XE-interfaces-oper",
+                                        "path": INTERFACES_PATH,
+                                        "meaning": (
+                                            "Matching structured hardware dev-name and platform "
+                                            "cname associate the optic with a reviewed "
+                                            "uplink port; "
+                                            "nested bay ownership follows the hardware profile. "
+                                            "The host Interface remains owned by the uplink Module"
+                                        ),
+                                    },
+                                },
+                                "observations": part,
+                            }
+                        )
+                        continue
+        result["unresolved"].append({**unresolved, "reason": reason})
+    return handled
 
 
 def collect(client, inventory, *, chassis_model, chassis_serial, member, interfaces, warnings):
@@ -243,6 +421,8 @@ def collect(client, inventory, *, chassis_model, chassis_serial, member, interfa
     )
     handled_platform_names = set()
     for fact in flat:
+        if fact["hw_type"] == "hw-type-transceiver":
+            continue
         unresolved = {**fact, "source": {"identity": _identity_source(fact)}}
         if not fact["model"] or not fact["serial"]:
             reason = "Serialized component model or serial number is unavailable"
@@ -344,6 +524,18 @@ def collect(client, inventory, *, chassis_model, chassis_serial, member, interfa
                     )
                     continue
         result["unresolved"].append({**unresolved, "reason": reason})
+    handled_platform_names.update(
+        _collect_transceivers(
+            result,
+            flat,
+            platform,
+            pairs,
+            root,
+            chassis_model=chassis_model,
+            member=member,
+            interfaces=interfaces,
+        )
+    )
     flat_pairs = {
         (fact["model"], fact["serial"]) for fact in flat if fact["model"] and fact["serial"]
     }

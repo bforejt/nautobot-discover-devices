@@ -163,8 +163,8 @@ maps to `Interface.enabled`; operational state remains an observation and does
 not change lifecycle status. The supported fields are type, enabled, description,
 MTU, MAC, operational speed, supported connector type, documented management-only
 purpose, and configured 802.1Q assignments.
-Routing/Namespace interpretation, IP addresses, cables, transceiver inventory,
-and additional component profiles are future increments.
+Routing/Namespace interpretation, IP addresses, cables, unreviewed transceiver
+placements, and additional component profiles are future increments.
 
 LAG membership comes from native interface configuration's structured
 `Cisco-IOS-XE-ethernet:channel-group/number` leaf. The collector includes
@@ -284,8 +284,43 @@ unresolved observations. A disabled PSU reporting `no-input` does not establish
 that its bay is vacant. Unknown serialized parts and unreviewed placement also
 remain unresolved, with evidence for the next interpretation increment. Exact
 reviewed stack aggregate aliases are excluded; matching a chassis serial alone
-does not exclude another component. Transceiver inventory remains a future
-increment.
+does not exclude another component.
+
+SFPs installed in the reviewed C3850-NM-4-1G uplink ports are serialized native
+Modules in nested ModuleBays under the uplink Module, following
+[Nautobot's documented transceiver model](https://docs.nautobot.com/projects/core/en/stable/user-guide/core-data-model/dcim/modulebay/).
+The `c9300-48uxm-c3850-nm-4-1g-transceivers-v1` profile requires a physical,
+field-replaceable `hw-type-transceiver`, complete PID/serial, a unique matching
+platform identity, explicit nonempty presence, and agreement between the
+hardware interface name, platform component name, and an observed eligible
+uplink port. The parent uplink Module must itself pass discovery. Individual
+port placement comes from those matching names and the reviewed four-port
+hardware profile; numeric inventory indexes and the generic location string
+do not identify an individual SFP slot. Platform `comp-port` and
+`removable=False` are retained as the observed lab representation; the explicit
+hardware transceiver classification establishes the serialized asset type.
+
+Manufacturer comes from the platform's structured `state/mfg-name` leaf, whose
+[YANG definition](https://raw.githubusercontent.com/YangModels/yang/main/vendor/cisco/xe/17111/Cisco-IOS-XE-platform-oper.yang)
+explicitly permits a component vendor different from the device vendor.
+Whitespace is trimmed without replacing vendor names or assuming Cisco from a
+Cisco-compatible PID. A missing Manufacturer can be created only from this
+reviewed source evidence, with its exact reported name; ambiguous matches block
+apply. New manufacturer and ModuleType catalog entries validate before saving
+and participate in the same atomic transaction as the asset. Catalog records
+are not created for a blocked occupied slot. Missing manufacturer, identity,
+parent, or placement evidence remains unresolved.
+
+The lab SFP reports `GLC-SX-MM`, serial `ZZ306221998`, revision `V03`, and
+manufacturer `CISCO-EQUIV` on `GigabitEthernet1/1/1`. Its nested bay identifies
+that port. Existing interfaces keep their UUIDs, names, uplink Module ownership,
+LAGs, and cables: discovery does not reassign a populated Interface.module to
+the SFP or create duplicate interfaces. The report retains the exact associated
+interface and the reviewed nesting interpretation; Nautobot has no separate
+native SFP-to-existing-Interface association. Hardware revision remains a report
+observation because Module has no corresponding native field. No connector,
+optical specification, absence, replacement, or relocation is inferred from
+the PID, link state, or operational speed. No custom fields are used.
 
 ## Switching and interface fields
 
@@ -609,3 +644,23 @@ absence of a management IP; no VRF or IP assignments were written because
 Namespace mapping remains deferred. Console line 0 settings remain report
 observations. The existing `Vlan2` type conflict and four unresolved serialized
 hardware identities remain the same documented warnings.
+
+The `0.8.0-dev` increment adds reviewed uplink SFP inventory and native
+Manufacturer creation from explicit structured vendor evidence. It passed 278
+offline tests and 54 real Nautobot ORM checks, with zero persistent integration
+changes. The new checks validate an unsaved Manufacturer without DML, reject
+invalid native catalog values before writing, roll back catalogs and the nested
+bay after a late SFP save failure, and preserve a real cabled port's alias, UUID,
+uplink ownership, LAG and cable terminations. Occupied-slot replacement,
+relocation and missing observations preserve inventory. Lint, formatting,
+syntax and diff checks passed.
+The live GET-only preview issued zero inventory mutation statements, and the
+real worker preview succeeded with an equal inventory snapshot. The successful
+strict worker apply created one Manufacturer (`CISCO-EQUIV`), one ModuleType
+(`GLC-SX-MM`), one nested bay (`SFP GigabitEthernet1/1/1`) and one SFP Module
+(serial `ZZ306221998`) under the existing uplink Module. All 58 interfaces,
+existing Module and console inventory, VLANs, IPAM and custom fields were
+preserved. A second successful worker apply reported zero inventory changes
+and identical complete snapshots, including the new SFP UUID. The previously
+documented four missing hardware identities and `Vlan2` type conflict remain
+unchanged; there are no new unresolved SFP observations on the lab switch.

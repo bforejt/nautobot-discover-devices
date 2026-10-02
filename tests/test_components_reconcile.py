@@ -37,6 +37,23 @@ def discovery(*items):
     }
 
 
+def reported_manufacturer_item(**values):
+    manufacturer = values.get("manufacturer", "CISCO-EQUIV")
+    return item(
+        manufacturer=manufacturer,
+        source={
+            "manufacturer": {
+                "module": "Cisco-IOS-XE-platform-oper",
+                "path": "/data/Cisco-IOS-XE-platform-oper:components",
+                "field": "state/mfg-name",
+                "component": "GigabitEthernet1/1/1",
+                "value": manufacturer,
+            }
+        },
+        **{key: value for key, value in values.items() if key != "manufacturer"},
+    )
+
+
 def inventory():
     return {
         "device": {"id": "device-1"},
@@ -85,6 +102,12 @@ def installed(before, *, serial="LABMODULE001", module_id="module-1", bay_name="
 
 def apply_to_snapshot(plan, before):
     after = deepcopy(before)
+    manufacturer_ids = {}
+    for row in plan.get("manufacturers", []):
+        manufacturer_ids[row["key"]] = "created-manufacturer-" + row["key"]
+        after["components"]["manufacturers"].append(
+            {"id": manufacturer_ids[row["key"]], "name": row["name"]}
+        )
     type_ids, module_ids, bay_ids = {}, {}, {}
     for row in plan["module_types"]:
         type_ids[row["key"]] = row["id"] or "created-type-" + row["key"]
@@ -92,7 +115,8 @@ def apply_to_snapshot(plan, before):
             after["components"]["module_types"].append(
                 {
                     "id": type_ids[row["key"]],
-                    "manufacturer_id": row["manufacturer_id"],
+                    "manufacturer_id": row["manufacturer_id"]
+                    or manufacturer_ids[row["manufacturer_key"]],
                     "model": row["model"],
                     "part_number": row["part_number"],
                 }
@@ -439,6 +463,73 @@ class ComponentReconciliationTests(unittest.TestCase):
     def test_unknown_manufacturer_is_not_created_implicitly(self):
         plan = planner.plan_components(discovery(item(manufacturer="Unknown")), inventory())
         self.assertTrue(plan["errors"])
+        self.assertFalse(plan["module_types"])
+
+    def test_reported_manufacturer_is_created_and_repeat_reuses_it(self):
+        before = inventory()
+        observed = discovery(reported_manufacturer_item())
+        plan = planner.plan_components(observed, before)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["summary"]["manufacturers_created"], 1)
+        self.assertEqual(plan["manufacturers"][0]["name"], "CISCO-EQUIV")
+        self.assertIsNone(plan["module_types"][0]["manufacturer_id"])
+        after = apply_to_snapshot(plan, before)
+        repeat = planner.plan_components(observed, after)
+        self.assertFalse(repeat["errors"])
+        self.assertFalse(repeat["manufacturers"])
+        self.assertTrue(all(count == 0 for count in repeat["summary"].values()))
+
+    def test_reported_manufacturer_is_created_once_for_multiple_assets(self):
+        first = reported_manufacturer_item(interfaces=[])
+        second = reported_manufacturer_item(
+            key="uplink:1/2", serial="LABMODULE002", bay={"name": "Uplink Module 2"}, interfaces=[]
+        )
+        plan = planner.plan_components(discovery(first, second), inventory())
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["summary"]["manufacturers_created"], 1)
+        self.assertEqual(plan["summary"]["module_types_created"], 1)
+        self.assertEqual(plan["summary"]["modules_created"], 2)
+
+    def test_manufacturer_source_must_match_the_exact_reported_name_and_leaf(self):
+        for field, value in (
+            ("value", "Cisco"),
+            ("field", "state/description"),
+            ("component", None),
+        ):
+            with self.subTest(field=field):
+                part = reported_manufacturer_item()
+                part["source"]["manufacturer"][field] = value
+                plan = planner.plan_components(discovery(part), inventory())
+                self.assertTrue(plan["errors"])
+                self.assertFalse(plan["manufacturers"])
+                self.assertFalse(plan["modules"])
+
+    def test_existing_manufacturer_spelling_and_description_are_preserved(self):
+        before = inventory()
+        before["components"]["manufacturers"].append(
+            {"id": "equiv-1", "name": "Cisco-Equiv", "description": "Operator catalog name"}
+        )
+        plan = planner.plan_components(discovery(reported_manufacturer_item()), before)
+        self.assertFalse(plan["errors"])
+        self.assertFalse(plan["manufacturers"])
+        self.assertEqual(plan["module_types"][0]["manufacturer_id"], "equiv-1")
+
+    def test_ambiguous_manufacturer_names_block_even_with_source_evidence(self):
+        before = inventory()
+        before["components"]["manufacturers"].extend(
+            [{"id": "equiv-1", "name": "CISCO-EQUIV"}, {"id": "equiv-2", "name": "cisco-equiv"}]
+        )
+        plan = planner.plan_components(discovery(reported_manufacturer_item()), before)
+        self.assertTrue(plan["errors"])
+        self.assertFalse(plan["manufacturers"])
+        self.assertFalse(plan["modules"])
+
+    def test_blocked_occupied_bay_does_not_create_orphan_manufacturer(self):
+        before = installed(inventory())
+        plan = planner.plan_components(discovery(reported_manufacturer_item()), before)
+        self.assertFalse(plan["errors"])
+        self.assertTrue(plan["conflicts"])
+        self.assertFalse(plan["manufacturers"])
         self.assertFalse(plan["module_types"])
 
     def test_populated_catalog_identity_is_not_changed(self):

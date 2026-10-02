@@ -389,6 +389,7 @@ def run(device_id=None):
     from tests.nautobot_components_integration import (
         run as verify_component_inventory,
     )
+    from tests.nautobot_transceiver_integration import run as verify_transceiver_inventory
     from tests.nautobot_vlan_integration import catalog_counts as vlan_catalog_counts
     from tests.nautobot_vlan_integration import run as verify_vlan_inventory
 
@@ -567,6 +568,7 @@ def run(device_id=None):
             verify_component_inventory(device, interface_status, checks)
             verify_vlan_inventory(device, interface_status, checks)
             verify_access_inventory(device, interface_status, checks)
+            verify_transceiver_inventory(device, interface_status, checks)
         finally:
             transaction.set_rollback(True)
 

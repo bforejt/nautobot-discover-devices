@@ -3,7 +3,7 @@
 import unittest
 from copy import deepcopy
 
-from tests._loader import load
+from tests._loader import fixture, load
 from tests.test_cisco_iosxe import FixtureClient, fixture_payloads
 
 cisco = load("adapters.cisco_iosxe")
@@ -20,7 +20,197 @@ def platform(payloads):
     return payloads[components.PLATFORM_PATH]["Cisco-IOS-XE-platform-oper:components"]["component"]
 
 
+def transceiver_payloads():
+    """Add the sanitized live transceiver leaves to the existing lab fixtures."""
+    payloads = fixture_payloads()
+    optic = fixture("iosxe_transceiver_inventory.json")
+    inventory(payloads).append(optic["hardware_inventory"])
+    platform(payloads).append(optic["platform_component"])
+    return payloads
+
+
 class CiscoComponentTests(unittest.TestCase):
+    def test_transceiver_explicit_identity_manufacturer_and_nested_port_are_captured(self):
+        client = FixtureClient(transceiver_payloads())
+        result = cisco.collect(client)["components"]
+        self.assertEqual(len(result["items"]), 3)
+        optic = next(row for row in result["items"] if row["kind"] == "transceiver")
+        self.assertEqual(optic["key"], "transceiver:1/1/1")
+        self.assertEqual(optic["manufacturer"], "CISCO-EQUIV")
+        self.assertEqual(optic["model"], "GLC-SX-MM")
+        self.assertEqual(optic["part_number"], "GLC-SX-MM")
+        self.assertEqual(optic["serial"], "LABOPTIC001")
+        self.assertEqual(optic["hardware_revision"], "V03")
+        self.assertEqual(optic["parent_key"], "uplink:1/1")
+        self.assertEqual(optic["interfaces"], [])
+        self.assertEqual(
+            optic["bay"],
+            {"name": "SFP GigabitEthernet1/1/1", "position": "1", "label": "GigabitEthernet1/1/1"},
+        )
+        self.assertEqual(optic["observations"]["platform_type"], "comp-port")
+        self.assertFalse(optic["observations"]["removable"])
+        self.assertFalse(optic["observations"]["empty"])
+        self.assertEqual(optic["source"]["identity"]["inventory_index"], 700)
+        self.assertEqual(optic["source"]["placement"]["profile"], components.TRANSCEIVER_PROFILE)
+        self.assertEqual(optic["source"]["manufacturer"]["value"], "CISCO-EQUIV")
+        self.assertEqual(optic["source"]["manufacturer"]["field"], "state/mfg-name")
+        self.assertEqual(optic["source"]["manufacturer"]["revision"], "2023-03-01")
+        self.assertEqual(optic["source"]["ownership"]["interface"], "GigabitEthernet1/1/1")
+        self.assertEqual(optic["source"]["ownership"]["parent_serial"], "LABUPLINK001")
+        self.assertTrue(any("mfg-name" in path for path in client.requests))
+        self.assertFalse(any(row.get("serial") == "LABOPTIC001" for row in result["unresolved"]))
+
+    def test_transceiver_collection_is_independent_of_inventory_order_and_ntc_flag(self):
+        expected = cisco.collect(FixtureClient(transceiver_payloads()))["components"]
+        payloads = transceiver_payloads()
+        inventory(payloads).reverse()
+        platform(payloads).reverse()
+        for ntc_defaults in (False, True):
+            with self.subTest(ntc_defaults=ntc_defaults):
+                result = cisco.collect(FixtureClient(payloads), use_ntc_defaults=ntc_defaults)
+                self.assertEqual(result["components"], expected)
+
+    def test_transceiver_pid_and_manufacturer_are_explicit_and_not_catalog_guesses(self):
+        payloads = transceiver_payloads()
+        inventory(payloads)[-1]["part-number"] = "VENDOR-EXPLICIT-PID  "
+        platform(payloads)[-1]["state"]["part-no"] = "VENDOR-EXPLICIT-PID"
+        platform(payloads)[-1]["state"]["mfg-name"] = "Actual OEM  "
+        result = cisco.collect(FixtureClient(payloads))["components"]
+        optic = next(row for row in result["items"] if row["kind"] == "transceiver")
+        self.assertEqual(optic["model"], "VENDOR-EXPLICIT-PID")
+        self.assertEqual(optic["manufacturer"], "Actual OEM")
+        self.assertEqual(optic["source"]["manufacturer"]["value"], "Actual OEM")
+
+    def test_missing_transceiver_manufacturer_or_identity_is_unresolved(self):
+        for target, field, value in (
+            ("platform", "mfg-name", None),
+            ("platform", "mfg-name", "   "),
+            ("platform", "mfg-name", "NULL"),
+            ("hardware", "part-number", None),
+            ("hardware", "serial-number", None),
+            ("hardware", "hw-class", None),
+            ("hardware", "field-replaceable", None),
+        ):
+            with self.subTest(target=target, field=field, value=value):
+                payloads = transceiver_payloads()
+                row = (
+                    platform(payloads)[-1]["state"]
+                    if target == "platform"
+                    else inventory(payloads)[-1]
+                )
+                if value is None:
+                    row.pop(field)
+                else:
+                    row[field] = value
+                result = cisco.collect(FixtureClient(payloads))["components"]
+                self.assertEqual(len(result["items"]), 2)
+                self.assertTrue(
+                    any(row.get("hw_type") == "hw-type-transceiver" for row in result["unresolved"])
+                )
+
+    def test_unreviewed_transceiver_placement_stays_unresolved(self):
+        for target, field, value in (
+            ("hardware", "dev-name", "Gi1/0/1"),
+            ("hardware", "dev-name", "Gi1/1/5"),
+            ("hardware", "dev-name", "Gi2/1/1"),
+            ("platform", "parent", "Switch2"),
+            ("platform", "location", "1/0/1/2"),
+            ("platform", "type", "comp-transceiver"),
+            ("platform", "empty", True),
+            ("platform", "removable", True),
+            ("platform", "empty", None),
+            ("platform", "removable", None),
+        ):
+            with self.subTest(target=target, field=field, value=value):
+                payloads = transceiver_payloads()
+                row = (
+                    platform(payloads)[-1]["state"]
+                    if target == "platform"
+                    else inventory(payloads)[-1]
+                )
+                if value is None:
+                    row.pop(field)
+                else:
+                    row[field] = value
+                result = cisco.collect(FixtureClient(payloads))["components"]
+                self.assertEqual(len(result["items"]), 2)
+                self.assertTrue(
+                    any(row.get("hw_type") == "hw-type-transceiver" for row in result["unresolved"])
+                )
+
+    def test_transceiver_does_not_require_link_up_but_requires_observed_parent_port(self):
+        payloads = transceiver_payloads()
+        rows = payloads[cisco.INTERFACES_PATH]["Cisco-IOS-XE-interfaces-oper:interfaces"][
+            "interface"
+        ]
+        target = next(row for row in rows if row["name"] == "GigabitEthernet1/1/1")
+        target["oper-status"] = "if-oper-state-lower-layer-down"
+        self.assertEqual(len(cisco.collect(FixtureClient(payloads))["components"]["items"]), 3)
+        target["oper-status"] = "if-oper-state-not-present"
+        result = cisco.collect(FixtureClient(payloads))["components"]
+        self.assertEqual(len(result["items"]), 2)
+        self.assertTrue(
+            any("eligible observed interface" in row["reason"] for row in result["unresolved"])
+        )
+
+    def test_transceiver_missing_or_unresolved_uplink_parent_is_not_created(self):
+        for remove in (True, False):
+            with self.subTest(remove=remove):
+                payloads = transceiver_payloads()
+                if remove:
+                    inventory(payloads).pop(1)
+                    platform(payloads).pop(2)
+                else:
+                    platform(payloads)[2]["state"]["parent"] = "Switch2"
+                result = cisco.collect(FixtureClient(payloads))["components"]
+                self.assertEqual([row["key"] for row in result["items"]], ["psu:1/B"])
+                self.assertTrue(
+                    any("parent uplink module" in row["reason"] for row in result["unresolved"])
+                )
+
+    def test_contradictory_transceiver_hardware_classification_blocks_collection(self):
+        for field, value in (
+            ("hw-class", "hw-class-logical"),
+            ("field-replaceable", False),
+            ("field-replaceable", "true"),
+        ):
+            with self.subTest(field=field, value=value):
+                payloads = transceiver_payloads()
+                inventory(payloads)[-1][field] = value
+                with self.assertRaisesRegex(
+                    cisco.DiscoveryError, "contradictory hardware classification"
+                ):
+                    cisco.collect(FixtureClient(payloads))
+
+    def test_transceiver_contradictory_identity_or_interface_names_block_collection(self):
+        for field, value in (
+            ("serial-no", "WRONG-SERIAL"),
+            ("part-no", "WRONG-PID"),
+            ("cname", "GigabitEthernet1/1/2"),
+        ):
+            with self.subTest(field=field):
+                payloads = transceiver_payloads()
+                target = (
+                    platform(payloads)[-1] if field == "cname" else platform(payloads)[-1]["state"]
+                )
+                target[field] = value
+                with self.assertRaises(cisco.DiscoveryError):
+                    cisco.collect(FixtureClient(payloads))
+
+    def test_duplicate_transceiver_identity_in_either_source_blocks_collection(self):
+        for target in ("hardware", "platform"):
+            with self.subTest(target=target):
+                payloads = transceiver_payloads()
+                rows = inventory(payloads) if target == "hardware" else platform(payloads)
+                duplicate = deepcopy(rows[-1])
+                if target == "hardware":
+                    duplicate["hw-dev-index"] = 999
+                else:
+                    duplicate["cname"] = "GigabitEthernet1/1/2"
+                rows.append(duplicate)
+                with self.assertRaises(cisco.DiscoveryError):
+                    cisco.collect(FixtureClient(payloads))
+
     def test_reviewed_identity_and_placement_produce_exact_two_serialized_items(self):
         result = cisco.collect(FixtureClient())["components"]
         self.assertEqual(result["schema_version"], 1)

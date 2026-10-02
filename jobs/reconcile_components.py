@@ -1,5 +1,6 @@
 """Pure, fill-only reconciliation of serialized modules and physical bays."""
 
+import json
 from collections import defaultdict
 
 from .adapters.cisco_iosxe import canonical_interface_name
@@ -19,6 +20,7 @@ def _blank(value):
 
 def _finish(plan):
     plan["summary"] = {
+        "manufacturers_created": len(plan["manufacturers"]),
         "modules_created": sum(row["create"] for row in plan["modules"]),
         "modules_updated": sum(bool(row["changes"]) for row in plan["modules"]),
         "module_types_created": sum(row["create"] for row in plan["module_types"]),
@@ -43,6 +45,7 @@ def plan_components(discovery, existing, interface_plan=None):
     """
     plan = {
         "schema_version": 1,
+        "manufacturers": [],
         "module_types": [],
         "bays": [],
         "modules": [],
@@ -206,19 +209,39 @@ def plan_components(discovery, existing, interface_plan=None):
         for row in (interface_plan or {}).get("interface_creates", [])
     }
     device_id = _id(existing["device"]["id"])
-    planned_modules, planned_types = {}, {}
+    planned_modules, planned_types, planned_manufacturers = {}, {}, {}
     seen_module_ids = set()
 
     def resolve_type(item):
         matches = manufacturers[item["manufacturer"].casefold()]
-        if len(matches) != 1:
+        if len(matches) > 1:
             error(
                 "Component %s requires one existing Manufacturer %s"
                 % (item["key"], item["manufacturer"])
             )
             return None
-        manufacturer_id = _id(matches[0]["id"])
-        candidates = [row for row in types if _id(row["manufacturer_id"]) == manufacturer_id]
+        manufacturer_id = _id(matches[0]["id"]) if matches else None
+        manufacturer_key = manufacturer_id or "reported:" + item["manufacturer"].casefold()
+        if not matches:
+            evidence = item.get("source", {}).get("manufacturer")
+            if not (
+                isinstance(evidence, dict)
+                and evidence.get("module") == "Cisco-IOS-XE-platform-oper"
+                and evidence.get("path") == "/data/Cisco-IOS-XE-platform-oper:components"
+                and evidence.get("field") == "state/mfg-name"
+                and _text(evidence.get("value")) == item["manufacturer"]
+                and _text(evidence.get("component")) is not None
+            ):
+                error(
+                    "Component %s requires one existing Manufacturer %s or reviewed source evidence"
+                    % (item["key"], item["manufacturer"])
+                )
+                return None
+        candidates = [
+            row
+            for row in types
+            if manufacturer_id is not None and _id(row["manufacturer_id"]) == manufacturer_id
+        ]
         by_model = [row for row in candidates if _text(row["model"]) == item["model"]]
         by_part = [
             row for row in candidates if _text(row.get("part_number")) == item["part_number"]
@@ -247,9 +270,12 @@ def plan_components(discovery, existing, interface_plan=None):
                 return None
         model = selected["model"] if selected else item["model"]
         return {
-            "key": "%s:%s" % (manufacturer_id, model),
+            "key": "%s:%s" % (manufacturer_id, model)
+            if manufacturer_id is not None
+            else json.dumps([manufacturer_key, model]),
             "id": _id(selected["id"]) if selected else None,
             "manufacturer_id": manufacturer_id,
+            "manufacturer_key": manufacturer_key,
             "model": model,
             "part_number": item["part_number"],
             "create": selected is None,
@@ -384,6 +410,16 @@ def plan_components(discovery, existing, interface_plan=None):
             if module_type["key"] not in planned_types:
                 planned_types[module_type["key"]] = module_type
                 plan["module_types"].append(module_type)
+            if module_type["manufacturer_id"] is None:
+                manufacturer_key = module_type["manufacturer_key"]
+                if manufacturer_key not in planned_manufacturers:
+                    manufacturer = {
+                        "key": manufacturer_key,
+                        "name": item["manufacturer"],
+                        "source": item["source"]["manufacturer"],
+                    }
+                    planned_manufacturers[manufacturer_key] = manufacturer
+                    plan["manufacturers"].append(manufacturer)
             plan["bays"].append(
                 {
                     "key": key,

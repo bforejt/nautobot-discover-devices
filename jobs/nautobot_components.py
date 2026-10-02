@@ -109,11 +109,19 @@ def _changes(instance, spec):
 def component_objects(plan, device, *, module_status, status_resolver):
     """Construct a cached hierarchy, including unsaved parents, without INSERTs."""
     ModuleType, ModuleBay, Module = _models()
+    manufacturers = {
+        spec["key"]: Manufacturer(name=spec["name"]) for spec in plan.get("manufacturers", [])
+    }
     types, bays, modules = {}, {}, {}
     for spec in plan["module_types"]:
         if spec["create"]:
+            manufacturer = (
+                manufacturers[spec["manufacturer_key"]]
+                if spec["manufacturer_id"] is None
+                else Manufacturer.objects.get(pk=spec["manufacturer_id"])
+            )
             obj = ModuleType(
-                manufacturer=Manufacturer.objects.get(pk=spec["manufacturer_id"]),
+                manufacturer=manufacturer,
                 model=spec["model"],
                 part_number=spec["part_number"],
             )
@@ -173,7 +181,13 @@ def component_objects(plan, device, *, module_status, status_resolver):
             progress = True
         if not progress:
             raise InventoryError("Component hierarchy has an unresolved parent or cycle")
-    return {"plan": plan, "types": types, "bays": bays, "modules": modules}
+    return {
+        "plan": plan,
+        "manufacturers": manufacturers,
+        "types": types,
+        "bays": bays,
+        "modules": modules,
+    }
 
 
 def _template_relations(module_type):
@@ -206,8 +220,11 @@ def _suppression_context(module_type):
 
 def validate_components(objects):
     """Skip only nonexistent FK checks; preserve cached-object model validation."""
-    for obj in objects["types"].values():
+    for obj in objects.get("manufacturers", {}).values():
         obj.full_clean()
+    for obj in objects["types"].values():
+        excluded = ["manufacturer"] if obj.manufacturer._state.adding else []
+        obj.full_clean(exclude=excluded)
     for obj in objects["bays"].values():
         excluded = (
             ["parent_module"] if obj.parent_module and obj.parent_module._state.adding else []
@@ -226,6 +243,8 @@ def validate_components(objects):
 
 def save_components(objects):
     """Save catalogs then parent-first assets; callers own the atomic transaction."""
+    for obj in objects.get("manufacturers", {}).values():
+        obj.validated_save()
     for spec in objects["plan"]["module_types"]:
         if spec["create"] or spec["changes"]:
             objects["types"][spec["key"]].validated_save()

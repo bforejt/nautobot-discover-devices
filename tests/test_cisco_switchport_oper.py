@@ -42,10 +42,12 @@ class FakeClient:
         self.errors = list(errors or [])
         self.status = status
         self.requests = []
+        self.request_options = []
         self.trace = []
 
-    def get(self, path):
+    def get(self, path, **kwargs):
         self.requests.append(path)
+        self.request_options.append(kwargs)
         error = self.errors.pop(0) if self.errors else None
         self.trace.append({"path": path, "status": error.status_code if error else self.status})
         if error:
@@ -67,15 +69,35 @@ class SwitchportOperationalTests(unittest.TestCase):
         )
         return result
 
-    def test_unknown_capability_and_known_module_absence_make_no_request(self):
-        for revisions, expected in ((None, "capability-unknown"), ({}, "not-advertised")):
-            with self.subTest(revisions=revisions):
-                client = FakeClient()
-                result = self.collect(client=client, revisions=revisions)
-                self.assertEqual(result["source"]["status"], expected)
-                self.assertEqual(result["interfaces"], [])
-                self.assertEqual(client.requests, [])
-                self.assertEqual(self.warnings, [])
+    def assert_invalid(self, result):
+        self.assertEqual(result["source"]["status"], "invalid")
+        self.assertEqual(result["interfaces"], [])
+        self.assertTrue(result["source"]["reason"])
+        self.assertTrue(self.warnings)
+        self.assertNotIn("secret-response-body", str(result) + str(self.warnings))
+
+    def test_unknown_capability_probes_with_a_bound_and_does_not_invent_a_revision(self):
+        client = FakeClient()
+        result = self.collect(client=client, revisions=None)
+        self.assertEqual(result["source"]["status"], "available")
+        self.assertEqual(result["source"]["capability_status"], "unknown")
+        self.assertTrue(result["source"]["probed_without_advertisement"])
+        self.assertIsNone(result["source"]["revision"])
+        self.assertEqual(result["interfaces"][0]["operational_mode"], "access")
+        self.assertIsNone(result["interfaces"][0]["source"]["revision"])
+        self.assertEqual(client.requests, [switchport.PATH + "?fields=" + switchport.FIELDS])
+        self.assertEqual(client.request_options, [{"timeout": 15}])
+        self.assertEqual(self.warnings, [])
+
+    def test_known_module_absence_makes_no_request(self):
+        client = FakeClient()
+        result = self.collect(client=client, revisions={})
+        self.assertEqual(result["source"]["status"], "not-advertised")
+        self.assertEqual(result["source"]["capability_status"], "not-advertised")
+        self.assertFalse(result["source"]["probed_without_advertisement"])
+        self.assertEqual(result["interfaces"], [])
+        self.assertEqual(client.requests, [])
+        self.assertEqual(self.warnings, [])
 
     def test_advertised_module_reads_whole_meaningful_port_details(self):
         client = FakeClient()
@@ -84,6 +106,8 @@ class SwitchportOperationalTests(unittest.TestCase):
         self.assertIn("port-details", switchport.FIELDS)
         self.assertEqual(result["source"]["status"], "available")
         self.assertEqual(result["source"]["revision"], "2024-03-01")
+        self.assertEqual(result["source"]["capability_status"], "advertised")
+        self.assertFalse(result["source"]["probed_without_advertisement"])
         self.assertEqual(result["source"]["http_status"], 200)
         self.assertEqual(result["schema_version"], 1)
 
@@ -192,13 +216,10 @@ class SwitchportOperationalTests(unittest.TestCase):
                     row["port-details"][field] = "unrelated:oper-trunk"
                 self.assertIsNone(self.collect([row])["interfaces"][0]["operational_mode"])
 
-    def test_duplicate_canonical_source_names_and_unknown_endpoints_block(self):
+    def test_duplicate_canonical_source_names_and_unknown_endpoints_discard_source(self):
         for rows in ([port(), port("GigabitEthernet1/0/1")], [port("Gi1/0/2")], [port("")]):
-            with (
-                self.subTest(rows=rows),
-                self.assertRaises(switchport.SwitchportOperDiscoveryError),
-            ):
-                self.collect(rows)
+            with self.subTest(rows=rows):
+                self.assert_invalid(self.collect(rows))
 
     def test_ambiguous_or_invalid_eligible_interface_names_block(self):
         for interfaces in (
@@ -212,7 +233,15 @@ class SwitchportOperationalTests(unittest.TestCase):
             ):
                 self.collect(interfaces=interfaces)
 
-    def test_duplicate_and_foreign_namespaced_leaves_block(self):
+    def test_invalid_revision_arguments_remain_programming_contract_errors(self):
+        for revisions in ([], "unknown", {switchport.MODULE: 15}, {switchport.MODULE: {}}):
+            with (
+                self.subTest(revisions=revisions),
+                self.assertRaises(switchport.SwitchportOperDiscoveryError),
+            ):
+                self.collect(revisions=revisions)
+
+    def test_duplicate_and_foreign_namespaced_leaves_discard_source(self):
         cases = []
         row = port()
         row[switchport.MODULE + ":if-name"] = "Gi1/0/1"
@@ -225,24 +254,19 @@ class SwitchportOperationalTests(unittest.TestCase):
         cases.append(payload([row]))
         cases.append({"unrelated:switchport-oper-data": {"switchport-info": [port()]}})
         for value in cases:
-            with (
-                self.subTest(value=value),
-                self.assertRaises(switchport.SwitchportOperDiscoveryError),
-            ):
-                self.collect(client=FakeClient(value))
+            with self.subTest(value=value):
+                self.assert_invalid(self.collect(client=FakeClient(value)))
 
-    def test_malformed_empty_leaves_block_even_if_the_other_guard_is_missing(self):
+    def test_malformed_empty_leaves_discard_source_even_if_the_other_guard_is_missing(self):
         for name in ("enabled", "hardware-present"):
             for invalid in (True, False, None, [], {}, [False], [None, None]):
-                with (
-                    self.subTest(name=name, invalid=invalid),
-                    self.assertRaises(switchport.SwitchportOperDiscoveryError),
-                ):
+                with self.subTest(name=name, invalid=invalid):
                     row = port()
                     row[name] = invalid
-                    self.collect([row])
+                    row.pop("hardware-present" if name == "enabled" else "enabled")
+                    self.assert_invalid(self.collect([row]))
 
-    def test_malformed_container_list_and_scalar_shapes_block(self):
+    def test_malformed_container_list_and_scalar_shapes_discard_source(self):
         cases = [
             {},
             [],
@@ -267,11 +291,16 @@ class SwitchportOperationalTests(unittest.TestCase):
             row["port-details"][name] = invalid
             cases.append(payload([row]))
         for value in cases:
-            with (
-                self.subTest(value=value),
-                self.assertRaises(switchport.SwitchportOperDiscoveryError),
-            ):
-                self.collect(client=FakeClient(value))
+            with self.subTest(value=value):
+                self.assert_invalid(self.collect(client=FakeClient(value)))
+
+    def test_a_late_invalid_row_discards_every_earlier_fact_atomically(self):
+        for advertised in (True, False):
+            with self.subTest(advertised=advertised):
+                invalid = port("secret-response-body")
+                self.assert_invalid(
+                    self.collect([port(), invalid], revisions=True if advertised else None)
+                )
 
     def test_empty_structured_list_and_confirmed_204_are_available_empty_sources(self):
         for client in (FakeClient(payload([])), FakeClient({}, status=204)):
@@ -287,35 +316,58 @@ class SwitchportOperationalTests(unittest.TestCase):
             client.requests, [switchport.PATH + "?fields=" + switchport.FIELDS, switchport.PATH]
         )
         self.assertEqual(result["interfaces"][0]["operational_mode"], "access")
+        self.assertEqual(client.request_options, [{"timeout": 15}, {"timeout": 15}])
         self.assertEqual(len(self.warnings), 1)
         self.assertIn("HTTP 400", self.warnings[0])
 
     def test_optional_transport_failures_preserve_other_discovery_without_error_body(self):
-        for status in (None, 404, 503):
+        for status in (None, 200, 201, 299, 401, 403, 404, 501, 503):
             with self.subTest(status=status):
                 client = FakeClient(errors=[RestconfError("secret-response-body", status)])
                 result = self.collect(client=client)
-                self.assertEqual(result["source"]["status"], "unavailable")
+                self.assertEqual(
+                    result["source"]["status"],
+                    "invalid"
+                    if status is not None and 200 <= status < 300
+                    else "unsupported"
+                    if status in (404, 501)
+                    else "unavailable",
+                )
+                if status is not None and 200 <= status < 300:
+                    self.assert_invalid(result)
                 self.assertEqual(result["interfaces"], [])
                 self.assertEqual(len(client.requests), 1)
                 self.assertEqual(len(self.warnings), 1)
                 self.assertNotIn("secret-response-body", self.warnings[0])
 
     def test_unfiltered_fallback_failure_is_optional_and_not_retried_again(self):
-        client = FakeClient(errors=[RestconfError("filter", 400), RestconfError("secret", 503)])
-        result = self.collect(client=client)
-        self.assertEqual(result["source"]["status"], "unavailable")
-        self.assertEqual(len(client.requests), 2)
-        self.assertEqual(len(self.warnings), 2)
-        self.assertNotIn("secret", str(result) + str(self.warnings))
+        for status in (200, 503):
+            with self.subTest(status=status):
+                client = FakeClient(
+                    errors=[RestconfError("filter", 400), RestconfError("secret", status)]
+                )
+                result = self.collect(client=client)
+                self.assertEqual(
+                    result["source"]["status"], "invalid" if status == 200 else "unavailable"
+                )
+                self.assertEqual(len(client.requests), 2)
+                self.assertEqual(len(self.warnings), 2)
+                self.assertNotIn("secret", str(result) + str(self.warnings))
 
     def test_cancellation_and_programming_failures_propagate(self):
         class CancelledClient:
-            def get(self, path):
+            def get(self, path, **kwargs):
                 raise RuntimeError("worker time limit")
 
         with self.assertRaisesRegex(RuntimeError, "worker time limit"):
             self.collect(client=CancelledClient())
+
+        class BrokenClient:
+            def get(self, path, **kwargs):
+                raise TypeError("programming error")
+
+        with self.assertRaisesRegex(TypeError, "programming error"):
+            self.collect(client=BrokenClient(), revisions=None)
 
     def test_output_is_sorted_and_observations_do_not_alias_input(self):
         rows = [port("Gi1/0/2"), port("Gi1/0/1")]

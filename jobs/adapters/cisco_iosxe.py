@@ -556,6 +556,7 @@ def collect(client, *, use_ntc_defaults=False):
         # worker time limits and programming errors must propagate unchanged.
         # Optional evidence must not mask a required discovery failure, and
         # transport/provider exception bodies are never copied into artifacts.
+        modules.clear()
         status = getattr(exc, "status_code", None)
         warnings.append(
             "YANG module revision evidence unavailable%s"

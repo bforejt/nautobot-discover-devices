@@ -430,10 +430,25 @@ configuration rows also retain actual
 mode and raw evidence in `discovery.layer2.settings`. Operational VLAN IDs,
 pruning, voice, and aggregation details remain observations. This adds no custom
 fields or new Interface column. `discovery.layer2.operational_source` records
-source status: `capability-unknown`, `not-advertised`, `unavailable`, or
-`available`. No request
-is made when the module is unadvertised or the library cannot establish its
-availability; older IOS XE discovery continues using the existing sources.
+source status: `not-advertised`, `unsupported`, `unavailable`, `invalid`, or
+`available`. A complete YANG library that does not advertise the module skips
+the request. If the library is unreadable or invalid, the job probes the
+endpoint directly and accepts only validated structured facts, with revision
+left unknown. `capability_status` and `probed_without_advertisement` distinguish
+library evidence from a direct probe. Partial invalid library results are
+discarded rather than supplying module revisions.
+
+The optional operational source uses a 15-second read timeout. HTTP 400 permits
+one unfiltered read of the same endpoint; HTTP 404/501 means `unsupported`,
+and other expected read failures mean `unavailable`. Successful HTTP responses
+with invalid JSON, a non-object body, or malformed or ambiguous structured
+replies mean `invalid`: the entire source is discarded, discovery
+continues, and NTC mode guessing is disabled for that invalid scope even when
+the Job's guessing flag is enabled. Independently validated explicit native
+configuration remains usable. No invalid row or partial result becomes a
+configured default. Required device identity, interfaces, collector input
+validation, cancellation, and unexpected programming errors remain fatal.
+There is no new software-version minimum, SSH transport, or CLI parser.
 Summary `switching_operational` counts positive access/trunk observations;
 `switching_dynamic_resolved` counts complete dynamic bundles resolved from
 those observations, rather than newly written assignments.
@@ -539,7 +554,7 @@ request `application/yang-data+json`.
 | Configured duplex | `/data/Cisco-IOS-XE-native:native/interface` with scoped qualified `Cisco-IOS-XE-ethernet:duplex` fields |
 | Configured LAG membership | `/data/Cisco-IOS-XE-native:native/interface` with qualified `Cisco-IOS-XE-ethernet:channel-group` field filters |
 | Configured 802.1Q mode, native VLAN, and allowed VLANs | `/data/Cisco-IOS-XE-native:native/interface` with complete scoped switchport containers |
-| Optional actual switchport mode, when advertised | `/data/Cisco-IOS-XE-switchport-oper:switchport-oper-data` with `switchport-info(if-name;enabled;admin-mode;hardware-present;port-details)` fields |
+| Optional actual switchport mode, advertised or directly probed when capability is unknown | `/data/Cisco-IOS-XE-switchport-oper:switchport-oper-data` with `switchport-info(if-name;enabled;admin-mode;hardware-present;port-details)` fields |
 | Global native-VLAN tagging configuration | `/data/Cisco-IOS-XE-native:native/vlan` |
 | Structured VLAN names and operational evidence | `/data/Cisco-IOS-XE-vlan-oper:vlans` |
 | Optional model revision evidence | `/data/ietf-yang-library:modules-state` |
@@ -552,8 +567,9 @@ Unavailable platform component data leaves serialized parts unresolved and
 preserves the usable Device and interface discovery. Malformed or contradictory
 serialized identity blocks discovery.
 Unavailable switching sources leave affected bundles unresolved; malformed or
-ambiguous structured switching data blocks discovery. Defaults do not replace
-failed or incomplete source reads.
+ambiguous native configuration or VLAN identity data blocks discovery. Invalid
+optional actual switchport data is discarded as described above. Defaults do
+not replace failed or incomplete source reads.
 HTTPS redirects are rejected. A legacy TLS retry is available only when the
 operator explicitly disables certificate verification.
 
@@ -735,3 +751,21 @@ preserved. A second successful worker apply reported zero inventory changes
 and identical complete snapshots, including the new SFP UUID. The previously
 documented four missing hardware identities and `Vlan2` type conflict remain
 unchanged; there are no new unresolved SFP observations on the lab switch.
+
+The `0.11.0-dev` increment makes optional operational switchport RESTCONF
+discovery best effort while retaining strict validation of required facts.
+It passed 383 offline regressions, lint/format/syntax checks, and 73 real
+Nautobot 3.2.5 ORM checks with zero persistent integration changes. Four live
+GET-only preview cases on the unchanged IOS XE 17.12.8 lab issued zero
+inventory mutation statements: normal discovery; an injected unavailable
+YANG library followed by a real endpoint probe returning HTTP 404; an invalid
+optional structured reply; and an invalid successful-HTTP JSON response.
+The invalid-source cases kept NTC guessing enabled to verify that rejected
+evidence produces zero inferred bundles. The two invalid responses and the
+unavailable library were process-local test injections, not device changes.
+Both the real worker preview and strict apply succeeded with identical
+before/after inventory snapshots and attached reports. The existing `Vlan2`
+type conflict and four unresolved hardware identities remained unchanged.
+Positive operational-mode cases on 17.15/17.18 remain offline schema-based
+tests; they have not been verified on a live newer-release switch. The
+omitted-leaf default profile remains reviewed only for 17.9/17.12/17.15.

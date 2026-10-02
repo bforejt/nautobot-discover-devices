@@ -12,6 +12,7 @@ from ..transport_restconf import RestconfError
 MODULE = "Cisco-IOS-XE-switchport-oper"
 PATH = "/data/%s:switchport-oper-data" % MODULE
 FIELDS = "switchport-info(if-name;enabled;admin-mode;hardware-present;port-details)"
+READ_TIMEOUT = 15
 MODEL_URL = (
     "https://raw.githubusercontent.com/YangModels/yang/main/"
     "vendor/cisco/xe/17151/Cisco-IOS-XE-switchport-oper.yang"
@@ -28,7 +29,7 @@ OPERATIONAL_MODES = {
 
 
 class SwitchportOperDiscoveryError(ValueError):
-    """Advertised switchport operational facts are malformed or ambiguous."""
+    """Switchport operational facts or collector inputs are invalid."""
 
 
 def _object(value, label):
@@ -142,23 +143,35 @@ def _status(client, path):
     return None
 
 
+def _failure_status(status):
+    if status in (404, 501):
+        return "unsupported"
+    # The transport rejects malformed JSON and non-object JSON with the
+    # successful HTTP status attached. Rejected bodies must not look like
+    # missing evidence and thereby enable the NTC down-port assumption.
+    if status is not None and 200 <= status < 300:
+        return "invalid"
+    return "unavailable"
+
+
 def _read(client, warnings):
     path = PATH + "?fields=" + FIELDS
     try:
-        return client.get(path), _status(client, path), True
+        return client.get(path, timeout=READ_TIMEOUT), _status(client, path), True
     except RestconfError as exc:
         if exc.status_code == 400:
             warnings.append(
                 "%s: fields filter rejected (HTTP 400); unfiltered JSON read used" % PATH
             )
             try:
-                return client.get(PATH), _status(client, PATH), True
+                return client.get(PATH, timeout=READ_TIMEOUT), _status(client, PATH), True
             except RestconfError as fallback:
                 exc = fallback
         status = " (HTTP %s)" % exc.status_code if exc.status_code else ""
+        availability = _failure_status(exc.status_code)
         warnings.append(
-            "Switchport operational source unavailable%s; existing interface modes are preserved"
-            % status
+            "Switchport operational source %s%s; existing interface modes are preserved"
+            % (availability, status)
         )
         return None, exc.status_code, False
 
@@ -166,38 +179,27 @@ def _read(client, warnings):
 def collect(client, interfaces, *, canonical_name, revisions, warnings):
     """Return applicable actual modes, retaining all distinct administrative facts.
 
-    A known complete module map gates the GET. An unreadable library must be
-    passed as None, which is different from a known absence of this module.
-    Optional transport failures preserve other discovery. Malformed advertised
-    data raises a specific error for the adapter's required validation boundary.
+    A known complete module map skips an absent module. An unreadable library
+    is passed as None and triggers a bounded direct probe with unknown revision.
+    Optional read or remote validation failures preserve other discovery, while
+    invalid collector inputs and unexpected exceptions continue to propagate.
     """
     source = {"module": MODULE, "path": PATH, "revision": None, "model_url": MODEL_URL}
     result = {"schema_version": 1, "source": source, "interfaces": []}
-    if revisions is None:
-        source["status"] = "capability-unknown"
-        return result
-    if not isinstance(revisions, dict):
+    if revisions is not None and not isinstance(revisions, dict):
         raise SwitchportOperDiscoveryError("Switchport module revisions must be a mapping")
-    if MODULE not in revisions:
+    source["capability_status"] = "unknown" if revisions is None else "advertised"
+    source["probed_without_advertisement"] = revisions is None
+    if revisions is not None and MODULE not in revisions:
+        source["capability_status"] = "not-advertised"
         source["status"] = "not-advertised"
         return result
-    revision = revisions[MODULE]
+    revision = revisions[MODULE] if revisions is not None else None
     if revision is not None and not isinstance(revision, str):
         raise SwitchportOperDiscoveryError("Switchport module revision must be a string")
     source["revision"] = revision
-    payload, status, read_ok = _read(client, warnings)
-    source["http_status"] = status
-    if not read_ok:
-        source["status"] = "unavailable"
-        return result
-    source["status"] = "available"
-    if status == 204 and payload == {}:
-        return result
-    envelope = _object(payload, "Switchport operational reply")
-    container = _object(_value(envelope, "switchport-oper-data"), "switchport-oper-data")
-    rows = _value(container, "switchport-info")
-    if not isinstance(rows, list):
-        raise SwitchportOperDiscoveryError("switchport-info must be a structured list")
+    # These names come from mandatory core discovery, not optional remote
+    # evidence. Invalid/ambiguous inputs must not be softened into a skipped read.
     eligible = set()
     for interface in interfaces:
         name = interface.get("name") if isinstance(interface, dict) else None
@@ -207,6 +209,42 @@ def collect(client, interfaces, *, canonical_name, revisions, warnings):
         if not isinstance(name, str) or not name or name in eligible:
             raise SwitchportOperDiscoveryError("Eligible canonical interface names are ambiguous")
         eligible.add(name)
+    payload, status, read_ok = _read(client, warnings)
+    source["http_status"] = status
+    if not read_ok:
+        source["status"] = _failure_status(status)
+        if source["status"] == "invalid":
+            source["reason"] = "Switchport operational response must be a structured JSON object"
+        return result
+    if status == 204 and payload == {}:
+        source["status"] = "available"
+        return result
+    try:
+        parsed = _parse(payload, eligible, canonical_name, revision)
+    except SwitchportOperDiscoveryError as exc:
+        # Validation messages contain only fixed schema labels; never retain
+        # remote response bodies. Discard the entire source, including earlier
+        # valid rows, so ambiguity cannot create partial assignments or guesses.
+        source["status"] = "invalid"
+        source["reason"] = str(exc)
+        warnings.append(
+            "Switchport operational source invalid; data discarded and negotiated-mode "
+            "guessing disabled for this source: %s" % exc
+        )
+        return result
+    source["status"] = "available"
+    result["interfaces"] = parsed
+    return result
+
+
+def _parse(payload, eligible, canonical_name, revision):
+    """Validate all remote rows before exposing any optional interface facts."""
+    envelope = _object(payload, "Switchport operational reply")
+    container = _object(_value(envelope, "switchport-oper-data"), "switchport-oper-data")
+    rows = _value(container, "switchport-info")
+    if not isinstance(rows, list):
+        raise SwitchportOperDiscoveryError("switchport-info must be a structured list")
+    parsed = []
     seen = set()
     for row in rows:
         row = _object(row, "switchport-info row")
@@ -237,7 +275,7 @@ def collect(client, interfaces, *, canonical_name, revisions, warnings):
             reason = "Administrative mode is absent, unknown, or outside the ordinary profile"
         elif oper not in OPERATIONAL_MODES:
             reason = "Current operational mode is absent, unknown, or unsupported"
-        result["interfaces"].append(
+        parsed.append(
             {
                 "name": name,
                 "admin_mode": _value(row, "admin-mode"),
@@ -259,5 +297,4 @@ def collect(client, interfaces, *, canonical_name, revisions, warnings):
                 },
             }
         )
-    result["interfaces"].sort(key=lambda row: row["name"])
-    return result
+    return sorted(parsed, key=lambda row: row["name"])

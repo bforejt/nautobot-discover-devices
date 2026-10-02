@@ -1,0 +1,51 @@
+{
+  "Cisco-IOS-XE-vlan-oper:vlans": {
+    "vlan": [
+      {
+        "id": 1,
+        "name": "LAB-VLAN-1",
+        "status": "active"
+      },
+      {
+        "id": 2,
+        "name": "LAB-VLAN-2",
+        "status": "active"
+      },
+      {
+        "id": 3,
+        "name": "LAB-VLAN-3",
+        "status": "active"
+      },
+      {
+        "id": 4,
+        "name": "LAB-VLAN-4",
+        "status": "active"
+      },
+      {
+        "id": 999,
+        "name": "LAB-VLAN-999",
+        "status": "active"
+      },
+      {
+        "id": 1002,
+        "name": "LAB-VLAN-1002",
+        "status": "suspend"
+      },
+      {
+        "id": 1003,
+        "name": "LAB-VLAN-1003",
+        "status": "suspend"
+      },
+      {
+        "id": 1004,
+        "name": "LAB-VLAN-1004",
+        "status": "suspend"
+      },
+      {
+        "id": 1005,
+        "name": "LAB-VLAN-1005",
+        "status": "suspend"
+      }
+    ]
+  }
+}

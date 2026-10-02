@@ -1,0 +1,22 @@
+{
+  "Cisco-IOS-XE-native:interface": {
+    "GigabitEthernet": [
+      {"name": "0/0"},
+      {"name": "1/1/1"}
+    ],
+    "TwoGigabitEthernet": [
+      {"name": "1/0/1"},
+      {
+        "name": "1/0/22",
+        "Cisco-IOS-XE-ethernet:channel-group": {"number": 1, "mode": "active"}
+      },
+      {
+        "name": "1/0/23",
+        "Cisco-IOS-XE-ethernet:channel-group": {"number": 1, "mode": "active"}
+      }
+    ],
+    "TenGigabitEthernet": [
+      {"name": "1/0/48"}
+    ]
+  }
+}

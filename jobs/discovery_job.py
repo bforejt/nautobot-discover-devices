@@ -14,7 +14,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.9.0-dev"
+JOB_VERSION = "0.10.0-dev"
 
 
 def _host(device):
@@ -398,6 +398,21 @@ class DiscoverDevice(Job):
                 "configuration reads; their source evidence is under Advanced.",
                 summary["switching_defaults"],
             )
+        operational_source = plan.get("layer2", {}).get("operational_source") or {}
+        if operational_source.get("status") in ("not-advertised", "capability-unknown"):
+            self.logger.info(
+                "Operational switchport mode source is %s. Negotiated mode stays blank "
+                "without supported evidence; configured assignments remain available.",
+                operational_source["status"],
+            )
+        if summary.get("switching_operational"):
+            self.logger.info(
+                "Observed actual negotiated access/trunk mode on %s interfaces; %s dynamic "
+                "switchports also have complete, supported configured VLAN assignments. "
+                "The operational source and administrative mode are separate in the report.",
+                summary["switching_operational"],
+                summary["switching_dynamic_resolved"],
+            )
         if summary.get("switching_dynamic"):
             if summary.get("switching_inferred"):
                 self.logger.info(
@@ -410,9 +425,10 @@ class DiscoverDevice(Job):
             else:
                 self.logger.info(
                     "%s interfaces have dynamic switchport configuration. Available configuration "
-                    "is retained separately; their negotiated 802.1Q mode remains blank unless "
-                    "it is established by supported evidence.",
+                    "is retained separately; %s have complete assignments established from their "
+                    "reported negotiated mode. Any unknown negotiated 802.1Q mode remains blank.",
                     summary["switching_dynamic"],
+                    summary.get("switching_dynamic_resolved", 0),
                 )
         if summary.get("interface_vlan_assignments_inferred"):
             self.logger.info(

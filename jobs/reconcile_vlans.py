@@ -40,6 +40,12 @@ def _finish(plan):
             row.get("configured_mode") in ("dynamic-auto", "dynamic-desirable")
             for row in plan["settings"]
         ),
+        "switching_inferred": sum(
+            isinstance(row.get("inference"), dict) for row in plan["settings"]
+        ),
+        "interface_vlan_assignments_inferred": sum(
+            row.get("inferred", False) for row in plan["assignments"]
+        ),
     }
     return plan
 
@@ -90,6 +96,10 @@ def plan_vlans(discovery, existing, interface_plan=None):
         if not isinstance(row.get("field_sources", {}), dict):
             plan["settings"] = []
             plan["errors"].append("Switching field provenance must be a structured object")
+            return _finish(plan)
+        if "inference" in row and not isinstance(row["inference"], dict):
+            plan["settings"] = []
+            plan["errors"].append("Switching inference provenance must be a structured object")
             return _finish(plan)
     if type(source.get("catalog_complete", False)) is not bool:
         plan["errors"].append("VLAN catalog completeness must be an explicit boolean")
@@ -146,6 +156,19 @@ def plan_vlans(discovery, existing, interface_plan=None):
         mode, native, tagged = row.get("mode"), row.get("untagged_vid"), row.get("tagged_vids")
         if not isinstance(mode, str) or mode not in MODES:
             error("Interface %s has an unsupported switching mode" % name)
+            continue
+        inferred = row.get("inferred", False)
+        if (
+            type(inferred) is not bool
+            or inferred
+            and not isinstance(
+                row.get("source", {}).get("ntc_inference")
+                if isinstance(row.get("source", {}), dict)
+                else None,
+                dict,
+            )
+        ):
+            error("Interface %s requires explicit inference provenance" % name)
             continue
         if (
             "untagged_vid" not in row
@@ -385,6 +408,8 @@ def plan_vlans(discovery, existing, interface_plan=None):
                     "source": fact.get("source", {}),
                 }
             )
+            if fact.get("inferred", False):
+                plan["assignments"][-1]["inferred"] = True
     # A complete device VLAN database is useful inventory independently of
     # whether any interface currently references a VLAN. Older discovery
     # reports without this marker keep the original referenced-only policy.

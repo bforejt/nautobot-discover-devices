@@ -90,6 +90,42 @@ def apply_to_snapshot(plan, before):
 
 
 class VLANReconciliationTests(unittest.TestCase):
+    def test_inferred_assignments_are_identified_and_idempotent(self):
+        inference = {"policy": "ntc-device-onboarding-5.4.1-dynamic-down-all"}
+        observed = discovery(
+            fact(mode="tagged-all", inferred=True, source={"ntc_inference": inference})
+        )
+        observed["layer2"]["settings"] = [
+            {"name": "Gi1/0/1", "configured_mode": "dynamic-auto", "inference": inference}
+        ]
+        before = inventory()
+        first = planner.plan_vlans(observed, before)
+        self.assertFalse(first["errors"])
+        self.assertTrue(first["assignments"][0]["inferred"])
+        self.assertEqual(first["summary"]["switching_inferred"], 1)
+        self.assertEqual(first["summary"]["interface_vlan_assignments_inferred"], 1)
+        after = apply_to_snapshot(first, before)
+        repeat = planner.plan_vlans(observed, after)
+        self.assertFalse(repeat["assignments"])
+        self.assertEqual(repeat["summary"]["switching_inferred"], 1)
+        self.assertEqual(repeat["summary"]["interface_vlan_assignments_inferred"], 0)
+        # Returning to strict discovery preserves inventory populated by a prior run.
+        strict = planner.plan_vlans(discovery(vlans=[]), after)
+        self.assertFalse(strict["assignments"])
+        self.assertEqual(after["interfaces"][0]["mode"], "tagged-all")
+        before["interfaces"][0]["mode"] = "access"
+        preserved = planner.plan_vlans(observed, before)
+        self.assertFalse(preserved["assignments"])
+        self.assertEqual(preserved["summary"]["interface_vlan_assignments_inferred"], 0)
+        self.assertEqual(preserved["conflicts"][0]["field"], "mode")
+
+    def test_inferred_bundle_requires_structured_provenance(self):
+        for values in ({"inferred": True}, {"inferred": "false"}):
+            with self.subTest(values=values):
+                plan = planner.plan_vlans(discovery(fact(**values)), inventory())
+                self.assertTrue(plan["errors"])
+                self.assertFalse(plan["assignments"])
+
     def test_access_bundle_creates_only_referenced_vlan_and_preserves_uuid(self):
         before = inventory()
         original = deepcopy(before)

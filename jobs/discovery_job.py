@@ -14,7 +14,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.5.0-dev"
+JOB_VERSION = "0.6.0-dev"
 
 
 def _host(device):
@@ -46,6 +46,16 @@ def _adapter(device):
 class DiscoverDevice(Job):
     device = ObjectVar(model=Device, description="Existing Device to verify and enrich.")
     dryrun = DryRunVar(description="Preview changes without updating device inventory.")
+    use_ntc_defaults = BooleanVar(
+        label="Use NTC defaults when guessing",
+        default=False,
+        description=(
+            "Disabled: leave uncertain values blank. Enabled: use the reviewed Network to Code "
+            "Device Onboarding fallback for down dynamic switchports that allow all VLANs: "
+            "Tagged all and their known native VLAN. Guessed values are identified in the report; "
+            "other unresolved data stays blank. Existing populated values are preserved."
+        ),
+    )
     verify_tls = BooleanVar(default=True, description="Verify the device HTTPS certificate.")
     restconf_port = IntegerVar(default=443, min_value=1, max_value=65535)
     secrets_group = ObjectVar(
@@ -98,6 +108,7 @@ class DiscoverDevice(Job):
         field_order = (
             "device",
             "dryrun",
+            "use_ntc_defaults",
             "verify_tls",
             "restconf_port",
             "secrets_group",
@@ -120,6 +131,7 @@ class DiscoverDevice(Job):
         module_status=None,
         vlan_group=None,
         vlan_status=None,
+        use_ntc_defaults=False,
     ):
         device = Device.objects.get(pk=device.pk)
         report = {
@@ -127,6 +139,7 @@ class DiscoverDevice(Job):
             "job_version": JOB_VERSION,
             "device_id": str(device.pk),
             "dry_run": dryrun,
+            "use_ntc_defaults": use_ntc_defaults,
             "verify_tls": verify_tls,
             "restconf_port": restconf_port,
             "applied": False,
@@ -137,13 +150,20 @@ class DiscoverDevice(Job):
             "Starting %s for %s.", "discovery preview" if dryrun else "discovery", device.name
         )
         try:
+            if type(use_ntc_defaults) is not bool:
+                raise ValueError("Use NTC defaults when guessing must be true or false")
+            if use_ntc_defaults:
+                self.logger.info(
+                    "NTC default guessing is enabled. Any inferred assignments are identified "
+                    "as guesses in the discovery report."
+                )
             adapter = _adapter(device)
             username, password = resolve_credentials(device, override_group=secrets_group)
             client = RestconfClient(
                 _host(device), username, password, port=restconf_port, verify=verify_tls
             )
             try:
-                report["discovery"] = adapter.collect(client)
+                report["discovery"] = adapter.collect(client, use_ntc_defaults=use_ntc_defaults)
             finally:
                 client.close()
                 report["requests"] = client.trace
@@ -349,11 +369,27 @@ class DiscoverDevice(Job):
                 summary["switching_defaults"],
             )
         if summary.get("switching_dynamic"):
+            if summary.get("switching_inferred"):
+                self.logger.info(
+                    "%s interfaces have dynamic switchport configuration; %s match the "
+                    "opt-in NTC guessing policy. These guesses do not establish a negotiated "
+                    "access/trunk mode. Configuration and inference evidence are under Advanced.",
+                    summary["switching_dynamic"],
+                    summary["switching_inferred"],
+                )
+            else:
+                self.logger.info(
+                    "%s interfaces have dynamic switchport configuration. Available configuration "
+                    "is retained separately; their negotiated 802.1Q mode remains blank unless "
+                    "it is established by supported evidence.",
+                    summary["switching_dynamic"],
+                )
+        if summary.get("interface_vlan_assignments_inferred"):
             self.logger.info(
-                "%s interfaces have dynamic switchport configuration. Available configuration "
-                "is retained separately; their negotiated 802.1Q mode remains blank unless "
-                "it is established by supported evidence.",
-                summary["switching_dynamic"],
+                "%s NTC-inferred VLAN assignments on %s interfaces. "
+                "The assumed mode and its source are identified in the report.",
+                "Would use" if dryrun else "Used",
+                summary["interface_vlan_assignments_inferred"],
             )
         if summary.get("unresolved_switching"):
             self.logger.warning(

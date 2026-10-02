@@ -30,6 +30,281 @@ class Layer2CollectionTests(unittest.TestCase):
     def collect(self, values=None, client=None):
         return cisco.collect(client or FixtureClient(values or payloads()))["layer2"]
 
+    def collect_ntc(self, values=None, client=None, use_ntc_defaults=True, **overrides):
+        values = values or payloads()
+        normalized = cisco.collect(FixtureClient(values))["interfaces"]
+        return layer2.collect(
+            client or FixtureClient(values),
+            normalized,
+            model=overrides.get("model", "C9300-48UXM"),
+            software_version=overrides.get("software_version", "17.12.08"),
+            canonical_name=cisco.canonical_interface_name,
+            warnings=[],
+            use_ntc_defaults=use_ntc_defaults,
+        )
+
+    def test_ntc_flag_off_preserves_strict_result_and_has_no_inference_metadata(self):
+        result = self.collect_ntc(use_ntc_defaults=False)
+        self.assertEqual(len(result["interfaces"]), 19)
+        self.assertEqual(len(result["unresolved"]), 34)
+        self.assertFalse(any("inference" in row for row in result["settings"]))
+        self.assertFalse(any("inferred" in row for row in result["interfaces"]))
+        normalized = cisco.collect(FixtureClient(payloads()))["interfaces"]
+        default = layer2.collect(
+            FixtureClient(payloads()),
+            normalized,
+            model="C9300-48UXM",
+            software_version="17.12.08",
+            canonical_name=cisco.canonical_interface_name,
+            warnings=[],
+        )
+        self.assertEqual(result, default)
+
+    def test_ntc_flag_requires_an_actual_boolean(self):
+        for invalid in ("true", "false", 0, 1, None, []):
+            with self.subTest(invalid=invalid), self.assertRaises(layer2.Layer2DiscoveryError):
+                self.collect_ntc(use_ntc_defaults=invalid)
+
+    def test_ntc_opt_in_models_only_down_dynamic_ports_and_labels_assumptions(self):
+        result = self.collect_ntc()
+        inferred = [row for row in result["interfaces"] if row.get("inferred")]
+        self.assertEqual(len(inferred), 33)
+        self.assertEqual(len(result["interfaces"]), 52)
+        self.assertEqual(len(result["unresolved"]), 1)
+        self.assertEqual(result["unresolved"][0]["name"], "TwoGigabitEthernet1/0/14")
+        settings = {row["name"]: row for row in result["settings"]}
+        for row in inferred:
+            self.assertEqual(
+                (row["mode"], row["untagged_vid"], row["tagged_vids"]), ("tagged-all", 1, [])
+            )
+            facts = settings[row["name"]]
+            inference = facts["inference"]
+            self.assertEqual(inference, row["source"]["ntc_inference"])
+            self.assertEqual(inference["policy"], layer2.NTC_DOWN_POLICY)
+            self.assertEqual(inference["observed_oper_status"], "if-oper-state-lower-layer-down")
+            self.assertEqual(
+                inference["inferred_fields"], {"mode": "tagged-all", "untagged_vid": 1}
+            )
+            self.assertIn("assumption", inference["meaning"])
+            self.assertEqual(inference["reason"], facts["unresolved_reason"])
+            self.assertEqual(facts["configured_mode"], "dynamic-auto")
+            self.assertEqual(facts["field_sources"]["configured_mode"], "documented-default")
+            self.assertTrue(inference["upstream_url"].endswith("jinja_filters.py#L95"))
+
+    def test_ntc_down_signal_accepts_only_the_two_reviewed_enums(self):
+        values = payloads()
+        physical = next(
+            row
+            for row in values[cisco.INTERFACES_PATH]["Cisco-IOS-XE-interfaces-oper:interfaces"][
+                "interface"
+            ]
+            if cisco.canonical_interface_name(row["name"]) == "TwoGigabitEthernet1/0/15"
+        )
+        for state in (
+            "if-oper-state-no-pass",
+            "if-oper-state-lower-layer-down",
+            "if-oper-state-ready",
+            "if-oper-state-test",
+            "if-oper-state-dormant",
+            "if-oper-state-unknown",
+            None,
+            "down",
+            "if-oper-state-future",
+        ):
+            with self.subTest(state=state):
+                physical["oper-status"] = state
+                result = self.collect_ntc(values)
+                selected = [
+                    row for row in result["interfaces"] if row["name"] == "TwoGigabitEthernet1/0/15"
+                ]
+                self.assertEqual(bool(selected), state in layer2.NTC_DOWN_STATES)
+
+    def test_ntc_opt_in_keeps_static_bundles_unchanged(self):
+        strict = self.collect_ntc(use_ntc_defaults=False)
+        opt_in = self.collect_ntc()
+        original = {row["name"]: row for row in strict["interfaces"]}
+        self.assertEqual(
+            original, {row["name"]: row for row in opt_in["interfaces"] if row["name"] in original}
+        )
+
+    def test_ntc_literal_full_allowed_range_matches_upstream_without_rewriting_facts(self):
+        values = payloads()
+        native_row(values, "TwoGigabitEthernet", "1/0/15")["switchport-config"] = {
+            "switchport": {
+                "Cisco-IOS-XE-switch:trunk": {
+                    "allowed": {"vlan-v2": {"vlan-choices": {"vlans": "1-4094"}}}
+                }
+            }
+        }
+        result = self.collect_ntc(values)
+        row = next(row for row in result["interfaces"] if row["name"] == "TwoGigabitEthernet1/0/15")
+        facts = next(row for row in result["settings"] if row["name"] == "TwoGigabitEthernet1/0/15")
+        self.assertTrue(row["inferred"])
+        self.assertEqual((row["mode"], row["tagged_vids"]), ("tagged-all", []))
+        self.assertEqual(facts["allowed_mode"], "list")
+        self.assertEqual(facts["allowed_vids"], list(range(1, 4095)))
+        self.assertEqual(facts["observations"]["raw_allowed"], {"vlans": "1-4094"})
+        self.assertEqual(
+            row["source"]["ntc_inference"]["allowed_vlan_evidence"],
+            {
+                "configured_policy": "list",
+                "raw_selection": {"vlans": "1-4094"},
+                "source": "explicit",
+                "validated_literal_full_range": True,
+            },
+        )
+
+    def test_ntc_other_finite_or_composed_allowed_ranges_remain_unresolved(self):
+        for allowed in ("1-4093", "3,4", "1,2-4094", "1-4093,4094"):
+            with self.subTest(allowed=allowed):
+                values = payloads()
+                native_row(values, "TwoGigabitEthernet", "1/0/15")["switchport-config"] = {
+                    "switchport": {
+                        "Cisco-IOS-XE-switch:trunk": {
+                            "allowed": {"vlan-v2": {"vlan-choices": {"vlans": allowed}}}
+                        }
+                    }
+                }
+                result = self.collect_ntc(values)
+                self.assertNotIn(
+                    "TwoGigabitEthernet1/0/15", {row["name"] for row in result["interfaces"]}
+                )
+
+    def test_ntc_literal_full_range_cannot_bypass_validated_range_proof(self):
+        strict = self.collect_ntc(use_ntc_defaults=False)
+        facts = next(row for row in strict["settings"] if row["name"] == "TwoGigabitEthernet1/0/15")
+        facts["allowed_mode"] = "list"
+        facts["allowed_vids"] = [1, 2, 3]
+        facts["observations"]["raw_allowed"] = {"vlans": "1-4094"}
+        interface = {
+            "name": facts["name"],
+            "observations": {"oper_status": "if-oper-state-lower-layer-down"},
+        }
+        self.assertIsNone(layer2._ntc_down_bundle(facts, interface, True, "unresolved mode"))
+
+    def test_ntc_explicit_dynamic_modes_retain_native_vid_and_configuration(self):
+        for dynamic in ("auto", "desirable"):
+            with self.subTest(dynamic=dynamic):
+                values = payloads()
+                physical = next(
+                    row
+                    for row in values[cisco.INTERFACES_PATH][
+                        "Cisco-IOS-XE-interfaces-oper:interfaces"
+                    ]["interface"]
+                    if cisco.canonical_interface_name(row["name"]) == "TwoGigabitEthernet1/0/1"
+                )
+                physical["oper-status"] = "if-oper-state-lower-layer-down"
+                port = switchport(values, "TwoGigabitEthernet", "1/0/1")
+                port["Cisco-IOS-XE-switch:mode"] = {"dynamic": dynamic}
+                port["Cisco-IOS-XE-switch:trunk"] = {
+                    "native": {"vlan": {"vlan-id": 999}},
+                    "allowed": {"vlan-v2": {"vlan-choices": {"all": True}}},
+                }
+                result = self.collect_ntc(values)
+                row = next(
+                    row for row in result["interfaces"] if row["name"] == "TwoGigabitEthernet1/0/1"
+                )
+                facts = next(
+                    candidate
+                    for candidate in result["settings"]
+                    if candidate["name"] == row["name"]
+                )
+                self.assertTrue(row["inferred"])
+                self.assertEqual(row["untagged_vid"], 999)
+                self.assertEqual(row["observations"]["configured_mode"], "dynamic-" + dynamic)
+                self.assertEqual(
+                    row["source"]["ntc_inference"]["inferred_fields"]["untagged_vid"], 999
+                )
+                self.assertNotEqual(facts["configured_mode"], "trunk")
+
+    def test_ntc_never_overrides_voice_private_tunnel_native_tagging_or_finite_allowed(self):
+        changes = (
+            {"Cisco-IOS-XE-switch:voice": {"vlan": {"vlan": 20}}},
+            {"Cisco-IOS-XE-switch:private-vlan": {}},
+            {"Cisco-IOS-XE-switch:mode": {"private-vlan": {"host": [None]}}},
+            {"Cisco-IOS-XE-switch:mode": {"dot1q-tunnel": {}}},
+            {"Cisco-IOS-XE-switch:trunk": {"native": {"vlan": {"tag": True, "vlan-id": 1}}}},
+            {"Cisco-IOS-XE-switch:trunk": {"native": {"vlan": {"tag": False, "vlan-id": 1}}}},
+            {
+                "Cisco-IOS-XE-switch:trunk": {
+                    "allowed": {"vlan-v2": {"vlan-choices": {"vlans": "3,4"}}}
+                }
+            },
+            {
+                "Cisco-IOS-XE-switch:trunk": {
+                    "allowed": {"vlan-v2": {"vlan-choices": {"none": [None]}}}
+                }
+            },
+            {"Cisco-IOS-XE-switch:trunk": {"encapsulation": "isl"}},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                values = payloads()
+                native_row(values, "TwoGigabitEthernet", "1/0/15")["switchport-config"] = {
+                    "switchport": change
+                }
+                result = self.collect_ntc(values)
+                self.assertNotIn(
+                    "TwoGigabitEthernet1/0/15", {row["name"] for row in result["interfaces"]}
+                )
+        for global_config in (
+            None,
+            {},
+            {"Cisco-IOS-XE-native:vlan": {"dot1q": {"tag": {"native": [None]}}}},
+        ):
+            with self.subTest(global_config=global_config):
+                values = payloads()
+                values[layer2.GLOBAL_PATH] = global_config
+                result = self.collect_ntc(values)
+                self.assertFalse(any(row.get("inferred") for row in result["interfaces"]))
+
+    def test_ntc_does_not_guess_management_logical_routed_or_lag_interfaces(self):
+        values = payloads()
+        switchport(values, "Port-channel", 1)["Cisco-IOS-XE-switch:mode"] = {"dynamic": "auto"}
+        native_row(values, "TwoGigabitEthernet", "1/0/15")["switchport-conf"] = {
+            "switchport": False
+        }
+        result = self.collect_ntc(values)
+        inferred = {row["name"] for row in result["interfaces"] if row.get("inferred")}
+        self.assertNotIn("Port-channel1", inferred)
+        self.assertNotIn("GigabitEthernet0/0", inferred)
+        self.assertNotIn("TwoGigabitEthernet1/0/15", inferred)
+        self.assertFalse(any(name.startswith("Vlan") for name in inferred))
+
+    def test_ntc_unavailable_configuration_or_missing_row_never_enables_a_guess(self):
+        class Unavailable(FixtureClient):
+            def __init__(self, missing):
+                super().__init__(payloads())
+                self.missing = missing
+
+            def get(self, path, **kwargs):
+                if path.split("?", 1)[0] == self.missing:
+                    raise cisco.RestconfError("unavailable", status_code=404)
+                return super().get(path, **kwargs)
+
+        for missing in (layer2.NATIVE_PATH, layer2.GLOBAL_PATH):
+            with self.subTest(missing=missing):
+                result = self.collect_ntc(client=Unavailable(missing))
+                self.assertFalse(any(row.get("inferred") for row in result["interfaces"]))
+        values = payloads()
+        values[layer2.NATIVE_PATH] = None
+        self.assertEqual(self.collect_ntc(values)["interfaces"], [])
+        values = payloads()
+        rows = values[layer2.NATIVE_PATH]["Cisco-IOS-XE-native:interface"]["TwoGigabitEthernet"]
+        rows[:] = [row for row in rows if row["name"] != "1/0/15"]
+        result = self.collect_ntc(values)
+        self.assertNotIn("TwoGigabitEthernet1/0/15", {row["name"] for row in result["interfaces"]})
+
+    def test_ntc_flag_does_not_bypass_malformed_or_competing_selector_errors(self):
+        for mode in (None, {"access": {}, "unexpected-mode": {}}):
+            with self.subTest(mode=mode):
+                values = payloads()
+                native_row(values, "TwoGigabitEthernet", "1/0/15")["switchport-config"] = {
+                    "switchport": {"Cisco-IOS-XE-switch:mode": mode}
+                }
+                with self.assertRaises(cisco.DiscoveryError):
+                    self.collect_ntc(values)
+
     def test_lab_has19_complete_bundles_and34_dynamic_modes(self):
         result = self.collect()
         self.assertEqual(len(result["interfaces"]), 19)

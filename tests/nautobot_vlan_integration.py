@@ -480,6 +480,51 @@ def run(device, interface_status, checks):
     assert repeat_catalog["summary"]["interface_vlan_assignments_updated"] == 0
     checks.append("catalog-only repeat is idempotent and creates no custom fields")
 
+    # The opt-in policy supplies a complete bundle while retaining its uncertainty.
+    guessed = seed_interface(name(18))
+    inference = {
+        "policy": "ntc-device-onboarding-5.4.1-dynamic-down-all",
+        "configured_mode": "dynamic-auto",
+        "observed_oper_status": "if-oper-state-lower-layer-down",
+        "inferred_fields": {"mode": "tagged-all", "untagged_vid": 191},
+    }
+    guessed_fact = switching(name(18), "tagged-all", 191)
+    guessed_fact.update(inferred=True, source={"ntc_inference": inference})
+    guessed_discovery = observed([fact(name(18))], [guessed_fact], [191])
+    guessed_discovery["layer2"]["settings"] = [
+        {"name": name(18), "configured_mode": "dynamic-auto", "inference": inference}
+    ]
+    before_guess = snapshot()
+    guessed_plan = build_plan(guessed_discovery, before_guess)
+    with CaptureQueriesContext(connection) as captured:
+        validate_plan(guessed_plan, device, interface_status=interface_status)
+    assert_no_dml(captured, "Inferred VLAN preview issued database writes")
+    assert snapshot() == before_guess
+    assert guessed_plan["summary"]["interface_vlan_assignments_inferred"] == 1
+    applied_guess = apply(guessed_discovery)
+    guessed.refresh_from_db()
+    assert guessed.mode == "tagged-all" and guessed.untagged_vlan.vid == 191
+    assert not guessed.tagged_vlans.exists()
+    assert applied_guess["layer2"]["assignments"][0]["inferred"] is True
+    assert CustomField.objects.count() == fields_before
+    checks.append(
+        "opt-in inferred tagged-all bundle validates without DML and applies native fields"
+    )
+    with CaptureQueriesContext(connection) as captured:
+        repeated_guess = apply(guessed_discovery)
+    assert_no_dml(captured, "Repeated inferred VLAN apply issued database writes")
+    assert repeated_guess["summary"]["switching_inferred"] == 1
+    assert repeated_guess["summary"]["interface_vlan_assignments_inferred"] == 0
+    strict_discovery = observed([fact(name(18))], [], [191])
+    with CaptureQueriesContext(connection) as captured:
+        apply(strict_discovery)
+    assert_no_dml(captured, "Returning to strict discovery mutated populated inferred inventory")
+    guessed.refresh_from_db()
+    assert guessed.mode == "tagged-all" and guessed.untagged_vlan.vid == 191
+    checks.append(
+        "inference repeats are idempotent and disabling guessing preserves existing values"
+    )
+
     # Fail the final tagged membership after catalog, software, Device,
     # interface fields, and an earlier tagged membership have actually saved.
     final_member = seed_interface(name(9), description="")

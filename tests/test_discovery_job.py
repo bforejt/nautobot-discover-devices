@@ -100,6 +100,8 @@ def plan(**counts):
         switching_defaults=0,
         switching_dynamic=0,
         switching_not_applicable=0,
+        switching_inferred=0,
+        interface_vlan_assignments_inferred=0,
         blocked=False,
     )
     summary.update(counts)
@@ -216,6 +218,59 @@ class DiscoveryJobTests(unittest.TestCase):
             "second raw warning",
         ):
             self.assertNotIn(evidence, messages)
+
+    def test_ntc_option_defaults_off_and_reaches_the_collector(self):
+        option = self.module.DiscoverDevice.use_ntc_defaults
+        self.assertFalse(option.default)
+        self.assertEqual(option.label, "Use NTC defaults when guessing")
+        self.assertIn("uncertain values blank", option.description)
+        self.job.run(self.device)
+        self.module.cisco_iosxe.collect.assert_called_once_with(self.client, use_ntc_defaults=False)
+        self.assertFalse(self.assert_saved_report()["use_ntc_defaults"])
+        self.assertNotIn("guessing is enabled", "\n".join(rendered_logs(self.job.logger)))
+
+    def test_opt_in_reports_inferences_and_keeps_raw_evidence_out_of_logs(self):
+        self.observed["layer2"] = {
+            "settings": [{"inference": {"reason": "raw-inference-sentinel"}}]
+        }
+        self.preview_plan["summary"].update(
+            switching_dynamic=34,
+            switching_inferred=33,
+            interface_vlan_assignments_inferred=33,
+            interface_vlan_assignments_updated=33,
+            interfaces_updated=33,
+        )
+        self.job.run(self.device, use_ntc_defaults=True)
+        self.module.cisco_iosxe.collect.assert_called_once_with(self.client, use_ntc_defaults=True)
+        report = self.assert_saved_report()
+        self.assertTrue(report["use_ntc_defaults"])
+        self.assertEqual(report["discovery"]["layer2"], self.observed["layer2"])
+        messages = "\n".join(rendered_logs(self.job.logger))
+        self.assertIn("NTC default guessing is enabled", messages)
+        self.assertIn("33 match the opt-in NTC guessing policy", messages)
+        self.assertIn("Would use NTC-inferred VLAN assignments on 33 interfaces", messages)
+        self.assertNotIn("negotiated 802.1Q mode remains blank", messages)
+        self.assertNotIn("raw-inference-sentinel", messages)
+        self.job.logger.warning.assert_not_called()
+
+    def test_repeat_inference_observations_do_not_report_inventory_changes(self):
+        repeated = plan(switching_dynamic=34, switching_inferred=33)
+        self.module.apply_discovery.return_value = repeated
+        self.job.run(self.device, dryrun=False, use_ntc_defaults=True)
+        messages = "\n".join(rendered_logs(self.job.logger))
+        self.assertIn("No inventory changes are needed", messages)
+        self.assertIn("33 match the opt-in NTC guessing policy", messages)
+        self.assertNotIn("Used NTC-inferred", messages)
+        self.assertTrue(self.assert_saved_report()["use_ntc_defaults"])
+
+    def test_non_boolean_ntc_option_cannot_enable_collection(self):
+        for value in ("false", "true", 1, None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "must be true or false"):
+                    self.job.run(self.device, use_ntc_defaults=value)
+        self.module.resolve_credentials.assert_not_called()
+        self.module.RestconfClient.assert_not_called()
+        self.module.cisco_iosxe.collect.assert_not_called()
 
     def test_apply_summaries_and_report_use_final_plan(self):
         self.preview_plan["summary"]["interfaces_created"] = 19

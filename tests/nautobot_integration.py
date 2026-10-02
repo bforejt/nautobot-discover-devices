@@ -407,6 +407,12 @@ def run(device_id=None):
     assert DiscoverDevice.supports_dryrun, "Nautobot must recognize the dryrun input"
     assert form["dryrun"].value() is True, "The rendered Job must default to a preview"
     checks.append("Nautobot recognizes the dryrun field and renders it enabled by default")
+    assert form["use_ntc_defaults"].value() is False
+    assert form.fields["use_ntc_defaults"].label == "Use NTC defaults when guessing"
+    assert "uncertain values blank" in form.fields["use_ntc_defaults"].help_text
+    checks.append(
+        "NTC guessing renders as a separate checkbox disabled by default with scoped help"
+    )
     _verify_job_error_serialization(device)
     checks.append(
         "failed apply logs and attaches its report without writes, and Billiard ExceptionInfo "

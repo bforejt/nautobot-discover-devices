@@ -436,8 +436,10 @@ def _lag_memberships(client, interfaces, excluded, warnings):
     return sorted(memberships, key=lambda row: (row["member"], row["lag"]))
 
 
-def collect(client):
+def collect(client, *, use_ntc_defaults=False):
     """Collect common facts; required identity/interface failures abort application."""
+    if type(use_ntc_defaults) is not bool:
+        raise DiscoveryError("Use NTC defaults when guessing must be true or false")
     warnings = []
     hostname = _text(_value(client.get(HOSTNAME_PATH), "hostname"))
     if hostname is None:
@@ -473,6 +475,7 @@ def collect(client):
             software_version=version,
             canonical_name=canonical_interface_name,
             warnings=warnings,
+            use_ntc_defaults=use_ntc_defaults,
         )
     except cisco_layer2.Layer2DiscoveryError as exc:
         raise DiscoveryError(str(exc)) from None

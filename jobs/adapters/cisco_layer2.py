@@ -39,6 +39,13 @@ CONFIG_DOC_ROOT = (
     "https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/"
     "software/release/%s/configuration_guide/int_hw/b_%s_int_and_hw_9300_cg/"
 )
+NTC_DOWN_POLICY = "ntc-device-onboarding-5.4.1-dynamic-down-all"
+NTC_DOWN_SOURCE = (
+    "https://github.com/nautobot/nautobot-app-device-onboarding/blob/"
+    "812746dc6f09077b8fe099da2318315e4e7cab23/"
+    "nautobot_device_onboarding/jinja_filters.py#L95"
+)
+NTC_DOWN_STATES = ("if-oper-state-no-pass", "if-oper-state-lower-layer-down")
 
 
 class Layer2DiscoveryError(ValueError):
@@ -467,8 +474,83 @@ def _bundle(switchport, profile, global_tagging):
     }, None
 
 
-def collect(client, interfaces, *, model, software_version, canonical_name, warnings):
+def _ntc_down_bundle(settings, interface, physical, reason):
+    """Apply the explicitly opted-in NTC down-port policy, never a known mode."""
+    operational = interface.get("observations")
+    observed = operational.get("oper_status") if isinstance(operational, dict) else None
+    observations = settings["observations"]
+    literal_full_range = (
+        settings["allowed_mode"] == "list"
+        and observations["raw_allowed"].get("vlans") == "1-4094"
+        and settings["allowed_vids"] == list(range(1, 4095))
+    )
+    if (
+        not physical
+        or settings["configured_mode"] not in ("dynamic-auto", "dynamic-desirable")
+        or not (settings["allowed_mode"] == "all" or literal_full_range)
+        or settings["native_vid"] is None
+        or settings["native_tagging"] is not False
+        or observations["native_tag_override"] is not None
+        or observations["voice_vlan_present"]
+        or observations["private_vlan_present"]
+        or observations["trunk_encapsulation"] not in (None, "dot1q")
+        or observed not in NTC_DOWN_STATES
+    ):
+        return None
+    inference = {
+        "policy": NTC_DOWN_POLICY,
+        "upstream_url": NTC_DOWN_SOURCE,
+        "module": "Cisco-IOS-XE-interfaces-oper",
+        "path": "/data/Cisco-IOS-XE-interfaces-oper:interfaces",
+        "field": "oper-status",
+        "interface": interface["name"],
+        "observed_oper_status": observed,
+        "configured_mode": settings["configured_mode"],
+        "inferred_fields": {"mode": "tagged-all", "untagged_vid": settings["native_vid"]},
+        "allowed_vlan_evidence": {
+            "configured_policy": settings["allowed_mode"],
+            "raw_selection": dict(observations["raw_allowed"]),
+            "source": settings["field_sources"].get("allowed_mode"),
+            "validated_literal_full_range": literal_full_range,
+        },
+        "reason": reason,
+        "meaning": (
+            "Opt-in assumption using NTC Device Onboarding's dynamic/down/allowed-all fallback; "
+            "the observed link state does not confirm the negotiated switchport mode"
+        ),
+    }
+    settings["inference"] = inference
+    return {
+        "mode": "tagged-all",
+        "untagged_vid": settings["native_vid"],
+        "tagged_vids": [],
+        "inferred": True,
+        "observations": {
+            "configured_mode": settings["configured_mode"],
+            "native_vid": settings["native_vid"],
+            "native_vid_source": settings["field_sources"].get("native_vid"),
+            "global_native_tagging": settings["native_tagging"],
+            "allowed_mode": settings["allowed_mode"],
+            "allowed_vids": settings["allowed_vids"],
+            "allowed_source": settings["field_sources"].get("allowed_mode"),
+            "native_in_allowed": True,
+        },
+    }
+
+
+def collect(
+    client,
+    interfaces,
+    *,
+    model,
+    software_version,
+    canonical_name,
+    warnings,
+    use_ntc_defaults=False,
+):
     """Return modelable bundles, independent facts, and explicit applicability."""
+    if type(use_ntc_defaults) is not bool:
+        raise Layer2DiscoveryError("NTC default guessing requires an explicit boolean flag")
     result = {
         "schema_version": 1,
         "interfaces": [],
@@ -626,6 +708,10 @@ def collect(client, interfaces, *, model, software_version, canonical_name, warn
             elif "requires" in (reason or "") or "not explicitly supported" in (reason or ""):
                 category = "unsupported"
             settings["unresolved_reason"] = reason
+            if use_ntc_defaults and bundle is None:
+                bundle = _ntc_down_bundle(settings, interface, physical, reason)
+                if bundle is not None:
+                    source["ntc_inference"] = settings["inference"]
             result["settings"].append({"name": name, **settings, "source": source})
         if bundle is None:
             result["unresolved"].append(

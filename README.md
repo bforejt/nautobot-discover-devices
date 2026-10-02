@@ -1,8 +1,8 @@
 # Nautobot device discovery
 
 `Discover Device` verifies an existing Nautobot Device against structured facts
-from the device, then fills missing identity, interface, reviewed serialized
-hardware inventory, and scoped 802.1Q assignments. The first adapter supports Cisco IOS XE switches on 17.9
+from the device, then fills missing identity, interface, console connector,
+reviewed serialized hardware inventory, and scoped 802.1Q assignments. The first adapter supports Cisco IOS XE switches on 17.9
 or later using RESTCONF JSON exclusively. The job defaults to a preview.
 
 This project targets Nautobot 3.2. Native `SoftwareVersion` is used for
@@ -129,6 +129,9 @@ MAC addresses, and descriptions.
 | Ready physical interface speed | Fill blank `Interface.speed` in Kbps from the structured operational value |
 | Explicit operational RJ45 media | Fill blank `Interface.port_type` with `8p8c` |
 | Configured copper duplex | Fill blank `Interface.duplex` from explicit configuration or the narrowly reviewed configured default |
+| Reviewed dedicated management hardware | Mark the confirmed `Gi0/0` as management-only using the narrow purpose-correction policy below |
+| Reviewed physical console connectors | Create or adopt native ConsolePorts, preserving existing names, UUIDs and cables |
+| Management VRF/address configuration | Retain structured evidence; defer assignments until the Namespace mapping is selected |
 | Negotiated and MAC duplex | Retain as observations; never substitute for the configured duplex setting |
 | Supported configured 802.1Q bundle | Fill blank mode and VLAN assignments in the selected VLAN Group |
 | Known configuration with unresolved forwarding mode | Retain separate access/native/allowed settings and provenance in the report; leave unsupported native assignments blank |
@@ -144,7 +147,8 @@ preserved when populated; existing LAG and VLAN assignments are also preserved.
 Differing observations
 appear as conflicts. Interfaces are never
 deleted or renamed. Serial/model conflicts, incomplete identity, and ambiguous
-canonical names block application.
+canonical names block application. The documented dedicated-management purpose
+correction below is the only exception that changes an existing Boolean `False`.
 
 The software release comes from explicit `install-oper` version/state leaves.
 An uncommitted provisioned release takes precedence over an older committed
@@ -157,7 +161,8 @@ Interfaces include present physical ports, management ports, SVIs, loopbacks,
 and port-channels. Disconnected ports remain eligible. Administrative state
 maps to `Interface.enabled`; operational state remains an observation and does
 not change lifecycle status. The supported fields are type, enabled, description,
-MTU, MAC, operational speed, supported connector type, and configured 802.1Q assignments.
+MTU, MAC, operational speed, supported connector type, documented management-only
+purpose, and configured 802.1Q assignments.
 Routing/Namespace interpretation, IP addresses, cables, transceiver inventory,
 and additional component profiles are future increments.
 
@@ -183,6 +188,65 @@ speed. The initial hardware map covers:
 An unsupported physical type or unknown administrative state skips creation
 with an explicit warning. Existing interfaces can still receive independently
 known blank fields. No generic physical type is invented.
+
+## Console and dedicated management ports
+
+The initial access-port profile is deliberately limited to the observed
+`C9300-48UXM`, member 1. Cisco documents a rear RJ45 console connector and a
+front five-pin USB mini-B console connector for this model. The collector uses
+that reviewed hardware specification and observed chassis PID as evidence,
+independently of **Use NTC defaults when guessing**. It records the profile,
+model, source leaf, document URLs, and physical position in each fact.
+
+These connectors become native Nautobot `ConsolePort` records with types
+`rj-45` and `usb-mini-b`. They are not Ethernet Interfaces or ConsoleServerPorts.
+Names default to **Console RJ45** and **Console USB**; their provenance identifies
+them as discovery-standardized names. Faceplate labels remain blank without
+verified label evidence. The USB Type-A storage connector is not inventoried as
+a console connector.
+
+An existing unique chassis connector of the same type is adopted without
+changing its name or UUID. A unique matching DeviceType template supplies a
+preferred creation name. Ambiguous templates/ports block application; an
+unidentified existing connector defers creation, and matching Module-owned
+ports remain attached to their Modules. Populated labels, descriptions,
+connector types, and cables are preserved. The job never creates cable links
+or guesses a remote console-server endpoint.
+
+The native `console=0` configuration represents one logical line shared by
+both connectors. Explicit speed, receive/transmit speeds, data bits, parity,
+stop bits, and configured medium are structured report observations. Missing
+settings remain unknown; the factory baud rate is not assumed. Disagreeing
+receive/transmit rates do not establish one baud rate. Nautobot 3.2.5 has no
+native ConsolePort fields for these serial settings, so no custom fields are
+created or populated. Targeted reads never retry with an unfiltered terminal
+configuration, which could include credentials. Optional configuration gaps
+do not invalidate confirmed physical connector inventory.
+
+The observed dedicated `GigabitEthernet0/0` is marked `mgmt_only=True` only
+when its reviewed chassis/port profile establishes exclusive out-of-band
+purpose and its physical type is compatible. Nautobot defaults this field to
+`False`; changing it to `True` for this documented port is an explicit narrow
+exception to ordinary fill-only reconciliation. Discovery never sets it to
+`False`, marks an SVI from its reachable address, or replaces populated type,
+connector, Module ownership, LAG membership, or VLAN settings to make the
+classification fit. Those incompatible settings defer the purpose correction
+and remain visible as conflicts.
+
+Management VRF definitions and configured static IPv4/IPv6 addresses are
+collected separately under `discovery.management`. Operational address values
+remain observations: `0.0.0.0` is not assigned, and an IPv6 address without a
+prefix length does not establish a mask. DHCP, autoconfiguration, EUI-64 and
+anycast flags retain their explicit meaning. VRF/IP writes are deferred until
+the intended Nautobot Namespace and Device-local VRF mapping are selected.
+Existing primary IPs and assignments remain unchanged.
+
+The lab exposes shutdown `Gi0/0` in `Mgmt-vrf` with no configured address;
+its existing primary management address belongs to `Vlan2`. Its console line
+explicitly reports one stop bit, with baud rate and other omitted settings
+unresolved. See [Cisco's connector specification](https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/hardware/install/b_c9300_hig/connector-cable-specs.html),
+[model diagrams](https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/hardware/install/b_c9300_hig/Product-overview.html),
+and [management-port guide](https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/software/release/17-12/configuration_guide/int_hw/b_1712_int_and_hw_9300_cg/configuring_ethernet_management_port.html).
 
 ## Serialized components
 
@@ -363,6 +427,10 @@ request `application/yang-data+json`.
 | Optional component identity corroboration and placement | `/data/Cisco-IOS-XE-platform-oper:components` |
 | Software release | `/data/Cisco-IOS-XE-install-oper:install-oper-data/install-location-information` |
 | Interfaces | `/data/Cisco-IOS-XE-interfaces-oper:interfaces` |
+| Optional logical console settings | `/data/Cisco-IOS-XE-native:native/line/console=0` with safe terminal-setting fields only |
+| Optional management configuration | `/data/Cisco-IOS-XE-native:native/interface/GigabitEthernet=0%2F0` with VRF/address fields |
+| Optional management operational evidence | `/data/Cisco-IOS-XE-interfaces-oper:interfaces/interface=GigabitEthernet0%2F0` with VRF/address fields |
+| Optional management VRF definition | `/data/Cisco-IOS-XE-native:native/vrf` with name/RD/address-family fields |
 | Configured duplex | `/data/Cisco-IOS-XE-native:native/interface` with scoped qualified `Cisco-IOS-XE-ethernet:duplex` fields |
 | Configured LAG membership | `/data/Cisco-IOS-XE-native:native/interface` with qualified `Cisco-IOS-XE-ethernet:channel-group` field filters |
 | Configured 802.1Q mode, native VLAN, and allowed VLANs | `/data/Cisco-IOS-XE-native:native/interface` with complete scoped switchport containers |
@@ -521,3 +589,23 @@ Both settings also succeeded through the real Celery worker, attached their
 reports, and preserved the full inventory and custom-field snapshots. The
 installed Job form renders the checkbox after Dry run with a disabled default
 and help describing the fallback and its limits.
+
+The `0.7.0-dev` increment adds physical console connectors and dedicated
+management-purpose discovery for the reviewed C9300-48UXM/member-1 profile.
+It passed 262 offline tests and 47 real Nautobot ORM checks, with zero persistent
+integration-test changes. The new checks cover zero-DML previews, whole-plan
+validation, rollback after a late console save failure, repeat-run idempotence,
+operator names, and preservation of actual cables and termination identities.
+Live GET-only previews with NTC inference disabled and enabled preserved the
+full inventory and recorded zero inventory mutation statements. The real
+worker preview also preserved inventory. The successful strict worker apply
+created `Console RJ45` (`rj-45`) and `Console USB` (`usb-mini-b`) and set
+`Gi0/0` to Management only. All existing interface identities, Module ownership,
+LAG memberships, VLANs, custom fields, routing inventory, and the Device's
+primary IP were preserved. A second successful worker apply reported zero
+inventory changes and equal before/after snapshots, including console UUIDs.
+The report retains the configured `Mgmt-vrf`, shutdown state, and observed
+absence of a management IP; no VRF or IP assignments were written because
+Namespace mapping remains deferred. Console line 0 settings remain report
+observations. The existing `Vlan2` type conflict and four unresolved serialized
+hardware identities remain the same documented warnings.

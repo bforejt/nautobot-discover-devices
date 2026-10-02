@@ -13,6 +13,12 @@ from .nautobot_components import (
     snapshot_components,
     validate_components,
 )
+from .nautobot_console import (
+    console_objects,
+    save_console_ports,
+    snapshot_console_ports,
+    validate_console_ports,
+)
 from .nautobot_vlans import (
     save_vlan_assignments,
     save_vlan_catalog,
@@ -76,6 +82,7 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None):
         ),
         "components": snapshot_components(device, lock=lock, discovery=discovery),
         "vlan_inventory": snapshot_vlans(device, vlan_group, lock=lock),
+        "console_inventory": snapshot_console_ports(device, lock=lock),
     }
 
 
@@ -155,7 +162,13 @@ def _objects(plan, device, interface_status, software_version_status, module_sta
             vlans = vlan_objects(
                 vlan_plan, objects, vlan_status=vlan_status, status_resolver=_status
             )
-    return version, creates, updates, memberships, components, ownerships, vlans
+    console_plan = plan["console_ports"]
+    consoles = (
+        console_objects(console_plan, device)
+        if console_plan["creates"] or console_plan["updates"]
+        else []
+    )
+    return version, creates, updates, memberships, components, ownerships, vlans, consoles
 
 
 def _validate_interface(interface):
@@ -209,7 +222,7 @@ def validate_plan(
 ):
     """Validate without saving. Re-fetch the Device to avoid mutating inputs."""
     device = Device.objects.get(pk=device.pk)
-    version, creates, updates, memberships, components, ownerships, vlans = _objects(
+    version, creates, updates, memberships, components, ownerships, vlans, consoles = _objects(
         plan, device, interface_status, software_version_status, module_status, vlan_status
     )
     if version is not None:
@@ -228,6 +241,7 @@ def validate_plan(
         validate_components(components)
     if vlans is not None:
         validate_vlan_objects(vlans, device)
+    validate_console_ports(consoles, device)
     for interface in creates + updates:
         _validate_interface(interface)
     for interface, module in ownerships:
@@ -274,7 +288,7 @@ def apply_discovery(
             module_status=module_status,
             vlan_status=vlan_status,
         )
-        version, creates, updates, memberships, components, ownerships, vlans = _objects(
+        version, creates, updates, memberships, components, ownerships, vlans, consoles = _objects(
             plan, device, interface_status, software_version_status, module_status, vlan_status
         )
         if version is not None:
@@ -300,4 +314,5 @@ def apply_discovery(
             member.validated_save()
         if vlans is not None:
             save_vlan_assignments(vlans, device)
+        save_console_ports(consoles)
         return plan

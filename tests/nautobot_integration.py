@@ -381,6 +381,8 @@ def run(device_id=None):
     from jobs.discovery_job import DiscoverDevice
     from jobs.nautobot_inventory import apply_discovery, snapshot_inventory, validate_plan
     from jobs.reconcile import build_plan
+    from tests.nautobot_access_integration import catalog_counts as access_catalog_counts
+    from tests.nautobot_access_integration import run as verify_access_inventory
     from tests.nautobot_components_integration import (
         catalog_counts,
     )
@@ -398,6 +400,7 @@ def run(device_id=None):
     initial_version_count = SoftwareVersion.objects.count()
     initial_component_catalog_counts = catalog_counts()
     initial_vlan_catalog_counts = vlan_catalog_counts()
+    initial_access_catalog_counts = access_catalog_counts()
     interface_status = Status.objects.filter(
         name="Active", content_types=ContentType.objects.get_for_model(Interface)
     ).first()
@@ -563,6 +566,7 @@ def run(device_id=None):
             _verify_lag_relationships(device, interface_status, checks)
             verify_component_inventory(device, interface_status, checks)
             verify_vlan_inventory(device, interface_status, checks)
+            verify_access_inventory(device, interface_status, checks)
         finally:
             transaction.set_rollback(True)
 
@@ -571,6 +575,7 @@ def run(device_id=None):
     assert SoftwareVersion.objects.count() == initial_version_count
     assert catalog_counts() == initial_component_catalog_counts
     assert vlan_catalog_counts() == initial_vlan_catalog_counts
+    assert access_catalog_counts() == initial_access_catalog_counts
     checks.append("outer rollback restores original lab inventory and catalog counts")
     return {"device_id": str(device.pk), "passed": True, "checks": checks, "persistent_changes": 0}
 

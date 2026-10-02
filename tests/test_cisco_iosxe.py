@@ -23,6 +23,7 @@ class FixtureClient:
 
 
 def fixture_payloads():
+    access = fixture("iosxe_access_ports.json")
     return {
         cisco.HOSTNAME_PATH: fixture("iosxe_hostname.json"),
         cisco.HARDWARE_PATH: fixture("iosxe_hardware.json"),
@@ -33,10 +34,35 @@ def fixture_payloads():
         cisco.cisco_layer2.VLAN_PATH: fixture("iosxe_vlan_database.json"),
         cisco.cisco_components.PLATFORM_PATH: fixture("iosxe_platform_components.json"),
         cisco.YANG_LIBRARY_PATH: fixture("iosxe_yang_library.json"),
+        cisco.cisco_access_ports.MANAGEMENT_PATH: access["management_config"],
+        cisco.cisco_access_ports.MANAGEMENT_OPER_PATH: access["management_oper"],
+        cisco.cisco_access_ports.CONSOLE_PATH: access["console_config"],
+        cisco.cisco_access_ports.VRF_PATH: access["vrf_config"],
     }
 
 
 class CiscoCollectionTests(unittest.TestCase):
+    def test_console_and_dedicated_management_are_reviewed_hardware_facts(self):
+        for ntc_defaults in (False, True):
+            with self.subTest(ntc_defaults=ntc_defaults):
+                result = cisco.collect(FixtureClient(), use_ntc_defaults=ntc_defaults)
+                self.assertEqual(
+                    {row["type"] for row in result["console_ports"]["items"]},
+                    {"rj-45", "usb-mini-b"},
+                )
+                port = next(
+                    row for row in result["interfaces"] if row["name"] == "GigabitEthernet0/0"
+                )
+                self.assertTrue(port["mgmt_only"])
+                self.assertEqual(
+                    port["mgmt_only_source"]["profile"], cisco.cisco_access_ports.PROFILE
+                )
+                self.assertTrue(port["mgmt_only_source"]["revision"])
+                self.assertEqual(result["management"]["interfaces"][0]["vrf"], "Mgmt-vrf")
+                self.assertEqual(result["management"]["interfaces"][0]["ipv4"], [])
+                self.assertIn("Namespace", result["management"]["writes_deferred_reason"])
+                self.assertNotIn("mgmt_only", result["interfaces"][1])
+
     def test_connector_uses_explicit_physical_rj45_media_even_when_down(self):
         for oper in (
             "if-oper-state-ready",

@@ -14,7 +14,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.6.0-dev"
+JOB_VERSION = "0.7.0-dev"
 
 
 def _host(device):
@@ -98,7 +98,8 @@ class DiscoverDevice(Job):
     class Meta:
         name = "Discover Device"
         description = (
-            "Verify Cisco IOS XE identity and fill interfaces, VLANs, and serialized hardware."
+            "Verify Cisco IOS XE identity and fill interfaces, console ports, VLANs, "
+            "and serialized hardware."
         )
         dryrun_default = True
         read_only = False
@@ -168,6 +169,20 @@ class DiscoverDevice(Job):
                 client.close()
                 report["requests"] = client.trace
             discovery = report["discovery"]
+            management = discovery.get("management", {})
+            if (management.get("interfaces") or management.get("observations")) and management.get(
+                "writes_deferred_reason"
+            ):
+                self.logger.info(
+                    "Management VRF and address evidence is available under Advanced. "
+                    "VRF/IP assignments are deferred until their Namespace mapping is selected."
+                )
+            if management.get("unresolved"):
+                self.logger.warning(
+                    "Could not establish %s management configuration observations. "
+                    "Available hardware and configuration evidence remains under Advanced.",
+                    len(management["unresolved"]),
+                )
             self.logger.info(
                 "Read %s interfaces and %s identified hardware modules from %s.",
                 len(discovery.get("interfaces", [])),
@@ -241,6 +256,15 @@ class DiscoverDevice(Job):
                 "empty device fields",
             ),
             ("interfaces_created", "add", "Added", "interface", "interfaces"),
+            ("console_ports_created", "add", "Added", "console port", "console ports"),
+            ("console_ports_updated", "update", "Updated", "console port", "console ports"),
+            (
+                "management_interfaces_updated",
+                "mark",
+                "Marked",
+                "dedicated management interface",
+                "dedicated management interfaces",
+            ),
             (
                 "interfaces_updated",
                 "update",
@@ -397,6 +421,12 @@ class DiscoverDevice(Job):
                 "is missing or has no reviewed mapping. Available configuration remains "
                 "in the discovery report; review the details under Advanced.",
                 summary["unresolved_switching"],
+            )
+        if summary.get("unresolved_console_ports"):
+            self.logger.warning(
+                "Left %s console-port observations unresolved because required evidence "
+                "is unavailable or ambiguous. Review the details under Advanced.",
+                summary["unresolved_console_ports"],
             )
         if summary["missing_interfaces"]:
             self.logger.warning(

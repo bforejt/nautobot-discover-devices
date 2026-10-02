@@ -24,9 +24,9 @@ The following table covers every forward native Interface field, including inher
 | `speed` | Operational speed in **Kbps**, stored as an integer. | This increment; known operational rate, converted from the documented source units. Unknown/down-state placeholders do not establish a rate. |
 | `duplex` | Copper twisted-pair duplex setting: `auto`, `full`, or `half`. | Explicit structured configuration, or an omitted leaf within the narrowly reviewed configured-default profile below. Negotiated/MAC duplex remains observations. |
 | `port_type` | Physical connector, such as `8p8c` or `lc`. | This increment; explicit `ether-media-type-rj45` maps to `8p8c` only on physical interfaces. Other connectors require reviewed evidence; an SFP capability alone does not establish an optical connector. |
-| `mgmt_only` | Used exclusively for out-of-band management. | Preserve. Reachability, an IP address, or a management-like VRF/name does not establish this purpose. `False` is populated. |
-| `vrf` | Routing/forwarding domain assigned to the interface. | Future; resolve existing Device-local VRF identity and namespace first. |
-| `ip_addresses` | Many-to-many assignment of IPAddress objects, with assignment metadata. | Future; namespace, parent prefix, host/mask, and address-role evidence are required. |
+| `mgmt_only` | Used exclusively for out-of-band management. | The reviewed C9300-48UXM/member-1 dedicated `Gi0/0` profile permits the narrow documented `False` to `True` purpose correction. Preserve other values; reachability, an IP, or a management-like VRF/name alone is insufficient. |
+| `vrf` | Routing/forwarding domain assigned to the interface. | Management configuration is report-only; resolve Device-local VRF identity and Namespace before assigning. |
+| `ip_addresses` | Many-to-many assignment of IPAddress objects, with assignment metadata. | Management static address/mask configuration is report-only; Namespace, parent prefix and address-role evidence are required before assigning. |
 | `parent_interface` | Parent of a virtual subinterface. | Future; explicit structured parent relationship, independent of `lag` and `module`. |
 | `bridge` | Another interface serving as its bridge. | Future; explicit bridge membership. A VLAN SVI is not automatically a bridge parent. |
 | `breakout_position` | Lane position on a breakout parent connector. | Future; explicit breakout evidence. It is not the numeric suffix of an arbitrary subinterface. |
@@ -39,6 +39,10 @@ The following table covers every forward native Interface field, including inher
 | `_name` | Internal natural-ordering value derived from `name`. | Managed by Nautobot. |
 
 Nautobot has no native Interface fields for PoE mode, PoE allocation/draw, Cisco voice-VLAN policy, DTP state, counters, STP state, or general link-up/link-down state in 3.2.5. Such data remains structured report observations until an appropriate native model and interpretation are established. A PSU PowerPort is not an Ethernet PoE port.
+
+The dedicated-management correction requires exact reviewed hardware provenance and an observed physical `Gi0/0`; it never sets `mgmt_only=False`. Existing incompatible type/connector, Module ownership, LAG membership or VLAN settings defer the correction. The Device's reachable `Vlan2` address does not establish an out-of-band Interface purpose. Structured management VRF, IPv4 masks, configured IPv6 prefixes and address flags are retained in `discovery.management` while Namespace/VRF assignments remain deferred.
+
+Physical console connectors use native `ConsolePort`, not `Interface` or `ConsoleServerPort`. For the reviewed C9300-48UXM/member-1 profile, Cisco's documented rear RJ45/front USB mini-B connectors map to `rj-45`/`usb-mini-b`. Their model-specific source and standardized-name provenance are recorded independently of NTC guessing. Existing names, UUIDs, populated labels/descriptions/types, Module ownership and cables are preserved; ambiguous matches are never duplicated. The one native console line is separate from those two physical connectors. Nautobot 3.2.5 has no ConsolePort baud, parity, stop-bit, enabled or operational-status field, so such configured settings remain report observations without custom fields. See the [Cisco connector specification](https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/hardware/install/b_c9300_hig/connector-cable-specs.html) and [native console model](https://github.com/nautobot/nautobot/blob/v3.2.5/nautobot/dcim/models/device_components.py).
 
 The installed form defines three 802.1Q modes:
 

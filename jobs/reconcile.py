@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from .adapters.cisco_iosxe import canonical_interface_name, canonical_software_version
 from .reconcile_components import plan_components
+from .reconcile_console import plan_console_ports, reviewed_profile
 from .reconcile_vlans import plan_vlans
 
 INTERFACE_FIELDS = (
@@ -15,6 +16,7 @@ INTERFACE_FIELDS = (
     "speed",
     "duplex",
     "port_type",
+    "mgmt_only",
 )
 COPPER_DUPLEX_TYPES = {"100base-tx", "1000base-t", "2.5gbase-t", "5gbase-t", "10gbase-t"}
 
@@ -42,6 +44,79 @@ def _equal(field, before, after):
             return before == after
         return before_version == after_version
     return before == after
+
+
+def _management_value(discovery, fact, row, effective_type, plan, conflict):
+    """Allow the documented purpose correction only for the reviewed OOB port.
+
+    Unlike most Boolean fields, mgmt_only starts False in Nautobot even when
+    purpose has not been classified. This narrow correction never sets False
+    and never infers purpose from an IP address or management VRF name.
+    """
+    value = fact.get("mgmt_only")
+    if value is None:
+        return None
+    if type(value) is not bool:
+        plan["errors"].append("Management-only discovery requires an actual Boolean value")
+        return None
+    if value is False:
+        return None
+    source = fact.get("mgmt_only_source")
+    name = canonical_interface_name(fact["name"])
+    if (
+        not reviewed_profile(source, discovery["identity"].get("model"))
+        or source.get("interface") != "GigabitEthernet0/0"
+        or source.get("value") is not True
+        or name != "GigabitEthernet0/0"
+        or fact.get("type") != "1000base-t"
+    ):
+        plan["errors"].append("Management-only discovery has invalid reviewed hardware provenance")
+        return None
+    members = [
+        canonical_interface_name(item.get("member"))
+        for item in discovery.get("lag_memberships", [])
+    ]
+    components = discovery.get("components")
+    component_items = components.get("items", []) if isinstance(components, dict) else []
+    if not isinstance(component_items, list):
+        component_items = []
+    owned = [
+        canonical_interface_name(interface)
+        for item in component_items
+        if isinstance(item, dict) and isinstance(item.get("interfaces", []), list)
+        for interface in item.get("interfaces", [])
+    ]
+    unsafe = (
+        effective_type != "1000base-t"
+        or name in members
+        or name in owned
+        or (
+            row
+            and (
+                row.get("module_id") is not None
+                or row.get("lag_id") is not None
+                or not _blank(row.get("lag"))
+                or not _blank(row.get("mode"))
+                or row.get("untagged_vlan_id") is not None
+                or row.get("tagged_vlan_ids")
+                or (not _blank(row.get("port_type")) and row.get("port_type") != "8p8c")
+            )
+        )
+    )
+    if unsafe:
+        conflict(
+            "interface",
+            (row or fact)["name"],
+            "mgmt_only",
+            row.get("mgmt_only") if row else None,
+            True,
+        )
+        plan["warnings"].append(
+            "%s: preserved interface type, ownership, LAG or switching data prevents "
+            "classifying the dedicated management port" % name
+        )
+        return None
+    return True
 
 
 def build_plan(discovery, existing):
@@ -151,6 +226,18 @@ def build_plan(discovery, existing):
         if len(by_name[name]) > 1:
             continue
         effective_type = (by_name[name][0].get("type") if by_name[name] else None) or values["type"]
+        values["mgmt_only"] = (
+            _management_value(
+                discovery,
+                fact,
+                by_name[name][0] if by_name[name] else None,
+                effective_type,
+                plan,
+                conflict,
+            )
+            if "mgmt_only" not in existing.get("unsupported_interface_fields", [])
+            else None
+        )
         if effective_type in {"virtual", "bridge", "lag", "tunnel"} or str(
             effective_type
         ).startswith("ieee802.11"):
@@ -177,13 +264,29 @@ def build_plan(discovery, existing):
                 plan["warnings"].append("Skipped creating %s: %s" % (name, reason))
                 plan["excluded_interfaces"].append({"name": name, "reason": reason})
                 continue
-            plan["interface_creates"].append({"name": name, **values, "type_source": type_source})
+            spec = {"name": name, **values, "type_source": type_source}
+            if values["mgmt_only"] is True:
+                spec["mgmt_only_source"] = fact["mgmt_only_source"]
+            plan["interface_creates"].append(spec)
             continue
         row = by_name[name][0]
         changes = []
         for field, after in values.items():
             before = row.get(field)
             if _blank(after):
+                continue
+            if field == "mgmt_only" and after is True:
+                if before is False or _blank(before):
+                    changes.append(
+                        {
+                            "field": field,
+                            "before": before,
+                            "after": True,
+                            "source": fact["mgmt_only_source"],
+                        }
+                    )
+                elif before is not True:
+                    conflict("interface", row["name"], field, before, after)
                 continue
             if _blank(before):
                 changes.append({"field": field, "before": before, "after": after})
@@ -201,6 +304,9 @@ def build_plan(discovery, existing):
     plan["components"] = plan_components(discovery, existing, interface_plan=plan)
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["components"][key])
+    plan["console_ports"] = plan_console_ports(discovery, existing)
+    for key in ("conflicts", "errors", "warnings"):
+        plan[key].extend(plan["console_ports"][key])
     changed_interfaces = {row["id"] for row in plan["interface_updates"]}
     changed_interfaces.update(
         row["member_id"] for row in plan["lag_assignments"] if row["member_id"] is not None
@@ -222,12 +328,17 @@ def build_plan(discovery, existing):
         "interfaces_created": len(plan["interface_creates"]),
         "interfaces_updated": len(changed_interfaces),
         "lag_memberships_updated": len(plan["lag_assignments"]),
+        "management_interfaces_updated": sum(
+            any(change["field"] == "mgmt_only" for change in row["changes"])
+            for row in plan["interface_updates"]
+        ),
         "conflicts": len(plan["conflicts"]),
         "missing_interfaces": len(plan["missing_interfaces"]),
         "excluded_interfaces": len(plan["excluded_interfaces"]),
         "blocked": bool(plan["errors"]),
         **plan["components"]["summary"],
         **plan["layer2"]["summary"],
+        **plan["console_ports"]["summary"],
     }
     return plan
 

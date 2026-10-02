@@ -8,7 +8,7 @@ or unstructured software-banner parser is included.
 import re
 
 from ..transport_restconf import RestconfError
-from . import cisco_components, cisco_duplex, cisco_layer2
+from . import cisco_access_ports, cisco_components, cisco_duplex, cisco_layer2
 from .cisco_hardware import interface_type
 
 HOSTNAME_PATH = "/data/Cisco-IOS-XE-native:native/hostname"
@@ -503,6 +503,9 @@ def collect(client, *, use_ntc_defaults=False):
         )
     except cisco_components.ComponentDiscoveryError as exc:
         raise DiscoveryError(str(exc)) from None
+    console_ports, management = cisco_access_ports.collect(
+        client, interfaces, model=model, member=member
+    )
     modules = {}
     try:
         library = _value(
@@ -605,6 +608,7 @@ def collect(client, *, use_ntc_defaults=False):
     cisco_components.add_revisions(components, modules)
     cisco_layer2.add_revisions(layer2, modules)
     cisco_duplex.add_revisions(configured_duplex, modules)
+    cisco_access_ports.add_revisions(console_ports, management, interfaces, modules)
     sources["configured_duplex"] = configured_duplex
     sources["lag_memberships"] = {
         "module": "Cisco-IOS-XE-ethernet",
@@ -625,6 +629,8 @@ def collect(client, *, use_ntc_defaults=False):
         "interfaces": interfaces,
         "lag_memberships": lag_memberships,
         "components": components,
+        "console_ports": console_ports,
+        "management": management,
         "layer2": layer2,
         "excluded_interfaces": excluded,
         "warnings": warnings,

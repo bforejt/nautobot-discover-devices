@@ -1,0 +1,59 @@
+{
+  "management_oper": {
+    "Cisco-IOS-XE-interfaces-oper:interface": [
+      {
+        "name": "GigabitEthernet0/0",
+        "interface-type": "iana-iftype-ethernet-csmacd",
+        "admin-status": "if-state-down",
+        "oper-status": "if-oper-state-no-pass",
+        "phys-address": "2c:73:a0:84:e0:80",
+        "vrf": "Mgmt-vrf",
+        "ipv4": "0.0.0.0",
+        "ipv4-subnet-mask": "0.0.0.0",
+        "description": "",
+        "mtu": 1500,
+        "ether-state": {
+          "negotiated-duplex-mode": "full-duplex",
+          "negotiated-port-speed": "speed-1gb",
+          "auto-negotiate": true,
+          "enable-flow-control": false,
+          "media-type": "ether-media-type-rj45"
+        }
+      }
+    ]
+  },
+  "management_config": {
+    "Cisco-IOS-XE-native:GigabitEthernet": [
+      {
+        "name": "0/0",
+        "shutdown": [
+          null
+        ],
+        "vrf": {
+          "forwarding": "Mgmt-vrf"
+        }
+      }
+    ]
+  },
+  "console_config": {
+    "Cisco-IOS-XE-native:console": [
+      {
+        "first": "0",
+        "stopbits": "1"
+      }
+    ]
+  },
+  "vrf_config": {
+    "Cisco-IOS-XE-native:vrf": {
+      "definition": [
+        {
+          "name": "Mgmt-vrf",
+          "address-family": {
+            "ipv4": {},
+            "ipv6": {}
+          }
+        }
+      ]
+    }
+  }
+}

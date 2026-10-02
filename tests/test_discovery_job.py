@@ -74,6 +74,9 @@ def discovery():
 CHANGE_COUNTERS = {
     "interfaces_created": (r"interfaces?", r"creat|new|add"),
     "interfaces_updated": (r"interfaces?", r"updat|enrich"),
+    "console_ports_created": (r"console ports?", r"creat|new|add"),
+    "console_ports_updated": (r"console ports?", r"updat|enrich"),
+    "management_interfaces_updated": (r"management interfaces?", r"mark"),
     "lag_memberships_updated": (r"lag|link aggregation|port-channel", r"members|updat"),
     "device_fields_updated": (r"device fields?", r"updat|fill"),
     "module_types_created": (r"(?:module|hardware) types?", r"creat|new|add"),
@@ -102,6 +105,7 @@ def plan(**counts):
         switching_not_applicable=0,
         switching_inferred=0,
         interface_vlan_assignments_inferred=0,
+        unresolved_console_ports=0,
         blocked=False,
     )
     summary.update(counts)
@@ -444,6 +448,46 @@ class DiscoveryJobTests(unittest.TestCase):
         self.assertNotIn("recorded", messages)
         self.job.logger.warning.assert_not_called()
         self.assertEqual(self.assert_saved_report()["plan"], repeated)
+
+    def test_management_evidence_is_reported_without_namespace_or_address_writes(self):
+        self.observed["management"] = {
+            "interfaces": [{"name": "GigabitEthernet0/0", "vrf": "private-vrf-sentinel"}],
+            "writes_deferred_reason": "Namespace mapping has not been selected",
+        }
+        self.preview_plan["summary"].update(
+            console_ports_created=2, management_interfaces_updated=1, interfaces_updated=1
+        )
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "info"))
+        self.assertIn("Would add 2 console ports", messages)
+        self.assertIn("Would mark 1 dedicated management interface", messages)
+        self.assertIn("VRF/IP assignments are deferred", messages)
+        self.assertNotIn("private-vrf-sentinel", messages)
+        self.assertEqual(self.assert_saved_report()["discovery"], self.observed)
+
+    def test_ambiguous_console_inventory_has_readable_warning_without_raw_evidence(self):
+        self.preview_plan["summary"]["unresolved_console_ports"] = 1
+        self.preview_plan["console_ports"] = {
+            "unresolved": [{"reason": "private-console-sentinel"}]
+        }
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "warning"))
+        self.assertIn("1 console-port observations unresolved", messages)
+        self.assertNotIn("private-console-sentinel", messages)
+        self.job.logger.error.assert_not_called()
+
+    def test_optional_management_gaps_keep_available_hardware_and_report_evidence(self):
+        self.observed["management"] = {
+            "interfaces": [],
+            "unresolved": [{"reason": "private-management-gap-sentinel"}],
+        }
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "warning"))
+        self.assertIn("1 management configuration observations", messages)
+        self.assertIn("Available hardware and configuration evidence", messages)
+        self.assertNotIn("private-management-gap-sentinel", messages)
+        self.job.logger.error.assert_not_called()
+        self.assertEqual(self.assert_saved_report()["discovery"], self.observed)
 
     def test_expected_collection_failure_saves_report_and_suppresses_exception_cause(self):
         failure = self.module.RestconfError("Device connection timed out")

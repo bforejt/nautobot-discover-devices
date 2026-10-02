@@ -8,7 +8,14 @@ or unstructured software-banner parser is included.
 import re
 
 from ..transport_restconf import RestconfError
-from . import cisco_access_ports, cisco_components, cisco_duplex, cisco_layer2, cisco_stack
+from . import (
+    cisco_access_ports,
+    cisco_components,
+    cisco_duplex,
+    cisco_layer2,
+    cisco_stack,
+    cisco_switchport_oper,
+)
 from .cisco_hardware import interface_type
 
 HOSTNAME_PATH = "/data/Cisco-IOS-XE-native:native/hostname"
@@ -53,6 +60,7 @@ MODULES = (
     "Cisco-IOS-XE-vlan",
     "Cisco-IOS-XE-vlan-oper",
     "Cisco-IOS-XE-stack-oper",
+    "Cisco-IOS-XE-switchport-oper",
 )
 _PREFIXES = (
     ("TwentyFiveGigE", "Twe"),
@@ -465,6 +473,18 @@ def _lag_memberships(client, interfaces, excluded, warnings):
     return sorted(memberships, key=lambda row: (row["member"], row["lag"]))
 
 
+def _library_value(mapping, name):
+    """Read a library leaf without accepting a foreign namespace or collision."""
+    if not isinstance(mapping, dict) or any(not isinstance(key, str) for key in mapping):
+        raise DiscoveryError("YANG library requires structured containers with string keys")
+    matches = [(key, value) for key, value in mapping.items() if key.split(":")[-1] == name]
+    if len(matches) > 1 or any(
+        ":" in key and key.split(":", 1)[0] != "ietf-yang-library" for key, _ in matches
+    ):
+        raise DiscoveryError("YANG library field is ambiguous or belongs to another module")
+    return matches[0][1] if matches else None
+
+
 def collect(client, *, use_ntc_defaults=False):
     """Collect common facts; required identity/interface failures abort application."""
     if type(use_ntc_defaults) is not bool:
@@ -505,6 +525,52 @@ def collect(client, *, use_ntc_defaults=False):
         else None,
     )
     lag_memberships = _lag_memberships(client, interfaces, excluded, warnings)
+    modules = {}
+    library_known = False
+    try:
+        library = _library_value(
+            client.get(YANG_LIBRARY_PATH + "?fields=module(name;revision)"), "modules-state"
+        )
+        entries = _library_value(library, "module")
+        if not isinstance(entries, list):
+            raise DiscoveryError("YANG library did not provide a complete module list")
+        for module in _rows(entries, "yang-library module"):
+            name = _library_value(module, "name")
+            revision = _library_value(module, "revision")
+            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", name) is None:
+                raise DiscoveryError("YANG library module requires a valid structured name")
+            if revision is not None and not isinstance(revision, str):
+                raise DiscoveryError("YANG library module revision must be structured text")
+            if name in MODULES:
+                if name in modules:
+                    raise DiscoveryError("YANG library has ambiguous relevant module revisions")
+                modules[name] = _text(revision)
+        library_known = True
+        if not modules:
+            warnings.append(
+                "YANG library did not provide relevant module revisions; "
+                "successful data reads remain the evidence"
+            )
+    except (RestconfError, DiscoveryError) as exc:
+        # Only expected optional evidence failures are warnings. Cancellation,
+        # worker time limits and programming errors must propagate unchanged.
+        # Optional evidence must not mask a required discovery failure, and
+        # transport/provider exception bodies are never copied into artifacts.
+        status = getattr(exc, "status_code", None)
+        warnings.append(
+            "YANG module revision evidence unavailable%s"
+            % (" (HTTP %s)" % status if status else "")
+        )
+    try:
+        switchport_oper = cisco_switchport_oper.collect(
+            client,
+            interfaces,
+            canonical_name=canonical_interface_name,
+            revisions=modules if library_known else None,
+            warnings=warnings,
+        )
+    except cisco_switchport_oper.SwitchportOperDiscoveryError as exc:
+        raise DiscoveryError(str(exc)) from None
     try:
         layer2 = cisco_layer2.collect(
             client,
@@ -516,6 +582,8 @@ def collect(client, *, use_ntc_defaults=False):
             canonical_name=canonical_interface_name,
             warnings=warnings,
             use_ntc_defaults=use_ntc_defaults,
+            switchport_oper=switchport_oper,
+            lag_memberships=lag_memberships,
         )
     except cisco_layer2.Layer2DiscoveryError as exc:
         raise DiscoveryError(str(exc)) from None
@@ -579,29 +647,6 @@ def collect(client, *, use_ntc_defaults=False):
             raise DiscoveryError(str(exc)) from None
         console_ports, management = cisco_access_ports.collect(
             client, interfaces, model=model, member=member
-        )
-    modules = {}
-    try:
-        library = _value(
-            client.get(YANG_LIBRARY_PATH + "?fields=module(name;revision)"), "modules-state"
-        )
-        for module in _rows(_value(library, "module"), "yang-library module"):
-            if module.get("name") in MODULES:
-                modules[module["name"]] = _text(module.get("revision"))
-        if not modules:
-            warnings.append(
-                "YANG library did not provide relevant module revisions; "
-                "successful data reads remain the evidence"
-            )
-    except (RestconfError, DiscoveryError) as exc:
-        # Only expected optional evidence failures are warnings. Cancellation,
-        # worker time limits and programming errors must propagate unchanged.
-        # Optional evidence must not mask a required discovery failure, and
-        # transport/provider exception bodies are never copied into artifacts.
-        status = getattr(exc, "status_code", None)
-        warnings.append(
-            "YANG module revision evidence unavailable%s"
-            % (" (HTTP %s)" % status if status else "")
         )
     safe_inventory = [
         {

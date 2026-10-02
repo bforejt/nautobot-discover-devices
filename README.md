@@ -135,6 +135,7 @@ MAC addresses, and descriptions.
 | Management VRF/address configuration | Retain structured evidence; defer assignments until the Namespace mapping is selected |
 | Negotiated and MAC duplex | Retain as observations; never substitute for the configured duplex setting |
 | Supported configured 802.1Q bundle | Fill blank mode and VLAN assignments in the selected VLAN Group |
+| Directly reported ordinary dynamic access/trunk mode | Use the actual mode with known configured VLAN policy to fill the existing 802.1Q fields |
 | Known configuration with unresolved forwarding mode | Retain separate access/native/allowed settings and provenance in the report; leave unsupported native assignments blank |
 | Eligible down dynamic switchport with NTC fallback enabled | Fill blank 802.1Q mode as `tagged-all` and assign its known native VLAN, with explicit inference provenance |
 | Complete structured VLAN database | Reconcile all named VLANs in the selected group, including VLANs without current interface membership |
@@ -164,7 +165,8 @@ and port-channels. Disconnected ports remain eligible. Administrative state
 maps to `Interface.enabled`; operational state remains an observation and does
 not change lifecycle status. The supported fields are type, enabled, description,
 MTU, MAC, operational speed, supported connector type, documented management-only
-purpose, and configured 802.1Q assignments.
+purpose, and configured 802.1Q assignments, including directly reported
+access/trunk selection for ordinary dynamic ports when available.
 Routing/Namespace interpretation, IP addresses, cables, unreviewed transceiver
 placements, and additional component profiles are future increments.
 
@@ -367,14 +369,15 @@ untagged and omitted from the tagged set. An all-VLAN trunk maps to `tagged-all`
 without expanding thousands of tagged relationships. Operational membership,
 an SVI, or the absence of switchport configuration does not establish a mode.
 
-The reviewed `C9300-48UXM` profile for IOS XE 17.9 and 17.12 permits documented
+The reviewed `C9300-48UXM` profile for IOS XE 17.9, 17.12, and 17.15 permits documented
 defaults of dynamic auto, access VLAN 1, trunk native VLAN 1, all allowed trunk
 VLANs, and disabled global native tagging. These defaults apply only after
 successful complete reads of the relevant native configuration and an
 identified supported switchport; the report records explicit versus default
 provenance. An explicitly configured ordinary access port with an omitted
-access VID can therefore receive `access` and untagged VLAN 1. A missing mode
-does not become `access`: dynamic auto can negotiate a trunk.
+access VID can therefore receive `access` and untagged VLAN 1. An omitted mode
+alone does not establish `access`: dynamic auto can negotiate a trunk. The
+optional actual-mode source below can resolve that distinction.
 
 Partial known configuration is retained in **Advanced → Worker → Meta →
 discovery_report → discovery → layer2 → settings**, and in the report download.
@@ -389,11 +392,61 @@ below. This increment creates no custom fields.
 
 Management, SVI, and explicitly routed interfaces are classified as not
 applicable to switchport mapping rather than missing switchport information.
-Known dynamic administrative modes are informational; source failures, unknown
-configuration outside a reviewed default profile, voice VLANs, private VLANs,
-802.1Q tunnels, incremental allowed-list operations, and unsupported native
-tagging remain unresolved. Disconnected switchports use the same configuration
+Dynamic administrative modes without a usable actual-mode source are
+informational; source failures, unknown configuration outside a reviewed
+default profile, voice VLANs, private VLANs, 802.1Q tunnels, incremental
+allowed-list operations, and unsupported native tagging remain unresolved.
+Disconnected switchports use the same configuration
 and default rules as connected ports.
+
+### Optional operational switchport mode
+
+When the YANG library advertises `Cisco-IOS-XE-switchport-oper`, discovery reads
+`switchport-oper-data/switchport-info/port-details/oper-mode`. Cisco's
+[published IOS XE 17.14.1 model](https://github.com/YangModels/yang/blob/main/vendor/cisco/xe/17141/Cisco-IOS-XE-switchport-oper.yang),
+revision `2024-03-01`, defines this as actual status after negotiation. A usable
+ordinary dynamic port reported as access or trunk can therefore fill the
+existing Nautobot 802.1Q mode as **Access**, **Tagged**, or **Tagged all**, with
+its VLAN assignments, without enabling guessing. The configured access/native
+VID, allowed policy, and native-tagging checks still determine the VLAN
+assignment; operational VLAN IDs or ranges never substitute for configuration.
+Explicit configured access or trunk mode retains precedence.
+
+The source's `enabled` leaf means switchport rather than routed operation;
+it does not set Nautobot `Interface.enabled`. Usable rows also require present
+hardware and compatible ordinary administrative mode. A directly reported
+dynamic administrative enum can establish an omitted mode on a complete native
+configuration row, but does not extend the reviewed VLAN-default profile to
+other models or releases. Reported voice/private-VLAN/tunnel semantics, routed
+operation, suspended aggregation, or disagreement with configured LAG membership
+block the affected mapping. Down or unknown actual mode leaves unresolved
+assignments blank. The existing opt-in down-port fallback remains available
+only with its independent link-down proof and other guards; it never replaces
+a positive or conflicting actual-mode report.
+
+All raw per-interface facts remain in `discovery.layer2.operational_interfaces`,
+including interfaces without a native configuration row. Compatible
+configuration rows also retain actual
+mode and raw evidence in `discovery.layer2.settings`. Operational VLAN IDs,
+pruning, voice, and aggregation details remain observations. This adds no custom
+fields or new Interface column. `discovery.layer2.operational_source` records
+source status: `capability-unknown`, `not-advertised`, `unavailable`, or
+`available`. No request
+is made when the module is unadvertised or the library cannot establish its
+availability; older IOS XE discovery continues using the existing sources.
+Summary `switching_operational` counts positive access/trunk observations;
+`switching_dynamic_resolved` counts complete dynamic bundles resolved from
+those observations, rather than newly written assignments.
+
+The IOS XE 17.12.8 lab does not advertise this module, and a separate read-only
+probe returned HTTP 404. Three correctly keyed RESTCONF VTP-MIB probes timed
+out after 30 seconds each; the job does not use that alternative. OpenConfig
+VLAN `state/interface-mode` represents
+[applied configuration](https://github.com/YangModels/yang/blob/main/vendor/cisco/xe/17121/openconfig-extensions.yang#L159),
+which does not prove the negotiated DTP result. No device configuration or MIB
+access changes were made. Positive newer-model behavior is covered with
+published-schema offline fixtures and has not been verified on a live
+newer-release switch.
 
 ### Optional NTC inference
 
@@ -486,6 +539,7 @@ request `application/yang-data+json`.
 | Configured duplex | `/data/Cisco-IOS-XE-native:native/interface` with scoped qualified `Cisco-IOS-XE-ethernet:duplex` fields |
 | Configured LAG membership | `/data/Cisco-IOS-XE-native:native/interface` with qualified `Cisco-IOS-XE-ethernet:channel-group` field filters |
 | Configured 802.1Q mode, native VLAN, and allowed VLANs | `/data/Cisco-IOS-XE-native:native/interface` with complete scoped switchport containers |
+| Optional actual switchport mode, when advertised | `/data/Cisco-IOS-XE-switchport-oper:switchport-oper-data` with `switchport-info(if-name;enabled;admin-mode;hardware-present;port-details)` fields |
 | Global native-VLAN tagging configuration | `/data/Cisco-IOS-XE-native:native/vlan` |
 | Structured VLAN names and operational evidence | `/data/Cisco-IOS-XE-vlan-oper:vlans` |
 | Optional model revision evidence | `/data/ietf-yang-library:modules-state` |

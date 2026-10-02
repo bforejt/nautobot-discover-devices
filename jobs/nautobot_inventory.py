@@ -2,7 +2,14 @@
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
-from nautobot.dcim.models import Device, Interface, InterfaceTemplate, Platform, SoftwareVersion
+from nautobot.dcim.models import (
+    Device,
+    Interface,
+    InterfaceTemplate,
+    Manufacturer,
+    Platform,
+    SoftwareVersion,
+)
 from nautobot.extras.models import Status
 
 from .adapters.cisco_iosxe import canonical_interface_name
@@ -19,6 +26,7 @@ from .nautobot_console import (
     snapshot_console_ports,
     validate_console_ports,
 )
+from .nautobot_stack import save_stack, snapshot_stack, stack_objects, validate_stack
 from .nautobot_vlans import (
     save_vlan_assignments,
     save_vlan_catalog,
@@ -83,6 +91,7 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None):
         "components": snapshot_components(device, lock=lock, discovery=discovery),
         "vlan_inventory": snapshot_vlans(device, vlan_group, lock=lock),
         "console_inventory": snapshot_console_ports(device, lock=lock),
+        "stack": snapshot_stack(device, lock=lock, discovery=discovery),
     }
 
 
@@ -222,6 +231,8 @@ def validate_plan(
 ):
     """Validate without saving. Re-fetch the Device to avoid mutating inputs."""
     device = Device.objects.get(pk=device.pk)
+    stack = stack_objects(plan.get("stack"), device)
+    validate_stack(stack)
     version, creates, updates, memberships, components, ownerships, vlans, consoles = _objects(
         plan, device, interface_status, software_version_status, module_status, vlan_status
     )
@@ -236,6 +247,8 @@ def validate_plan(
             if version is not None and plan["software_version"]["create"]
             else []
         )
+        if device.virtual_chassis is not None and device.virtual_chassis._state.adding:
+            excluded.append("virtual_chassis")
         device.full_clean(exclude=excluded)
     if components is not None:
         validate_components(components)
@@ -272,10 +285,20 @@ def apply_discovery(
 ):
     """Re-read under lock and apply the complete valid change set in one transaction."""
     with transaction.atomic():
+        context = Device.objects.values("platform_id", "device_type__manufacturer_id").get(
+            pk=device.pk
+        )
+        # Stack jobs can target different members while touching the same asset
+        # graph. Acquire shared catalog locks before any member Device lock.
+        Manufacturer.objects.select_for_update().get(pk=context["device_type__manufacturer_id"])
+        if context["platform_id"]:
+            Platform.objects.select_for_update().get(pk=context["platform_id"])
         device = Device.objects.select_for_update().get(pk=device.pk)
-        # Serialize catalog creation across participating jobs for this platform.
-        if device.platform_id:
-            Platform.objects.select_for_update().get(pk=device.platform_id)
+        if (
+            device.platform_id != context["platform_id"]
+            or device.device_type.manufacturer_id != context["device_type__manufacturer_id"]
+        ):
+            raise InventoryError("Selected Device catalog context changed; retry discovery")
         plan = build_plan(
             discovery,
             snapshot_inventory(device, lock=True, discovery=discovery, vlan_group=vlan_group),
@@ -288,9 +311,11 @@ def apply_discovery(
             module_status=module_status,
             vlan_status=vlan_status,
         )
+        stack = stack_objects(plan.get("stack"), device)
         version, creates, updates, memberships, components, ownerships, vlans, consoles = _objects(
             plan, device, interface_status, software_version_status, module_status, vlan_status
         )
+        save_stack(stack)
         if version is not None:
             if plan["software_version"]["create"]:
                 version.validated_save()

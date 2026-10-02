@@ -97,6 +97,8 @@ def run(
         "applied": False,
         "database_write_statements": 0,
         "identity": report["discovery"]["identity"],
+        "stack": report["discovery"].get("stack", {}),
+        "stack_plan": report["plan"].get("stack", {}),
         "summary": report["plan"]["summary"],
         "lag_memberships": report["discovery"].get("lag_memberships", []),
         "components": report["discovery"].get("components", {}),

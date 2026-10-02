@@ -25,3 +25,9 @@ identities and their observed parent/location envelopes. It retains the lab's
 `empty=false` plus disabled/no-input state. Fan identities remain unavailable.
 Flat inventory indexes deliberately differ from platform identifiers; joins
 must use uniquely corroborated PID and serial, never those numeric indexes.
+
+`iosxe_stack_oper.json` is a synthetic two-member StackWise roster with member 2
+active. Stack tests combine it with reduced hardware and per-member install
+fixtures, deliberately reorder records and vary inventory indexes, and add
+provisioned absent slots. It is not a capture from a physical multi-member lab
+stack. The live lab 9300 currently reports a single ready active member.

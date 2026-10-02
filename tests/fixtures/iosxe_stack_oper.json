@@ -1,0 +1,15 @@
+{
+  "Cisco-IOS-XE-stack-oper:stack-oper-data": {
+    "stack-info": {"size": 2, "ring-status": "full-ring"},
+    "stack-node": [
+      {
+        "chassis-number": 2, "priority": 15, "serial-number": "LAB93000002",
+        "role": "role-active", "node-state": "state-ready", "stack-mode": "mode-stackwise-rear"
+      },
+      {
+        "chassis-number": 1, "priority": 12, "serial-number": "LAB93000001",
+        "role": "role-standby", "node-state": "state-ready", "stack-mode": "mode-stackwise-rear"
+      }
+    ]
+  }
+}

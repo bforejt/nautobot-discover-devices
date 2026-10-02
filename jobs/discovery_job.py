@@ -14,7 +14,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.8.0-dev"
+JOB_VERSION = "0.9.0-dev"
 
 
 def _host(device):
@@ -256,6 +256,11 @@ class DiscoverDevice(Job):
                 "empty device fields",
             ),
             ("interfaces_created", "add", "Added", "interface", "interfaces"),
+            ("virtual_chassis_created", "add", "Added", "virtual chassis", "virtual chassis"),
+            ("virtual_chassis_updated", "update", "Updated", "virtual chassis", "virtual chassis"),
+            ("stack_members_created", "add", "Added", "stack member", "stack members"),
+            ("stack_members_updated", "update", "Updated", "stack member", "stack members"),
+            ("device_types_created", "add", "Added", "device type", "device types"),
             ("console_ports_created", "add", "Added", "console port", "console ports"),
             ("console_ports_updated", "update", "Updated", "console port", "console ports"),
             (

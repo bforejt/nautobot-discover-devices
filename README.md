@@ -121,6 +121,7 @@ MAC addresses, and descriptions.
 | Native hostname | Fill blank `Device.name`; preserve and report populated disagreement |
 | Chassis serial | Fill blank `Device.serial`; populated disagreement blocks apply |
 | Chassis model | Verify existing DeviceType; disagreement blocks apply |
+| Multiple ready StackWise members | Create or reuse a native VirtualChassis and serial-matched member Devices; record positions, priorities and active master |
 | Provisioned install release | Fill blank native software field using a matching platform SoftwareVersion, creating one if needed |
 | Present interface | Match canonical name within the Device; create missing or enrich blank fields |
 | Configured channel-group | Fill blank member `Interface.lag` with its discovered port-channel |
@@ -154,8 +155,9 @@ The software release comes from explicit `install-oper` version/state leaves.
 An uncommitted provisioned release takes precedence over an older committed
 release. Numeric build suffixes are retained as evidence while releases such
 as `17.12.8` and `17.12.08.0.770` match as `17.12.08`. Software banners are
-not parsed. Unsupported image extensions and multi-member stacks require
-another interpretation increment.
+not parsed. Unsupported image extensions require another interpretation increment.
+For multiple physically present StackWise members, the provisioned installation
+release must be established for every member and agree across the stack.
 
 Interfaces include present physical ports, management ports, SVIs, loopbacks,
 and port-channels. Disconnected ports remain eligible. Administrative state
@@ -188,6 +190,21 @@ speed. The initial hardware map covers:
 An unsupported physical type or unknown administrative state skips creation
 with an explicit warning. Existing interfaces can still receive independently
 known blank fields. No generic physical type is invented.
+
+## StackWise discovery
+
+Stacking follows NtC Device Onboarding's native VirtualChassis/member model and
+`hostname:position` naming for newly created additional members. The selected
+Device keeps its identity, interface ownership, addressing and credentials.
+Stack role selects the VirtualChassis master independently of member number.
+Reported serials join stack nodes to hardware records; response ordering and
+physical inventory indexes never establish member identity. Standalone switches
+remain standalone, and provisioning alone cannot create a physical Device.
+
+See [stacking.md](docs/stacking.md) for the source fields, preservation rules,
+differences from NtC, and current placement limits. Multi-member module/console
+placement is retained as unresolved evidence for a separate increment; the
+existing single-member component and connector discovery continues unchanged.
 
 ## Console and dedicated management ports
 

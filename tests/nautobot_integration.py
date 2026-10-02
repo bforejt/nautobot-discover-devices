@@ -389,6 +389,8 @@ def run(device_id=None):
     from tests.nautobot_components_integration import (
         run as verify_component_inventory,
     )
+    from tests.nautobot_stack_integration import catalog_counts as stack_catalog_counts
+    from tests.nautobot_stack_integration import run as verify_stack_inventory
     from tests.nautobot_transceiver_integration import run as verify_transceiver_inventory
     from tests.nautobot_vlan_integration import catalog_counts as vlan_catalog_counts
     from tests.nautobot_vlan_integration import run as verify_vlan_inventory
@@ -402,6 +404,7 @@ def run(device_id=None):
     initial_component_catalog_counts = catalog_counts()
     initial_vlan_catalog_counts = vlan_catalog_counts()
     initial_access_catalog_counts = access_catalog_counts()
+    initial_stack_catalog_counts = stack_catalog_counts()
     interface_status = Status.objects.filter(
         name="Active", content_types=ContentType.objects.get_for_model(Interface)
     ).first()
@@ -569,6 +572,7 @@ def run(device_id=None):
             verify_vlan_inventory(device, interface_status, checks)
             verify_access_inventory(device, interface_status, checks)
             verify_transceiver_inventory(device, interface_status, checks)
+            verify_stack_inventory(device, interface_status, checks)
         finally:
             transaction.set_rollback(True)
 
@@ -578,6 +582,7 @@ def run(device_id=None):
     assert catalog_counts() == initial_component_catalog_counts
     assert vlan_catalog_counts() == initial_vlan_catalog_counts
     assert access_catalog_counts() == initial_access_catalog_counts
+    assert stack_catalog_counts() == initial_stack_catalog_counts
     checks.append("outer rollback restores original lab inventory and catalog counts")
     return {"device_id": str(device.pk), "passed": True, "checks": checks, "persistent_changes": 0}
 

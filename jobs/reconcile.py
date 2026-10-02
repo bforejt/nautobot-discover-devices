@@ -5,6 +5,7 @@ from collections import defaultdict
 from .adapters.cisco_iosxe import canonical_interface_name, canonical_software_version
 from .reconcile_components import plan_components
 from .reconcile_console import plan_console_ports, reviewed_profile
+from .reconcile_stack import plan_stack
 from .reconcile_vlans import plan_vlans
 
 INTERFACE_FIELDS = (
@@ -129,7 +130,8 @@ def build_plan(discovery, existing):
     if discovery.get("adapter") != "cisco_iosxe" or discovery.get("schema_version") != 1:
         raise ValueError("Unsupported discovery adapter or schema version")
     device = existing["device"]
-    identity = discovery["identity"]
+    stack = plan_stack(discovery, existing)
+    identity = stack["identity"]
     plan = {
         "schema_version": 1,
         "adapter": discovery["adapter"],
@@ -139,9 +141,10 @@ def build_plan(discovery, existing):
         "interface_updates": [],
         "lag_assignments": [],
         "software_version": None,
-        "conflicts": [],
-        "errors": [],
-        "warnings": list(discovery.get("warnings", [])),
+        "stack": stack,
+        "conflicts": list(stack["conflicts"]),
+        "errors": list(stack["errors"]),
+        "warnings": list(discovery.get("warnings", [])) + stack["warnings"],
         "missing_interfaces": [],
         "excluded_interfaces": list(discovery.get("excluded_interfaces", [])),
     }
@@ -339,6 +342,7 @@ def build_plan(discovery, existing):
         **plan["components"]["summary"],
         **plan["layer2"]["summary"],
         **plan["console_ports"]["summary"],
+        **stack["summary"],
     }
     return plan
 

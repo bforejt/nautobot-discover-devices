@@ -71,19 +71,30 @@ The job form contains these inputs:
 | Module status | Applicable `Active` | Status for newly created serialized Modules |
 | VLAN Group | None | Explicit Layer-2 domain required for VLAN catalog and interface switching writes |
 | VLAN status | Applicable `Active` | Operator-selected status for newly created VLANs |
+| Use NTC defaults when guessing | Disabled | Apply the reviewed Network to Code Device Onboarding fallback for eligible down dynamic switchports; mark inferred values in the report |
 
 Start with Dry run enabled. The main job log shows progress, readable change
 counts, and brief notices for preserved differences and skipped observations.
 Only changes with nonzero counts are listed; a repeat run explicitly says when
 no inventory changes are needed. Preview messages say "Would add" or "Would
 update"; apply messages say "Added" or "Updated" after changes are saved.
+Documented defaults, dynamic switchport configuration, and interfaces where
+switchport VLAN mapping does not apply are informational. Missing source data,
+unsupported interpretations, and preserved inventory disagreements remain
+warnings. A missing model/serial warning explains why serialized hardware was
+not created; it does not report a failed write. Reviewed interface-type
+conflicts identify the interface and the preserved/discovered choice labels.
+Enabling the NTC fallback produces an explicit opt-in notice and inference
+counts. Matching policy observations are counted separately from new inferred
+VLAN assignments, so a repeat can report eligible ports while making zero
+inventory changes.
 
 Open **Advanced → Worker → Meta → discovery_report** for the complete discovery
 result data, or download the attached `discovery_<device UUID>.json` report.
 The job does not return the large report into the main **Result Data** field.
 The Advanced data and download include discovered facts,
 structured source fields, YANG module revisions when available, request
-metadata, the TLS verification and port settings, proposed changes, conflicts,
+metadata, the TLS verification, port, and NTC-fallback settings, proposed changes, conflicts,
 exclusions, and missing interfaces. Individual warning messages and field
 conflict values are kept in that report. Expected discovery failures log the
 cause and retain the report under Advanced, as well as attaching a download,
@@ -117,8 +128,12 @@ MAC addresses, and descriptions.
 | Reviewed module interface ownership | Fill blank `Interface.module` using the existing interface record |
 | Ready physical interface speed | Fill blank `Interface.speed` in Kbps from the structured operational value |
 | Explicit operational RJ45 media | Fill blank `Interface.port_type` with `8p8c` |
-| Negotiated and MAC duplex | Retain as observations; await explicit configured duplex before filling `Interface.duplex` |
+| Configured copper duplex | Fill blank `Interface.duplex` from explicit configuration or the narrowly reviewed configured default |
+| Negotiated and MAC duplex | Retain as observations; never substitute for the configured duplex setting |
 | Supported configured 802.1Q bundle | Fill blank mode and VLAN assignments in the selected VLAN Group |
+| Known configuration with unresolved forwarding mode | Retain separate access/native/allowed settings and provenance in the report; leave unsupported native assignments blank |
+| Eligible down dynamic switchport with NTC fallback enabled | Fill blank 802.1Q mode as `tagged-all` and assign its known native VLAN, with explicit inference provenance |
+| Complete structured VLAN database | Reconcile all named VLANs in the selected group, including VLANs without current interface membership |
 | Absent alias / internal application port | Exclude and explain |
 | Existing interface absent from discovery | Report; preserve |
 
@@ -218,8 +233,11 @@ or belong to the Device's location hierarchy. An existing VLAN must likewise be
 global or associated with the Device's location or an ancestor.
 
 VLAN identity is the selected group plus VID. Other groups can reuse a VID.
-Only referenced missing VLANs with a unique structured name are created, and
-their VIDs must be from 1 through 4094 and inside the group's allowed range.
+With a successfully read complete structured VLAN database, all observed named
+VLANs are eligible for reconciliation, including VLANs with no interface
+membership. Earlier discovery schemas without the completeness marker retain
+their referenced-only behavior. A new VLAN needs a unique structured name,
+and its VID must be from 1 through 4094 and inside the group's allowed range.
 New VLANs are global within that group. Missing names or incompatible existing
 VLAN locations leave the affected interface bundle unresolved; they never cause
 duplicate catalog entries. Existing populated VLAN names are preserved. New
@@ -233,40 +251,101 @@ untagged and omitted from the tagged set. An all-VLAN trunk maps to `tagged-all`
 without expanding thousands of tagged relationships. Operational membership,
 an SVI, or the absence of switchport configuration does not establish a mode.
 
-The reviewed `C9300-48UXM` profile for IOS XE 17.9 and 17.12 permits ordinary
-trunk defaults of native VLAN 1, all allowed VLANs, and global native tagging
-disabled. These defaults apply only after successful complete reads of the
-scoped native configuration; the report identifies every applied default.
-An access VLAN default is not assumed. The lab's 39 interfaces without a
-supported explicit configured mode remain unresolved. Dynamic modes, voice
-VLANs, private VLANs, 802.1Q tunnels, incremental allowed-list operations, and
-native-tagging configurations outside the supported interpretation also remain
-unresolved rather than being guessed.
+The reviewed `C9300-48UXM` profile for IOS XE 17.9 and 17.12 permits documented
+defaults of dynamic auto, access VLAN 1, trunk native VLAN 1, all allowed trunk
+VLANs, and disabled global native tagging. These defaults apply only after
+successful complete reads of the relevant native configuration and an
+identified supported switchport; the report records explicit versus default
+provenance. An explicitly configured ordinary access port with an omitted
+access VID can therefore receive `access` and untagged VLAN 1. A missing mode
+does not become `access`: dynamic auto can negotiate a trunk.
+
+Partial known configuration is retained in **Advanced → Worker → Meta →
+discovery_report → discovery → layer2 → settings**, and in the report download.
+This includes administrative mode, access VLAN, trunk native VLAN, allowed
+VLAN policy, and available source evidence. Access and trunk-native settings
+stay separate when they differ. A common untagged VID is recorded only when
+their equality and ordinary untagged semantics are established. Even then,
+Nautobot requires a nonempty 802.1Q mode before assigning `untagged_vlan`, so a
+dynamic port's native mode and VLAN relationships remain blank unless the
+complete mapping is established or the operator enables the narrow fallback
+below. This increment creates no custom fields.
+
+Management, SVI, and explicitly routed interfaces are classified as not
+applicable to switchport mapping rather than missing switchport information.
+Known dynamic administrative modes are informational; source failures, unknown
+configuration outside a reviewed default profile, voice VLANs, private VLANs,
+802.1Q tunnels, incremental allowed-list operations, and unsupported native
+tagging remain unresolved. Disconnected switchports use the same configuration
+and default rules as connected ports.
+
+### Optional NTC inference
+
+**Use NTC defaults when guessing** is disabled by default. With it disabled,
+unresolved forwarding modes and their native VLAN relationships remain blank.
+With it enabled, the job can apply one reviewed policy from
+[Network to Code Device Onboarding 5.4.1](https://github.com/nautobot/nautobot-app-device-onboarding/blob/812746dc6f09077b8fe099da2318315e4e7cab23/nautobot_device_onboarding/jinja_filters.py#L86):
+a dynamic switchport that is down and permits all VLANs maps to `tagged-all`
+with its known trunk-native VLAN. This is an onboarding normalization policy,
+not a switch-reported forwarding mode or a Cisco configuration default.
+
+The initial fallback requires a supported physical switchport, known
+dynamic-auto/dynamic-desirable configuration, a complete known all-VLAN
+allowed policy, a known native VID, and proven disabled native tagging. Its
+structured RESTCONF operational state must be exactly `if-oper-state-no-pass`
+or `if-oper-state-lower-layer-down`. Up, testing, dormant, missing, and other
+states do not qualify. Failed/incomplete reads, malformed data, finite VLAN
+restrictions, voice/private/tunnel configurations, and unsupported tagging
+semantics remain subject to the existing unresolved or validation behavior.
+The flag enables no general guessing of interface or device fields.
+An explicit `ALL` setting or the validated exact allowed-list literal
+`1-4094` qualifies. Composed ranges that happen to cover the same VIDs and
+other finite lists remain excluded for parity with the reviewed upstream
+rule. A configured `1-4094` list remains recorded as a configured list;
+the separate inference evidence explains the proposed `tagged-all` mode.
+
+The report records `use_ntc_defaults` at its top level. Eligible settings carry
+`inference` evidence under `discovery.layer2.settings`; resulting complete
+bundles carry `source.ntc_inference`. That evidence identifies the policy,
+upstream source, actual RESTCONF operational state and its source, configured
+administrative mode, inferred fields, and the assumption being made. Main-log
+counts distinguish matching observations from newly planned inferred
+assignments. VLAN Group selection, valid catalog identity, location checks,
+atomic validation, and existing-value preservation still apply.
+
+Disabling the option on a later run does not erase already populated inferred
+inventory: the job's fill-only policy preserves existing mode and VLAN
+assignments. Review the original report to identify their inferred origin.
 
 Each interface's mode, untagged VLAN, and tagged set form one fill-only bundle.
 A populated disagreement skips the entire bundle. An empty tagged set can be
 filled; a populated set must match exactly, with no partial merge, removal, or
-replacement. Failed bundles do not create unused VLANs. Existing UUIDs and
-manual assignments are preserved. Nautobot clears tagged memberships when
+replacement. A failed bundle does not independently create referenced VLANs;
+the complete VLAN database can still establish those records as device
+inventory. Existing UUIDs and manual assignments are preserved. Nautobot clears tagged memberships when
 saving an interface outside `tagged` mode, so validation also blocks a save
 that would discard existing membership while enriching another field.
 
 Operational speed is accepted only for a ready physical interface, converting
 the structured bits-per-second value to Nautobot's Kbps unit. It does not
 determine hardware capability. The exact structured media value
-`ether-media-rj45` identifies an RJ45 (8P8C) connector and can fill blank
+`ether-media-type-rj45` identifies an RJ45 (8P8C) connector and can fill blank
 `Interface.port_type` with `8p8c` on a physical interface. Connector type is not
 inferred from copper capability, speed, or a generic media value. Both fields
 follow the same blank-only policy; a later change is reported as a conflict.
 
 Negotiated duplex and MAC duplex status remain report observations, even when
 they agree. Nautobot's duplex field is treated as the configured `auto`, `full`,
-or `half` setting. The current collector does not obtain that explicit
-configured source, and the lab has none, so discovery leaves blank duplex
-fields blank. Public guidance and historical configuration-generation behavior
-leave operational-versus-configured semantics ambiguous; an agreed configured
-source is required before enabling writes. Down-link placeholders, unsupported
-types, and contradictory observations do not establish a configured value.
+or `half` setting. A separate complete native RESTCONF configuration read
+captures explicit duplex values on supported copper interfaces. A narrowly
+reviewed default profile also establishes configured `auto` for
+`C9300-48UXM` on IOS XE 17.9/17.12, member 1, fixed
+`TwoGigabitEthernet1/0/1`–`1/0/36` and management `GigabitEthernet0/0`, provided
+the interface is present in the complete native read with its expected copper
+type. Omitted duplex on TenGigabitEthernet, optical, other-member, or unreviewed
+ports remains blank. Every accepted value records its configuration/default
+source; a ready link or matching operational duplex does not establish it.
+Existing populated settings are preserved on disagreement.
 
 See the [Interface field mapping](docs/interface-fields.md) for all native
 fields, source evidence, model constraints, deferred routing and relationship
@@ -284,6 +363,7 @@ request `application/yang-data+json`.
 | Optional component identity corroboration and placement | `/data/Cisco-IOS-XE-platform-oper:components` |
 | Software release | `/data/Cisco-IOS-XE-install-oper:install-oper-data/install-location-information` |
 | Interfaces | `/data/Cisco-IOS-XE-interfaces-oper:interfaces` |
+| Configured duplex | `/data/Cisco-IOS-XE-native:native/interface` with scoped qualified `Cisco-IOS-XE-ethernet:duplex` fields |
 | Configured LAG membership | `/data/Cisco-IOS-XE-native:native/interface` with qualified `Cisco-IOS-XE-ethernet:channel-group` field filters |
 | Configured 802.1Q mode, native VLAN, and allowed VLANs | `/data/Cisco-IOS-XE-native:native/interface` with complete scoped switchport containers |
 | Global native-VLAN tagging configuration | `/data/Cisco-IOS-XE-native:native/vlan` |
@@ -385,8 +465,8 @@ The switching increment adds regressions for selected-group identity and range,
 location applicability, unknown names, planned interfaces and LAGs, strict
 bundle conflicts, exact tagged-set idempotence, and unused-catalog prevention.
 Speed cases distinguish ready operational facts from down-link placeholders;
-connector cases require the exact RJ45 media enum, and duplex cases retain
-negotiated and MAC values without writing an inferred configuration setting.
+connector cases require the exact RJ45 media enum, and duplex cases distinguish
+configured settings from negotiated and MAC observations.
 The `0.4.0-dev` increment passed 160 offline tests and 34 rollback-only real ORM
 checks on Nautobot 3.2.5, plus lint, formatting, and syntax checks. Both live
 preview checks recorded zero inventory mutation statements, and the real worker
@@ -402,3 +482,42 @@ reported zero changes across every inventory count, with equal before/after
 snapshots including VLAN catalogs and tagged memberships. The 39 unknown modes
 and four unresolved serialized components remained unresolved, and the existing
 `Vlan2` interface's populated type `other` was preserved as a reported conflict.
+
+The `0.5.0-dev` increment adds complete VLAN-catalog reconciliation, explicit
+access-port VLAN defaults, partial switchport configuration reports, configured
+duplex/default provenance, and clearer expected-discovery notices. Its
+regressions distinguish dynamic/default/not-applicable cases from real source
+gaps, and preserve full Advanced/download reports and failure behavior.
+It passed 202 offline tests, 37 rollback-only real ORM checks with zero
+persistent test changes, and lint, formatting, and syntax checks. The live
+GET-only preview recorded zero inventory mutation statements, and the
+successful worker preview preserved inventory and custom fields. The worker
+apply succeeded, added VLANs 1002–1005 to the selected `lab` group, and filled
+37 blank configured duplex fields with documented `auto`. It added no
+interface VLAN assignments and preserved all 58 interface UUIDs, names,
+Module ownership, and LAG assignments. Custom-field definitions and values
+were unchanged. A second successful worker apply reported zero across every
+inventory change counter and an equal full inventory snapshot, including the
+nine-VLAN catalog. Reports retain 53 interfaces with documented defaults,
+34 dynamic switchport configurations, and five interfaces where switchport
+mapping is not applicable; these are informational, with zero genuinely
+unresolved switching observations. Four missing hardware identities and the
+existing `Vlan2` type `other` discrepancy remain clearly explained warnings.
+
+The `0.6.0-dev` increment adds the default-disabled NTC inference option,
+its structured source/assumption evidence, and separate observation/write
+counts. Collection remains RESTCONF JSON only, and no custom fields are
+created or populated. Its regressions cover the strict default, exact down
+states, eligible dynamic/all-VLAN ports, excluded source/configuration gaps,
+preserved conflicts, and repeat-run behavior.
+It passed 221 offline tests and 40 real Nautobot ORM checks. Live GET-only
+previews with the option disabled and enabled both recorded zero inventory
+mutation statements and preserved inventory. The strict preview proposed zero
+changes. The enabled preview proposed 34 inferred mode/native assignments for
+existing down dynamic switchports with blank assignments, with 34 matching
+inference observations and 34 proposed writes. No inferred assignments were
+persisted in the lab during these previews.
+Both settings also succeeded through the real Celery worker, attached their
+reports, and preserved the full inventory and custom-field snapshots. The
+installed Job form renders the checkbox after Dry run with a disabled default
+and help describing the fallback and its limits.

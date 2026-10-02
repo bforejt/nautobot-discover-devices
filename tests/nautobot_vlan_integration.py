@@ -158,6 +158,7 @@ def run(device, interface_status, checks):
 
     group = VLANGroup(name="CODEX-VLAN-SCOPE-" + token, range="100-200")
     group.validated_save()
+
     assert group.location_id is None, "The regression group must be global"
     other_group = VLANGroup(name="CODEX-VLAN-OTHER-" + token)
     other_group.validated_save()
@@ -426,6 +427,103 @@ def run(device, interface_status, checks):
         copper_auto.full_clean()
     assert_no_dml(captured, "Operational field validation wrote inventory")
     checks.append("native full_clean rejects LAG speed/duplex and optical duplex without DML")
+
+    # Capture known VLAN identities without inventing a DTP access/trunk mode.
+    from nautobot.extras.models import CustomField
+
+    dynamic = seed_interface(name(17), duplex="")
+    dynamic_before = snapshot()
+    dynamic_cf_before = copy.deepcopy(dynamic._custom_field_data)
+    fields_before = CustomField.objects.count()
+    catalog_only = observed([fact(name(17))], [], [191])
+    catalog_only["layer2"].update(
+        catalog_complete=True,
+        settings=[
+            {
+                "name": name(17),
+                "configured_mode": "dynamic-auto",
+                "access_vid": 191,
+                "native_vid": 191,
+                "untagged_vid": 191,
+                "field_sources": {"configured_mode": "explicit"},
+            }
+        ],
+        unresolved=[
+            {
+                "name": name(17),
+                "category": "dynamic-mode",
+                "reason": "Configured DTP mode does not establish a static tagging mode",
+            }
+        ],
+    )
+    catalog_plan = build_plan(catalog_only, snapshot())
+    assert catalog_plan["summary"]["vlans_created"] == 1
+    assert not catalog_plan["layer2"]["assignments"]
+    with CaptureQueriesContext(connection) as captured:
+        validate_plan(catalog_plan, device, interface_status=interface_status)
+    assert_no_dml(captured, "Catalog-only preview issued database writes")
+    assert snapshot() == dynamic_before
+    checks.append("complete unused VLAN catalog preview validates with zero database writes")
+    applied_catalog = apply(catalog_only)
+    dynamic.refresh_from_db()
+    assert dynamic.mode == "" and dynamic.untagged_vlan_id is None
+    assert not dynamic.tagged_vlans.exists()
+    assert dynamic._custom_field_data == dynamic_cf_before
+    assert VLAN.objects.filter(vlan_group=group, vid=191, name=vlan_name(191)).exists()
+    assert CustomField.objects.count() == fields_before
+    assert applied_catalog["layer2"]["settings"][0]["native_vid"] == 191
+    checks.append("unused named VLANs load independently while DTP native fields stay blank")
+    with CaptureQueriesContext(connection) as captured:
+        repeat_catalog = apply(catalog_only)
+    assert_no_dml(captured, "Catalog-only repeat issued database writes")
+    assert repeat_catalog["summary"]["vlans_created"] == 0
+    assert repeat_catalog["summary"]["interface_vlan_assignments_updated"] == 0
+    checks.append("catalog-only repeat is idempotent and creates no custom fields")
+
+    # The opt-in policy supplies a complete bundle while retaining its uncertainty.
+    guessed = seed_interface(name(18))
+    inference = {
+        "policy": "ntc-device-onboarding-5.4.1-dynamic-down-all",
+        "configured_mode": "dynamic-auto",
+        "observed_oper_status": "if-oper-state-lower-layer-down",
+        "inferred_fields": {"mode": "tagged-all", "untagged_vid": 191},
+    }
+    guessed_fact = switching(name(18), "tagged-all", 191)
+    guessed_fact.update(inferred=True, source={"ntc_inference": inference})
+    guessed_discovery = observed([fact(name(18))], [guessed_fact], [191])
+    guessed_discovery["layer2"]["settings"] = [
+        {"name": name(18), "configured_mode": "dynamic-auto", "inference": inference}
+    ]
+    before_guess = snapshot()
+    guessed_plan = build_plan(guessed_discovery, before_guess)
+    with CaptureQueriesContext(connection) as captured:
+        validate_plan(guessed_plan, device, interface_status=interface_status)
+    assert_no_dml(captured, "Inferred VLAN preview issued database writes")
+    assert snapshot() == before_guess
+    assert guessed_plan["summary"]["interface_vlan_assignments_inferred"] == 1
+    applied_guess = apply(guessed_discovery)
+    guessed.refresh_from_db()
+    assert guessed.mode == "tagged-all" and guessed.untagged_vlan.vid == 191
+    assert not guessed.tagged_vlans.exists()
+    assert applied_guess["layer2"]["assignments"][0]["inferred"] is True
+    assert CustomField.objects.count() == fields_before
+    checks.append(
+        "opt-in inferred tagged-all bundle validates without DML and applies native fields"
+    )
+    with CaptureQueriesContext(connection) as captured:
+        repeated_guess = apply(guessed_discovery)
+    assert_no_dml(captured, "Repeated inferred VLAN apply issued database writes")
+    assert repeated_guess["summary"]["switching_inferred"] == 1
+    assert repeated_guess["summary"]["interface_vlan_assignments_inferred"] == 0
+    strict_discovery = observed([fact(name(18))], [], [191])
+    with CaptureQueriesContext(connection) as captured:
+        apply(strict_discovery)
+    assert_no_dml(captured, "Returning to strict discovery mutated populated inferred inventory")
+    guessed.refresh_from_db()
+    assert guessed.mode == "tagged-all" and guessed.untagged_vlan.vid == 191
+    checks.append(
+        "inference repeats are idempotent and disabling guessing preserves existing values"
+    )
 
     # Fail the final tagged membership after catalog, software, Device,
     # interface fields, and an earlier tagged membership have actually saved.

@@ -138,7 +138,7 @@ class CiscoCollectionTests(unittest.TestCase):
             row for row in result["interfaces"] if row["name"] == "TwoGigabitEthernet1/0/1"
         )
         self.assertEqual(collected["speed"], 2500000)
-        self.assertIsNone(collected["duplex"])
+        self.assertEqual(collected["duplex"], "auto")
         self.assertEqual(collected["observations"]["corroborated_operational_duplex"], "full")
         self.assertEqual(collected["type"], "2.5gbase-t")
         self.assertFalse(collected["observations"]["auto_negotiate"])
@@ -172,7 +172,7 @@ class CiscoCollectionTests(unittest.TestCase):
             if row["name"] == "TwoGigabitEthernet1/0/1"
         )
         self.assertIsNone(collected["speed"])
-        self.assertIsNone(collected["duplex"])
+        self.assertEqual(collected["duplex"], "auto")
         self.assertEqual(collected["observations"]["reported_speed_bps"], 2500000000)
 
     def test_duplex_observation_requires_agreeing_mac_status_and_reviewed_copper_type(self):
@@ -207,7 +207,7 @@ class CiscoCollectionTests(unittest.TestCase):
                     for row in cisco.collect(FixtureClient(payloads))["interfaces"]
                     if row["name"] == cisco.canonical_interface_name(raw_name)
                 )
-                self.assertIsNone(collected["duplex"])
+                self.assertEqual(collected["duplex"], "auto" if raw_name.startswith("Tw") else None)
                 self.assertEqual(
                     collected["observations"]["corroborated_operational_duplex"], expected
                 )

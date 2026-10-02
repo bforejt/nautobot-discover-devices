@@ -26,7 +26,9 @@ def _boolean(value):
     return value.lower() == "true"
 
 
-def run(device_id=None, verify_tls=None, report_path=None, vlan_group_id=None):
+def run(
+    device_id=None, verify_tls=None, report_path=None, vlan_group_id=None, use_ntc_defaults=None
+):
     """Collect live JSON and validate the Job preview without database mutation."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from django.db import connection, transaction
@@ -41,6 +43,8 @@ def run(device_id=None, verify_tls=None, report_path=None, vlan_group_id=None):
     if verify_tls is None:
         verify_tls = _boolean(os.environ.get("NAUTOBOT_DISCOVERY_VERIFY_TLS", "true"))
     report_path = report_path or os.environ.get("NAUTOBOT_DISCOVERY_REPORT_PATH")
+    if use_ntc_defaults is None:
+        use_ntc_defaults = _boolean(os.environ.get("NAUTOBOT_DISCOVERY_USE_NTC_DEFAULTS", "false"))
     device = Device.objects.get(pk=device_id)
     vlan_group_id = vlan_group_id or os.environ.get("NAUTOBOT_DISCOVERY_VLAN_GROUP_ID")
     vlan_group = VLANGroup.objects.get(pk=vlan_group_id) if vlan_group_id else None
@@ -61,7 +65,11 @@ def run(device_id=None, verify_tls=None, report_path=None, vlan_group_id=None):
             with CaptureQueriesContext(connection) as captured:
                 job = PreviewJob()
                 result = job.run(
-                    device=device, dryrun=True, verify_tls=verify_tls, vlan_group=vlan_group
+                    device=device,
+                    dryrun=True,
+                    verify_tls=verify_tls,
+                    vlan_group=vlan_group,
+                    use_ntc_defaults=use_ntc_defaults,
                 )
             assert result is None, "Detailed discovery data must not appear in the main result"
             report = job.request.meta["discovery_report"]
@@ -85,6 +93,7 @@ def run(device_id=None, verify_tls=None, report_path=None, vlan_group_id=None):
     return {
         "device_id": str(device.pk),
         "dry_run": True,
+        "use_ntc_defaults": use_ntc_defaults,
         "applied": False,
         "database_write_statements": 0,
         "identity": report["discovery"]["identity"],

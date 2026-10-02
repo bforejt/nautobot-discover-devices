@@ -83,6 +83,9 @@ CHANGE_COUNTERS = {
     "modules_created": (r"modules?", r"creat|new|add"),
     "modules_updated": (r"modules?", r"updat|enrich"),
     "interface_modules_updated": (r"interface", r"ownership|module|link"),
+    "vlans_created": (r"vlans?", r"creat|new|add"),
+    "vlans_updated": (r"vlans?", r"updat|enrich"),
+    "interface_vlan_assignments_updated": (r"interface vlan assignments?", r"updat"),
 }
 
 
@@ -93,6 +96,12 @@ def plan(**counts):
         missing_interfaces=0,
         excluded_interfaces=0,
         unresolved_components=0,
+        unresolved_switching=0,
+        switching_defaults=0,
+        switching_dynamic=0,
+        switching_not_applicable=0,
+        switching_inferred=0,
+        interface_vlan_assignments_inferred=0,
         blocked=False,
     )
     summary.update(counts)
@@ -210,6 +219,59 @@ class DiscoveryJobTests(unittest.TestCase):
         ):
             self.assertNotIn(evidence, messages)
 
+    def test_ntc_option_defaults_off_and_reaches_the_collector(self):
+        option = self.module.DiscoverDevice.use_ntc_defaults
+        self.assertFalse(option.default)
+        self.assertEqual(option.label, "Use NTC defaults when guessing")
+        self.assertIn("uncertain values blank", option.description)
+        self.job.run(self.device)
+        self.module.cisco_iosxe.collect.assert_called_once_with(self.client, use_ntc_defaults=False)
+        self.assertFalse(self.assert_saved_report()["use_ntc_defaults"])
+        self.assertNotIn("guessing is enabled", "\n".join(rendered_logs(self.job.logger)))
+
+    def test_opt_in_reports_inferences_and_keeps_raw_evidence_out_of_logs(self):
+        self.observed["layer2"] = {
+            "settings": [{"inference": {"reason": "raw-inference-sentinel"}}]
+        }
+        self.preview_plan["summary"].update(
+            switching_dynamic=34,
+            switching_inferred=33,
+            interface_vlan_assignments_inferred=33,
+            interface_vlan_assignments_updated=33,
+            interfaces_updated=33,
+        )
+        self.job.run(self.device, use_ntc_defaults=True)
+        self.module.cisco_iosxe.collect.assert_called_once_with(self.client, use_ntc_defaults=True)
+        report = self.assert_saved_report()
+        self.assertTrue(report["use_ntc_defaults"])
+        self.assertEqual(report["discovery"]["layer2"], self.observed["layer2"])
+        messages = "\n".join(rendered_logs(self.job.logger))
+        self.assertIn("NTC default guessing is enabled", messages)
+        self.assertIn("33 match the opt-in NTC guessing policy", messages)
+        self.assertIn("Would use NTC-inferred VLAN assignments on 33 interfaces", messages)
+        self.assertNotIn("negotiated 802.1Q mode remains blank", messages)
+        self.assertNotIn("raw-inference-sentinel", messages)
+        self.job.logger.warning.assert_not_called()
+
+    def test_repeat_inference_observations_do_not_report_inventory_changes(self):
+        repeated = plan(switching_dynamic=34, switching_inferred=33)
+        self.module.apply_discovery.return_value = repeated
+        self.job.run(self.device, dryrun=False, use_ntc_defaults=True)
+        messages = "\n".join(rendered_logs(self.job.logger))
+        self.assertIn("No inventory changes are needed", messages)
+        self.assertIn("33 match the opt-in NTC guessing policy", messages)
+        self.assertNotIn("Used NTC-inferred", messages)
+        self.assertTrue(self.assert_saved_report()["use_ntc_defaults"])
+
+    def test_non_boolean_ntc_option_cannot_enable_collection(self):
+        for value in ("false", "true", 1, None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "must be true or false"):
+                    self.job.run(self.device, use_ntc_defaults=value)
+        self.module.resolve_credentials.assert_not_called()
+        self.module.RestconfClient.assert_not_called()
+        self.module.cisco_iosxe.collect.assert_not_called()
+
     def test_apply_summaries_and_report_use_final_plan(self):
         self.preview_plan["summary"]["interfaces_created"] = 19
         self.preview_plan["warnings"] = ["preliminary raw warning sentinel"]
@@ -271,6 +333,117 @@ class DiscoveryJobTests(unittest.TestCase):
                 messages = "\n".join(rendered_logs(self.job.logger, "info")).lower()
                 self.assertRegex(messages, r"no (?:inventory )?changes")
                 self.assertFalse(re.search(r"\b0 (?:interfaces?|modules?|bays?)", messages))
+
+    def test_dynamic_defaults_and_not_applicable_interfaces_are_informational(self):
+        self.preview_plan["summary"].update(
+            switching_defaults=53,
+            switching_dynamic=34,
+            switching_not_applicable=5,
+        )
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "info")).lower()
+        self.assertRegex(messages, r"documented switchport defaults[^\n]*53")
+        self.assertRegex(messages, r"34 interfaces have dynamic")
+        self.assertRegex(messages, r"does not apply[^\n]*5")
+        self.assertIn("802.1q mode remains blank", messages)
+        self.assertIn("no inventory changes are needed", messages)
+        self.job.logger.warning.assert_not_called()
+        self.job.logger.error.assert_not_called()
+        self.assertEqual(self.assert_saved_report()["plan"], self.preview_plan)
+
+    def test_actual_source_gaps_and_unsupported_mapping_remain_warnings(self):
+        self.preview_plan["summary"].update(unresolved_switching=2)
+        self.preview_plan["warnings"] = ["/restconf/data/private-source: HTTP 503"]
+        self.job.run(self.device)
+        warnings = "\n".join(rendered_logs(self.job.logger, "warning")).lower()
+        self.assertIn("1 discovery warning", warnings)
+        self.assertIn("2 interface vlan observations unresolved", warnings)
+        self.assertIn("required evidence is missing or has no reviewed mapping", warnings)
+        self.assertNotIn("/restconf/", warnings)
+        self.assertNotIn("http 503", warnings)
+        self.job.logger.error.assert_not_called()
+        self.assertEqual(self.assert_saved_report()["plan"], self.preview_plan)
+
+    def test_known_type_conflict_identifies_the_preserved_interface(self):
+        self.preview_plan["summary"].update(conflicts=1)
+        self.preview_plan["conflicts"] = [
+            {
+                "scope": "interface",
+                "name": "Vlan2",
+                "field": "type",
+                "before": "other",
+                "observed": "virtual",
+            }
+        ]
+        self.job.run(self.device)
+        warnings = "\n".join(rendered_logs(self.job.logger, "warning"))
+        self.assertIn("Interface Vlan2: kept type Other", warnings)
+        self.assertIn("discovery identifies it as Virtual", warnings)
+        self.assertIn("existing interface was preserved", warnings)
+        self.job.logger.error.assert_not_called()
+
+    def test_unknown_conflict_values_are_kept_out_of_main_log(self):
+        self.preview_plan["summary"].update(conflicts=1)
+        self.preview_plan["conflicts"] = [
+            {
+                "scope": "interface",
+                "name": "Vlan2",
+                "field": "type",
+                "before": {"private": "raw-type-sentinel"},
+                "observed": "virtual",
+            }
+        ]
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger))
+        self.assertNotIn("raw-type-sentinel", messages)
+        self.assertNotIn("Interface Vlan2:", messages)
+        self.assertEqual(self.assert_saved_report()["plan"], self.preview_plan)
+
+    def test_hardware_warning_identifies_missing_identity_and_other_gaps_separately(self):
+        self.preview_plan["summary"].update(unresolved_components=5)
+        self.preview_plan["components"] = {
+            "unresolved": [
+                {
+                    "name": name,
+                    "model": None,
+                    "serial": None,
+                    "platform_type": type_,
+                    "empty": False,
+                    "oper_status": "disabled" if type_ == "comp-power-supply" else "enabled",
+                    "reason": (
+                        "Component identity is unavailable; presence or occupancy "
+                        "is not inferred from operational state"
+                    ),
+                }
+                for name, type_ in (
+                    ("Switch 1 - Fan 1", "comp-fan"),
+                    ("Switch 1 - Fan 2", "comp-fan"),
+                    ("Switch 1 - Fan 3", "comp-fan"),
+                    ("Switch 1 - Power Supply A", "comp-power-supply"),
+                )
+            ]
+            + [{"reason": "private-placement-sentinel"}]
+        }
+        self.job.run(self.device)
+        warnings = "\n".join(rendered_logs(self.job.logger, "warning")).lower()
+        self.assertIn("4 serialized hardware records", warnings)
+        self.assertIn("device did not provide model or serial identity", warnings)
+        self.assertIn("1 hardware observation unresolved", warnings)
+        self.assertIn("existing hardware was preserved", warnings)
+        self.assertNotIn("private-placement-sentinel", warnings)
+        self.job.logger.error.assert_not_called()
+        self.assertEqual(self.assert_saved_report()["plan"], self.preview_plan)
+
+    def test_repeat_run_keeps_dynamic_classification_without_reporting_a_change(self):
+        repeated = plan(switching_dynamic=34, switching_defaults=53, switching_not_applicable=5)
+        self.module.apply_discovery.return_value = repeated
+        self.job.run(self.device, dryrun=False)
+        messages = "\n".join(rendered_logs(self.job.logger, "info")).lower()
+        self.assertIn("no inventory changes are needed", messages)
+        self.assertIn("34 interfaces have dynamic", messages)
+        self.assertNotIn("recorded", messages)
+        self.job.logger.warning.assert_not_called()
+        self.assertEqual(self.assert_saved_report()["plan"], repeated)
 
     def test_expected_collection_failure_saves_report_and_suppresses_exception_cause(self):
         failure = self.module.RestconfError("Device connection timed out")

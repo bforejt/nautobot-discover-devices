@@ -515,6 +515,24 @@ def collect(client, *, use_ntc_defaults=False):
         else None,
         active_member=stack["active_position"],
     )
+    # The common release was established from a running image on every physical
+    # chassis. Keep the per-chassis join so member inventory never acquires a
+    # release merely because the active supervisor reported it.
+    for stack_member in stack["members"]:
+        position = stack_member["position"]
+        member_install = [row.copy() for row in install_evidence if row["chassis"] == position]
+        if not member_install or any(row["release"] != version for row in member_install):
+            raise DiscoveryError("Stack member software lacks its validated installation evidence")
+        stack_member["software_version"] = version
+        stack_member["sources"]["software_version"] = {
+            "module": "Cisco-IOS-XE-install-oper",
+            "path": INSTALL_PATH,
+            "requested_fields": INSTALL_FIELDS,
+            "field": "install-location-information[chassis=%s]/"
+            "install-version-info[current=provisioned-*]/version" % position,
+            "chassis": position,
+            "install_rows": member_install,
+        }
     interfaces, excluded = _interfaces(
         _filtered(client, INTERFACES_PATH, INTERFACE_FIELDS, warnings),
         model,
@@ -628,12 +646,7 @@ def collect(client, *, use_ntc_defaults=False):
         raise DiscoveryError(str(exc)) from None
     if stack["is_stack"]:
         reason = cisco_stack.DEFERRED_PLACEMENT
-        console_ports = {
-            "schema_version": 1,
-            "items": [],
-            "unresolved": [{"reason": reason}],
-            "observations": {},
-        }
+        console_ports = cisco_access_ports.collect_stack_consoles(stack)
         management = {
             "schema_version": 1,
             "interfaces": [],

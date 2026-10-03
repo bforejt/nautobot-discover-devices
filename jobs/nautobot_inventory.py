@@ -55,6 +55,7 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None, i
         {
             "id": str(interface.pk),
             "name": interface.name,
+            "device_id": str(interface.device_id) if interface.device_id else None,
             "lag_id": str(interface.lag_id) if interface.lag_id else None,
             "lag": interface.lag.name if interface.lag_id else None,
             "module_id": str(interface.module_id) if interface.module_id else None,
@@ -99,7 +100,7 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None, i
         ),
         "components": snapshot_components(device, lock=lock, discovery=discovery),
         "vlan_inventory": snapshot_vlans(device, vlan_group, lock=lock),
-        "console_inventory": snapshot_console_ports(device, lock=lock),
+        "console_inventory": snapshot_console_ports(device, lock=lock, discovery=discovery),
         "stack": snapshot_stack(device, lock=lock, discovery=discovery),
         "ipam_inventory": snapshot_ipam(device, ipam_policy, lock=lock, discovery=discovery),
     }
@@ -135,7 +136,11 @@ def _objects(
     version = None
     version_spec = plan["software_version"]
     if version_spec is not None:
-        if version_spec["create"]:
+        key = version_spec.get("key") or "%s:%s" % (device.platform_id, version_spec["version"])
+        cached_versions = stack["software_versions"] if stack is not None else {}
+        if key in cached_versions:
+            version = cached_versions[key]
+        elif version_spec["create"]:
             version = SoftwareVersion(
                 platform=device.platform,
                 version=version_spec["version"],
@@ -143,6 +148,8 @@ def _objects(
             )
         else:
             version = SoftwareVersion.objects.get(pk=version_spec["existing_id"])
+        if stack is not None:
+            cached_versions[key] = version
     status = _status(Interface, interface_status) if plan["interface_creates"] else None
     creates = []
     for row in plan["interface_creates"]:
@@ -168,7 +175,7 @@ def _objects(
         devices_by_serial[selected_serial] = device
     if stack is not None:
         devices_by_serial.update(
-            {member.serial: member for member in stack["members"].values() if member.serial}
+            {member.serial.strip(): member for member in stack["members"].values() if member.serial}
         )
     components = (
         component_objects(
@@ -222,7 +229,7 @@ def _objects(
     )
     console_plan = plan["console_ports"]
     consoles = (
-        console_objects(console_plan, device)
+        console_objects(console_plan, device, devices_by_serial=devices_by_serial)
         if console_plan["creates"] or console_plan["updates"]
         else []
     )
@@ -282,7 +289,12 @@ def validate_plan(
 ):
     """Validate without saving. Re-fetch the Device to avoid mutating inputs."""
     device = Device.objects.get(pk=device.pk)
-    stack = stack_objects(plan.get("stack"), device)
+    stack = stack_objects(
+        plan.get("stack"),
+        device,
+        software_version_status=software_version_status,
+        status_resolver=_status,
+    )
     validate_stack(stack)
     version, creates, updates, memberships, components, ownerships, vlans, consoles, ipam = (
         _objects(
@@ -402,7 +414,12 @@ def apply_discovery(
             ipam_prefix_status=ipam_prefix_status,
             ipam_ip_address_status=ipam_ip_address_status,
         )
-        stack = stack_objects(plan.get("stack"), device)
+        stack = stack_objects(
+            plan.get("stack"),
+            device,
+            software_version_status=software_version_status,
+            status_resolver=_status,
+        )
         version, creates, updates, memberships, components, ownerships, vlans, consoles, ipam = (
             _objects(
                 plan,
@@ -418,7 +435,7 @@ def apply_discovery(
         )
         save_stack(stack)
         if version is not None:
-            if plan["software_version"]["create"]:
+            if version._state.adding:
                 version.validated_save()
             device.software_version = version
         if plan["device_updates"]:

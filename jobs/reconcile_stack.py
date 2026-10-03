@@ -7,6 +7,8 @@ which physical chassis an existing Device represents.
 
 from collections import defaultdict
 
+from .adapters.cisco_iosxe import INSTALL_PATH, canonical_software_version
+
 
 def _text(value):
     return value.strip() if isinstance(value, str) and value.strip() else None
@@ -14,6 +16,29 @@ def _text(value):
 
 def _integer(value, minimum=0):
     return type(value) is int and minimum <= value <= 255
+
+
+def _member_install_row(row, position, release):
+    """Recheck the reviewed evidence shape before using it as an assignment."""
+    if not isinstance(row, dict):
+        return False
+    fru, current = row.get("fru"), row.get("current")
+    extension = row.get("version-extension")
+    return (
+        type(row.get("chassis")) is int
+        and row["chassis"] == position
+        and isinstance(fru, str)
+        and fru.split(":")[-1] == "fru-rp"
+        and isinstance(current, str)
+        and current.split(":")[-1]
+        in {
+            "install-version-state-provisioned-committed",
+            "install-version-state-provisioned-uncommitted",
+        }
+        and canonical_software_version(row.get("version")) == release
+        and canonical_software_version(row.get("release")) == release
+        and (extension is None or isinstance(extension, str) and extension.isdecimal())
+    )
 
 
 def _finish(plan):
@@ -26,6 +51,9 @@ def _finish(plan):
             bool(member["changes"]) for member in plan["members"] if not member["create"]
         ),
         "device_types_created": sum(row["create"] for row in plan["device_types"]),
+        "stack_member_software_assigned": sum(
+            bool(member.get("software_version_key")) for member in plan["members"]
+        ),
     }
     return plan
 
@@ -43,6 +71,7 @@ def plan_stack(discovery, existing):
         "schema_version": 1,
         "virtual_chassis": None,
         "device_types": [],
+        "software_versions": [],
         "members": [],
         "identity": identity,
         "errors": [],
@@ -196,6 +225,90 @@ def plan_stack(discovery, existing):
             }
         )
     used_ids = set()
+    software_catalog = {}
+
+    def member_software(member, row, is_selected):
+        """Only explicit member install evidence can fill a blank assignment."""
+        # The selected Device retains the established top-level software path.
+        if is_selected:
+            return None
+        release = canonical_software_version(member.get("software_version"))
+        source = member["sources"].get("software_version")
+        rows = source.get("install_rows") if isinstance(source, dict) else None
+        if (
+            release is None
+            or release != canonical_software_version(identity.get("software_version"))
+            or not isinstance(source, dict)
+            or source.get("module") != "Cisco-IOS-XE-install-oper"
+            or source.get("path") != INSTALL_PATH
+            or type(source.get("chassis")) is not int
+            or source["chassis"] != member["position"]
+            or not isinstance(rows, list)
+            or not rows
+            or any(not _member_install_row(item, member["position"], release) for item in rows)
+        ):
+            plan["warnings"].append(
+                "Stack member %s software is deferred: verified member installation evidence "
+                "is missing or inconsistent" % member["position"]
+            )
+            return None
+        before = row.get("software_version") if row else None
+        if _text(before):
+            if canonical_software_version(before) != release:
+                conflict("stack_member", row.get("name"), "software_version", before, release)
+            return None
+        platform_id = row.get("platform_id") if row else selected.get("platform_id")
+        if not platform_id:
+            plan["warnings"].append(
+                "Stack member %s software is deferred: assign its Platform before loading "
+                "software; existing member Platforms are preserved" % member["position"]
+            )
+            return None
+        platform_id = str(platform_id)
+        member_driver = _text((row if row else selected).get("platform_network_driver"))
+        if member_driver and member_driver.casefold() not in {"cisco_ios", "cisco_iosxe"}:
+            conflict(
+                "stack_member",
+                row.get("name") if row else "%s:%s" % (name, member["position"]),
+                "platform",
+                platform_id,
+                selected.get("platform_id"),
+            )
+            plan["warnings"].append(
+                "Stack member %s software is deferred: its existing Platform network driver "
+                "does not identify supported IOS XE; the Platform is preserved" % member["position"]
+            )
+            return None
+        key = "%s:%s" % (platform_id, release)
+        if key not in software_catalog:
+            candidates = [
+                candidate
+                for candidate in catalog.get("software_versions", [])
+                if str(candidate.get("platform_id")) == platform_id
+                and canonical_software_version(candidate.get("version")) == release
+            ]
+            # Older pure snapshots carry only the selected Platform's catalog.
+            if not candidates and platform_id == str(selected.get("platform_id")):
+                candidates = [
+                    candidate
+                    for candidate in existing.get("software_versions", [])
+                    if canonical_software_version(candidate.get("version")) == release
+                ]
+            if len(candidates) > 1:
+                plan["errors"].append(
+                    "Several SoftwareVersion records represent release %s for stack member "
+                    "Platform %s" % (release, platform_id)
+                )
+                return None
+            software_catalog[key] = {
+                "key": key,
+                "platform_id": platform_id,
+                "version": release,
+                "existing_id": str(candidates[0]["id"]) if candidates else None,
+                "create": not candidates,
+            }
+        return key
+
     for member in sorted(members, key=lambda item: item["position"]):
         is_selected = member["position"] == selected_member["position"]
         candidates = by_serial[member["serial"]]
@@ -296,6 +409,15 @@ def plan_stack(discovery, existing):
             ]
             if occupied:
                 plan["errors"].append("Observed stack position is occupied by another Device")
+        software_key = member_software(member, row, is_selected)
+        if software_key and row:
+            changes.append(
+                {
+                    "field": "software_version",
+                    "before": row.get("software_version"),
+                    "after": software_catalog[software_key]["version"],
+                }
+            )
         plan["members"].append(
             {
                 "position": member["position"],
@@ -307,8 +429,13 @@ def plan_stack(discovery, existing):
                 "selected": is_selected,
                 "create": row is None,
                 "changes": changes,
+                "platform_id": row.get("platform_id") if row else selected.get("platform_id"),
+                "software_version": member.get("software_version"),
+                "software_version_key": software_key,
+                "software_source": member["sources"].get("software_version"),
             }
         )
+    plan["software_versions"] = [software_catalog[key] for key in sorted(software_catalog)]
     active_plan = next(
         (row for row in plan["members"] if row["position"] == active["position"]), None
     )

@@ -22,7 +22,7 @@ from `Cisco-IOS-XE-install-oper:install-oper-data/install-location-information`.
 | Chassis `part-number`, `serial-number` | Exact member model and physical serial → DeviceType and Device serial |
 | `node-state=state-ready`, `stack-mode=mode-stackwise-rear` | Supported physically confirmed StackWise member |
 | Provisioned, removed or unprovisioned roster slot without chassis hardware | Evidence only; no physical Device created |
-| Per-member provisioned installation version/state | Shared running release only when every present member is represented and releases agree |
+| Per-member provisioned RP installation version/state | Each member's native `Device.software_version`, only when every present member is represented and releases agree |
 
 Serial joins are case-sensitive after trimming surrounding whitespace.
 An explicit inventory `Switch N` name cross-checks the reported position.
@@ -60,9 +60,18 @@ component creation is suppressed, so discovery does not instantiate unevidenced
 ports. Older releases without the suppression API can use DeviceTypes with no
 component templates; populated templates block apply.
 
-Primary IPs, SecretsGroups, rack positions, software assignments, custom fields,
+Primary IPs, SecretsGroups, rack positions, custom fields,
 cables and other operator settings are not copied to additional Devices.
-The shared release continues to fill the selected Device's blank software field.
+The selected Device's blank software field and each additional member's blank
+`Device.software_version` reference native `SoftwareVersion` catalog rows.
+Each assignment requires that member's validated provisioned RP installation
+evidence, rather than copying an active member's assignment. The catalog is
+scoped to the member's own Platform. New members inherit the selected Platform;
+existing member Platforms are preserved. Missing or explicitly incompatible
+Platforms, incomplete installation evidence and populated conflicting versions
+defer that member's software assignment while preserving its other inventory.
+Identical releases on the same Platform share one catalog row; no custom fields
+or software image records are created.
 
 Existing members can be adopted by a unique serial or by a unique matching
 member name with blank serial and the same model, manufacturer, location and
@@ -94,10 +103,25 @@ The NTC guessing checkbox does not relax stack identity or placement checks.
 Reviewed PSU bays, serialized assets and native power inlets belong to their
 physical serial-matched member Device, including newly created members. See
 [power-supply-discovery.md](power-supply-discovery.md) for identity, inlet and
-strict-mode requirements. Network modules, transceivers, physical console ports
-and dedicated management-port placement on multi-member stacks remain unresolved
-with hardware evidence in the report. Existing records are preserved. StackWise
-link cabling is not inferred from ring status.
+strict-mode requirements. The reviewed C9300-48UXM / C3850-NM-4-1G network-module
+profile also creates native ModuleBays and serialized Modules on their physical
+members. Eligible SFPs use nested ModuleBays under the confirmed network module.
+Hardware, platform and stack sources must agree on model, serial and member;
+an optic's parent identity and eligible physical interface must also agree.
+Unsupported profiles or ambiguous ownership remain unresolved in the report.
+
+Nautobot requires an Interface and its Module to share a root Device. Interfaces
+remain on the selected Device, so a network module on another physical member
+can be inventoried accurately while its Interface links are deferred separately.
+These expected deferrals are informational; they do not block valid hardware
+inventory. Existing modules are never moved between member Devices automatically.
+
+Each validated C9300-48UXM member also receives the documented rear RJ45 and
+front USB mini-B native ConsolePorts. Connector adoption and DeviceType template
+selection are scoped to that member; existing names, labels, UUIDs and cables
+are preserved. The shared logical `console=0` settings are not copied to other
+members. Dedicated management-port placement on multi-member stacks remains
+unresolved. StackWise link cabling is not inferred from ring status.
 
 ## Preview and apply
 
@@ -111,3 +135,14 @@ Repeat runs with unchanged facts issue no inventory writes.
 Stack-specific counts and evidence appear in the normal discovery report and
 the job's concise change log. Real-model tests target Nautobot 3.2.5; other
 versions require the same native fields and compatible validators.
+
+## Stack member inventory validation
+
+The `0.14.0-dev` increment passes 522 offline tests and 118 real Nautobot 3.2.5
+ORM checks for preview, apply, repeat and rollback. Those checks cover
+member-specific Platforms and software catalogs, nested network modules/SFPs,
+physical consoles, preserved cables and interface ownership, and late save
+failures. Fixtures and ORM mutations run inside rollback transactions. The lab
+C9300-48UXM on IOS XE 17.18.4 provides the live standalone regression check;
+a registered worker preview and repeat apply both preserve the inventory.
+A live multi-member stack is still needed to confirm actual stacked responses.

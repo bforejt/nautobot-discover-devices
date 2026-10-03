@@ -21,9 +21,10 @@ in place. Replacements and moves are reported as conflicts for operator review.
 
 The exact chassis and PSU compatibility lists, inlet connector specifications,
 and their Cisco documentation links are in
-[cisco_psu_profiles.py](../jobs/adapters/cisco_psu_profiles.py). This broader
-PSU coverage does not expand the separate uplink, transceiver, console or
-management-port profiles.
+[cisco_psu_profiles.py](../jobs/adapters/cisco_psu_profiles.py). The `0.13.0-dev`
+PSU increment did not expand the separate uplink, transceiver, console or
+management-port profiles. The later [stack member inventory](stacking.md)
+increment adds reviewed network modules, SFPs and console placement.
 
 ## Power inlets
 

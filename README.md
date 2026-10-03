@@ -259,14 +259,16 @@ physical inventory indexes never establish member identity. Standalone switches
 remain standalone, and provisioning alone cannot create a physical Device.
 
 See [stacking.md](docs/stacking.md) for the source fields, preservation rules,
-differences from NtC, and current placement limits. Reviewed PSU bays, assets
-and inlets belong to physical member Devices. Other multi-member components and
-console placement remain unresolved pending separate reviewed profiles.
+differences from NtC, and current placement limits. Each member's verified running
+release fills its native software-version field using its own Platform. Reviewed
+PSU bays, assets and inlets, network modules, nested SFPs and physical console
+connectors belong to their serial-matched member Devices. Network interfaces stay
+on the selected Device; cross-member Module links are deferred separately.
 
 ## Console and dedicated management ports
 
-The initial access-port profile is deliberately limited to the observed
-`C9300-48UXM`, member 1. Cisco documents a rear RJ45 console connector and a
+The physical console profile is limited to validated `C9300-48UXM` chassis,
+including each confirmed stack member. Cisco documents a rear RJ45 console connector and a
 front five-pin USB mini-B console connector for this model. The collector uses
 that reviewed hardware specification and observed chassis PID as evidence,
 independently of **Use NTC defaults when guessing**. It records the profile,
@@ -288,7 +290,8 @@ connector types, and cables are preserved. The job never creates cable links
 or guesses a remote console-server endpoint.
 
 The native `console=0` configuration represents one logical line shared by
-both connectors. Explicit speed, receive/transmit speeds, data bits, parity,
+both connectors; its settings are not copied to other stack members. Explicit
+speed, receive/transmit speeds, data bits, parity,
 stop bits, and configured medium are structured report observations. Missing
 settings remain unknown; the factory baud rate is not assumed. Disagreeing
 receive/transmit rates do not establish one baud rate. Nautobot 3.2.5 has no

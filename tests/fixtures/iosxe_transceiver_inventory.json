@@ -1,0 +1,31 @@
+{
+  "hardware_inventory": {
+    "hw-type": "hw-type-transceiver",
+    "hw-dev-index": 700,
+    "version": "V03 ",
+    "part-number": "GLC-SX-MM           ",
+    "serial-number": "LABOPTIC001     ",
+    "hw-description": "1000BaseSX SFP",
+    "dev-name": "Gi1/1/1",
+    "field-replaceable": true,
+    "hw-class": "hw-class-physical"
+  },
+  "platform_component": {
+    "cname": "GigabitEthernet1/1/1",
+    "state": {
+      "type": "comp-port",
+      "id": "1120",
+      "description": "1000BaseSX SFP",
+      "mfg-name": "CISCO-EQUIV     ",
+      "version": "V03 ",
+      "serial-no": "LABOPTIC001     ",
+      "part-no": "GLC-SX-MM",
+      "location": "1/0/1/1",
+      "empty": false,
+      "removable": false,
+      "parent": "Switch1",
+      "status": "status-active",
+      "status-desc": "status-desc-ok"
+    }
+  }
+}

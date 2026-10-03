@@ -422,7 +422,7 @@ class Layer2CollectionTests(unittest.TestCase):
 
     def test_unreviewed_profiles_retain_explicit_settings_but_no_absent_leaf_defaults(self):
         interfaces = cisco.collect(FixtureClient())["interfaces"]
-        for model, version in (("C9300-24T", "17.12.08"), ("C9300-48UXM", "17.15.06")):
+        for model, version in (("C9300-24T", "17.12.08"), ("C9300-48UXM", "17.16.01")):
             with self.subTest(model=model, version=version):
                 result = layer2.collect(
                     FixtureClient(payloads()),
@@ -640,7 +640,7 @@ class Layer2CollectionTests(unittest.TestCase):
                 )
 
     def test_default_profile_is_scoped_to_reviewed_chassis_and_release_families(self):
-        for model, version in (("C9300-24T", "17.12.08"), ("C9300-48UXM", "17.15.06")):
+        for model, version in (("C9300-24T", "17.12.08"), ("C9300-48UXM", "17.16.01")):
             with self.subTest(model=model, version=version):
                 client = FixtureClient(payloads())
                 result = layer2.collect(

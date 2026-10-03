@@ -79,6 +79,148 @@ def apply_to_snapshot(plan, before):
 
 
 class ReconciliationTests(unittest.TestCase):
+    def test_reviewed_management_purpose_corrects_default_false_then_repeats(self):
+        from tests.test_console_reconcile import profile
+
+        source = {**profile(), "interface": "GigabitEthernet0/0", "value": True}
+        observed = discovery(
+            name="GigabitEthernet0/0", type="1000base-t", mgmt_only=True, mgmt_only_source=source
+        )
+        before = inventory()
+        before["interfaces"] = [
+            {
+                "id": "mgmt",
+                "name": "Gi0/0",
+                "type": "1000base-t",
+                "enabled": True,
+                "mgmt_only": False,
+            }
+        ]
+        first = reconcile.build_plan(observed, before)
+        self.assertFalse(first["errors"])
+        change = next(
+            change
+            for row in first["interface_updates"]
+            for change in row["changes"]
+            if change["field"] == "mgmt_only"
+        )
+        self.assertIs(change["before"], False)
+        self.assertIs(change["after"], True)
+        self.assertEqual(change["source"], source)
+        self.assertEqual(first["summary"]["management_interfaces_updated"], 1)
+        second = reconcile.build_plan(observed, apply_to_snapshot(first, before))
+        self.assertEqual(second["interface_updates"], [])
+        self.assertEqual(second["summary"]["management_interfaces_updated"], 0)
+
+    def test_reviewed_management_new_interface_has_true_and_provenance(self):
+        from tests.test_console_reconcile import profile
+
+        source = {**profile(), "interface": "GigabitEthernet0/0", "value": True}
+        plan = reconcile.build_plan(
+            discovery(
+                name="GigabitEthernet0/0",
+                type="1000base-t",
+                mgmt_only=True,
+                mgmt_only_source=source,
+            ),
+            inventory(),
+        )
+        self.assertIs(plan["interface_creates"][0]["mgmt_only"], True)
+        self.assertEqual(plan["interface_creates"][0]["mgmt_only_source"], source)
+        self.assertEqual(plan["summary"]["management_interfaces_updated"], 0)
+
+    def test_unclassified_interfaces_do_not_write_management_false(self):
+        before = inventory()
+        before["interfaces"] = [
+            {"id": "ordinary", "name": "Gi1/0/1", "type": "1000base-t", "mgmt_only": True}
+        ]
+        for value in (None, False):
+            plan = reconcile.build_plan(
+                discovery(name="GigabitEthernet1/0/1", type="1000base-t", mgmt_only=value), before
+            )
+            self.assertFalse(
+                any(
+                    change["field"] == "mgmt_only"
+                    for row in plan["interface_updates"]
+                    for change in row["changes"]
+                )
+            )
+        plan = reconcile.build_plan(discovery(), inventory())
+        self.assertIsNone(plan["interface_creates"][0]["mgmt_only"])
+
+    def test_unreviewed_or_malformed_management_facts_block_apply(self):
+        from tests.test_console_reconcile import profile
+
+        source = {**profile(), "interface": "GigabitEthernet0/0", "value": True}
+        cases = [
+            ("mgmt_only", "true"),
+            ("mgmt_only", 1),
+            ("mgmt_only_source", None),
+            ("name", "GigabitEthernet1/0/1"),
+            ("type", "virtual"),
+        ]
+        for field, value in cases:
+            observed = discovery(
+                name="GigabitEthernet0/0",
+                type="1000base-t",
+                mgmt_only=True,
+                mgmt_only_source=source,
+            )
+            observed["interfaces"][0][field] = value
+            plan = reconcile.build_plan(observed, inventory())
+            self.assertTrue(plan["errors"])
+            self.assertEqual(plan["summary"]["management_interfaces_updated"], 0)
+
+    def test_management_purpose_is_deferred_when_native_type_or_relationships_conflict(self):
+        from tests.test_console_reconcile import profile
+
+        source = {**profile(), "interface": "GigabitEthernet0/0", "value": True}
+        observed = discovery(
+            name="GigabitEthernet0/0", type="1000base-t", mgmt_only=True, mgmt_only_source=source
+        )
+        for fields in (
+            {"type": "other"},
+            {"module_id": "module"},
+            {"lag_id": "lag"},
+            {"mode": "access"},
+            {"untagged_vlan_id": "vlan"},
+            {"tagged_vlan_ids": ["vlan"]},
+            {"port_type": "lc"},
+        ):
+            with self.subTest(fields=fields):
+                before = inventory()
+                before["interfaces"] = [
+                    {
+                        "id": "mgmt",
+                        "name": "Gi0/0",
+                        "type": "1000base-t",
+                        "mgmt_only": False,
+                        **fields,
+                    }
+                ]
+                plan = reconcile.build_plan(observed, before)
+                self.assertFalse(plan["errors"])
+                self.assertEqual(plan["summary"]["management_interfaces_updated"], 0)
+                self.assertTrue(any(row["field"] == "mgmt_only" for row in plan["conflicts"]))
+
+    def test_older_schema_skips_management_only_field(self):
+        from tests.test_console_reconcile import profile
+
+        before = inventory()
+        before["unsupported_interface_fields"] = ["mgmt_only"]
+        source = {**profile(), "interface": "GigabitEthernet0/0", "value": True}
+        plan = reconcile.build_plan(
+            discovery(
+                name="GigabitEthernet0/0",
+                type="1000base-t",
+                mgmt_only=True,
+                mgmt_only_source=source,
+            ),
+            before,
+        )
+        self.assertIsNone(plan["interface_creates"][0]["mgmt_only"])
+        self.assertTrue(any("mgmt_only" in message for message in plan["warnings"]))
+
     def test_operational_fields_respect_preserved_type(self):
         before = inventory()
         before["interfaces"] = [{"id": "port-1", "name": "Gi1/0/1", "type": "1000base-x-sfp"}]

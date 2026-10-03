@@ -2,8 +2,10 @@
 
 Identity comes from device-hardware-oper; platform-oper corroborates identity
 and supplies placement. Numeric inventory indexes are evidence, never joins.
-The first profile covers a C9300-48UXM, C3850-NM-4-1G uplink and
-PWR-C1-1100WAC-P power supplies. Unknown parts remain explicit observations.
+The uplink/transceiver profile covers a C9300-48UXM and C3850-NM-4-1G.
+Separate documented Catalyst 9300 PSU profiles establish chassis bays even
+when occupant identity is unavailable, and resolve serialized supplies to
+verified standalone or stack-member owners. Unknown parts remain observations.
 
 Platform fields are documented in Cisco's published YANG model:
 https://raw.githubusercontent.com/YangModels/yang/main/vendor/cisco/xe/17111/Cisco-IOS-XE-platform-oper.yang
@@ -11,17 +13,22 @@ https://raw.githubusercontent.com/YangModels/yang/main/vendor/cisco/xe/17111/Cis
 
 import re
 from collections import Counter
+from copy import deepcopy
+from decimal import Decimal, InvalidOperation
 
 from ..transport_restconf import RestconfError
+from . import cisco_psu_profiles as psu_profiles
 
 HARDWARE_PATH = "/data/Cisco-IOS-XE-device-hardware-oper:device-hardware-data"
 PLATFORM_PATH = "/data/Cisco-IOS-XE-platform-oper:components"
 INTERFACES_PATH = "/data/Cisco-IOS-XE-interfaces-oper:interfaces"
 PLATFORM_FIELDS = (
-    "component(cname;state(type;id;description;serial-no;part-no;version;location;"
-    "empty;removable;parent;status;status-desc);platform-subcomponents)"
+    "component(cname;state(type;id;description;mfg-name;serial-no;part-no;version;location;"
+    "empty;removable;parent;status;status-desc);platform-subcomponents;"
+    "platform-properties/platform-property(name;value;configurable))"
 )
 PROFILE = "c9300-48uxm-serialized-components-v1"
+TRANSCEIVER_PROFILE = "c9300-48uxm-c3850-nm-4-1g-transceivers-v1"
 CATALOG = {
     "C3850-NM-4-1G": ("network-module", "hw-type-pim"),
     "PWR-C1-1100WAC-P": ("power-supply", "hw-type-pem"),
@@ -74,6 +81,94 @@ def _flat_fact(row):
     }
 
 
+def _platform_properties(row, component):
+    """Keep optional operational properties independent of identity validation."""
+    properties = _value(row, "platform-properties")
+    if properties is None:
+        return None, []
+    retained, errors = [], []
+    source = {
+        "module": "Cisco-IOS-XE-platform-oper",
+        "path": PLATFORM_PATH,
+        "component": component,
+        "field": "platform-properties/platform-property",
+        "meaning": "Raw typed property; units/interpretation are not inferred",
+    }
+    if not isinstance(properties, dict):
+        return [], [{"reason": "Platform properties must be structured objects", "source": source}]
+    values = _value(properties, "platform-property")
+    rows = values if isinstance(values, list) else [values] if values is not None else []
+    seen = set()
+    for index, prop in enumerate(rows):
+        name = None
+        try:
+            if not isinstance(prop, dict):
+                raise ComponentDiscoveryError("Platform property must be a structured object")
+            name = _text(_value(prop, "name"))
+            value = _value(prop, "value")
+            if not name or not isinstance(value, dict):
+                raise ComponentDiscoveryError("Platform property lacks structured name/value")
+            choices = [(key.split(":")[-1], value) for key, value in value.items()]
+            if len(choices) != 1 or choices[0][0] not in (
+                "string",
+                "boolean",
+                "intsixfour",
+                "uintsixfour",
+                "decimal",
+            ):
+                raise ComponentDiscoveryError(
+                    "Platform property must contain one YANG value choice"
+                )
+            choice, leaf = choices[0]
+            if choice == "string" and not isinstance(leaf, str):
+                raise ComponentDiscoveryError("Platform string property has a non-string value")
+            if choice == "boolean" and type(leaf) is not bool:
+                raise ComponentDiscoveryError("Platform boolean property has a non-boolean value")
+            if choice in ("intsixfour", "uintsixfour"):
+                if type(leaf) is int:
+                    integer = leaf
+                elif isinstance(leaf, str) and re.fullmatch(r"-?\d+", leaf):
+                    integer = int(leaf)
+                else:
+                    raise ComponentDiscoveryError("Platform integer property has an invalid value")
+                minimum, maximum = (
+                    (-(2**63), 2**63 - 1) if choice == "intsixfour" else (0, 2**64 - 1)
+                )
+                if not minimum <= integer <= maximum:
+                    raise ComponentDiscoveryError(
+                        "Platform integer property exceeds its YANG range"
+                    )
+            if choice == "decimal":
+                if type(leaf) not in (str, int, float):
+                    raise ComponentDiscoveryError("Platform decimal property has an invalid value")
+                try:
+                    valid_decimal = Decimal(str(leaf)).is_finite()
+                except InvalidOperation:
+                    valid_decimal = False
+                if not valid_decimal:
+                    raise ComponentDiscoveryError("Platform decimal property has an invalid value")
+            configurable = _value(prop, "configurable")
+            if configurable is not None and type(configurable) is not bool:
+                raise ComponentDiscoveryError("Platform property configurable must be a boolean")
+            if name in seen:
+                retained = [item for item in retained if item["name"] != name]
+                raise ComponentDiscoveryError("Platform property name is ambiguous")
+            seen.add(name)
+            retained.append(
+                {
+                    "name": name,
+                    "value": {choice: deepcopy(leaf)},
+                    "configurable": configurable,
+                    "source": deepcopy(source),
+                }
+            )
+        except ComponentDiscoveryError as exc:
+            errors.append(
+                {"property": name, "index": index, "reason": str(exc), "source": deepcopy(source)}
+            )
+    return sorted(retained, key=lambda prop: prop["name"]), errors
+
+
 def _platform_fact(row):
     state = _value(row, "state")
     if not isinstance(state, dict):
@@ -82,6 +177,7 @@ def _platform_fact(row):
         "name": _text(_value(row, "cname")),
         "model": _text(_value(state, "part-no")),
         "serial": _text(_value(state, "serial-no")),
+        "manufacturer": _text(_value(state, "mfg-name")),
         "hardware_revision": _text(_value(state, "version")),
         "platform_type": _enum(_value(state, "type")),
         "platform_id": _text(_value(state, "id")),
@@ -97,6 +193,11 @@ def _platform_fact(row):
     for key in ("empty", "removable"):
         if fact[key] is not None and not isinstance(fact[key], bool):
             raise ComponentDiscoveryError("Platform component %s must be a boolean" % key)
+    properties, errors = _platform_properties(row, fact["name"])
+    if properties is not None:
+        fact["platform_properties"] = properties
+    if errors:
+        fact["platform_property_errors"] = errors
     return fact
 
 
@@ -115,7 +216,7 @@ def _identity_source(fact):
     }
 
 
-def _placement_source(fact):
+def _placement_source(fact, *, profile=PROFILE):
     return {
         "module": "Cisco-IOS-XE-platform-oper",
         "path": PLATFORM_PATH,
@@ -124,9 +225,10 @@ def _placement_source(fact):
             "parent": "state/parent",
             "location": "state/location",
             "hardware_revision": "state/version",
+            "manufacturer": "state/mfg-name",
         },
         "identity_join_rule": "unique trimmed part-number/part-no and serial-number/serial-no",
-        "profile": PROFILE,
+        "profile": profile,
     }
 
 
@@ -177,9 +279,430 @@ def _expected_platform_name(fact, member):
     return None
 
 
-def collect(client, inventory, *, chassis_model, chassis_serial, member, interfaces, warnings):
+def _collect_transceivers(
+    result, flat, platform, pairs, root, *, chassis_model, member, interfaces
+):
+    """Resolve SFP assets after their reviewed uplink parent, independent of input order.
+
+    The observed platform component describes the optic as comp-port and reports
+    removable=False even though hardware inventory explicitly identifies a physical,
+    field-replaceable transceiver. Preserve those observations. The shared platform
+    location corroborates uplink slot 1; only matching structured interface names
+    establish an individual SFP port, never numeric inventory indexes or location
+    segment guesses. Existing host interfaces remain owned by the uplink Module.
+    """
+    from .cisco_iosxe import canonical_interface_name
+
+    handled = set()
+    parent_key = "uplink:%d/1" % member
+    parents = [item for item in result["items"] if item["key"] == parent_key]
+    for fact in flat:
+        if fact["hw_type"] != "hw-type-transceiver":
+            continue
+        unresolved = {**fact, "source": {"identity": _identity_source(fact)}}
+        name = canonical_interface_name(fact["name"])
+        match = re.fullmatch(r"GigabitEthernet%d/1/([1-4])" % member, name or "")
+        if not fact["model"] or not fact["serial"]:
+            reason = "Serialized transceiver model or serial number is unavailable"
+        elif chassis_model != "C9300-48UXM" or match is None:
+            reason = "Transceiver chassis or port has no reviewed nested placement profile"
+        elif fact["hardware_class"] is None or fact["field_replaceable"] is None:
+            reason = "Transceiver physical or field-replaceable classification is unavailable"
+        else:
+            if (
+                fact["hardware_class"] != "hw-class-physical"
+                or fact["field_replaceable"] is not True
+            ):
+                raise ComponentDiscoveryError(
+                    "Reviewed transceiver has contradictory hardware classification"
+                )
+            if pairs[(fact["model"], fact["serial"])] != 1:
+                raise ComponentDiscoveryError(
+                    "Reviewed serialized transceiver identity occurs in multiple inventory entries"
+                )
+            matches = [
+                part
+                for part in platform
+                if (part["model"], part["serial"]) == (fact["model"], fact["serial"])
+            ]
+            if len(matches) > 1:
+                raise ComponentDiscoveryError(
+                    "Serialized transceiver identity matches multiple platform components"
+                )
+            if not matches:
+                expected = next((part for part in platform if part["name"] == name), None)
+                if expected and expected["model"] and expected["serial"]:
+                    raise ComponentDiscoveryError(
+                        "Serialized transceiver inventory and platform identities "
+                        "disagree at a reviewed port"
+                    )
+                reason = "No unique platform identity match establishes transceiver placement"
+            else:
+                part = matches[0]
+                handled.add(part["name"])
+                unresolved["observations"] = part
+                unresolved["source"]["placement"] = _placement_source(
+                    part, profile=TRANSCEIVER_PROFILE
+                )
+                if part["name"] != name:
+                    raise ComponentDiscoveryError(
+                        "Serialized transceiver identity names different "
+                        "hardware and platform ports"
+                    )
+                if root is None:
+                    reason = (
+                        "Platform chassis identity is unavailable for transceiver parent validation"
+                    )
+                elif part["parent"] != "Switch%d" % member:
+                    reason = "Transceiver platform parent does not match the reviewed chassis"
+                elif part["location"] != "%d/0/1/1" % member:
+                    reason = "Transceiver platform location does not match the reviewed uplink slot"
+                elif part["platform_type"] != "comp-port":
+                    reason = "Transceiver platform classification has no reviewed placement profile"
+                elif part["empty"] is not False or part["removable"] is not False:
+                    reason = "Transceiver presence or platform removability needs review"
+                elif part["manufacturer"] is None:
+                    reason = (
+                        "Transceiver manufacturer is unavailable from structured platform state"
+                    )
+                elif len(parents) != 1 or parents[0]["model"] != "C3850-NM-4-1G":
+                    reason = "Transceiver parent uplink module is not uniquely established"
+                elif name not in parents[0]["interfaces"]:
+                    reason = (
+                        "Transceiver port is not an eligible observed interface "
+                        "of the parent uplink"
+                    )
+                else:
+                    observed = [interface for interface in interfaces if interface["name"] == name]
+                    if len(observed) != 1:
+                        raise ComponentDiscoveryError(
+                            "Transceiver port has ambiguous eligible interface observations"
+                        )
+                    if (
+                        observed[0].get("type") != "1000base-x-sfp"
+                        or observed[0].get("type_source")
+                        != "Installed C3850-NM-4-1G 4x1G SFP uplink module"
+                    ):
+                        reason = (
+                            "Transceiver port lacks the reviewed physical SFP capability evidence"
+                        )
+                    else:
+                        result["items"].append(
+                            {
+                                "key": "transceiver:%d/1/%s" % (member, match.group(1)),
+                                "kind": "transceiver",
+                                "manufacturer": part["manufacturer"],
+                                "model": fact["model"],
+                                "part_number": fact["model"],
+                                "serial": fact["serial"],
+                                "hardware_revision": fact["hardware_revision"]
+                                or part["hardware_revision"],
+                                "parent_key": parent_key,
+                                "bay": {
+                                    "name": "SFP %s" % name,
+                                    "position": match.group(1),
+                                    "label": name,
+                                },
+                                "interfaces": [],
+                                "source": {
+                                    "identity": {
+                                        **_identity_source(fact),
+                                        "hardware_class": fact["hardware_class"],
+                                        "field_replaceable": fact["field_replaceable"],
+                                        "interface_name": fact["name"],
+                                    },
+                                    "placement": _placement_source(
+                                        part, profile=TRANSCEIVER_PROFILE
+                                    ),
+                                    "manufacturer": {
+                                        "module": "Cisco-IOS-XE-platform-oper",
+                                        "path": PLATFORM_PATH,
+                                        "field": "state/mfg-name",
+                                        "component": part["name"],
+                                        "value": part["manufacturer"],
+                                        "profile": TRANSCEIVER_PROFILE,
+                                    },
+                                    "ownership": {
+                                        "method": "reviewed-profile",
+                                        "profile": TRANSCEIVER_PROFILE,
+                                        "rule": (
+                                            "C3850-NM-4-1G uplink slot 1 contains SFP bays "
+                                            "for GigabitEthernet<member>/1/1-4"
+                                        ),
+                                        "parent_key": parent_key,
+                                        "parent_model": parents[0]["model"],
+                                        "parent_serial": parents[0]["serial"],
+                                        "interface": name,
+                                        "module": "Cisco-IOS-XE-interfaces-oper",
+                                        "path": INTERFACES_PATH,
+                                        "meaning": (
+                                            "Matching structured hardware dev-name and platform "
+                                            "cname associate the optic with a reviewed "
+                                            "uplink port; "
+                                            "nested bay ownership follows the hardware profile. "
+                                            "The host Interface remains owned by the uplink Module"
+                                        ),
+                                    },
+                                },
+                                "observations": part,
+                            }
+                        )
+                        continue
+        result["unresolved"].append({**unresolved, "reason": reason})
+    return handled
+
+
+def _psu_owners(inventory, platform, *, chassis_model, chassis_serial, member, stack):
+    """Join physical chassis, validated stack membership and platform roots."""
+    hardware = [_flat_fact(row) for row in inventory]
+    chassis = [fact for fact in hardware if fact["hw_type"] == "hw-type-chassis"]
+    members = stack.get("members", []) if isinstance(stack, dict) else []
+    candidates = members or [{"model": chassis_model, "serial": chassis_serial, "position": member}]
+    owners = {}
+    for candidate in candidates:
+        position, serial, model = (
+            candidate.get("position"),
+            candidate.get("serial"),
+            candidate.get("model"),
+        )
+        if type(position) is not int or not 1 <= position <= 255:
+            raise ComponentDiscoveryError("PSU owner needs a validated positive member position")
+        matches = [fact for fact in chassis if (fact["model"], fact["serial"]) == (model, serial)]
+        if len(matches) != 1 or not serial or not model:
+            raise ComponentDiscoveryError("PSU owner must uniquely match physical chassis identity")
+        named = re.fullmatch(r"Switch\s+(\d+)", matches[0]["name"] or "", re.IGNORECASE)
+        if named and int(named.group(1)) != position:
+            raise ComponentDiscoveryError("PSU owner position contradicts physical chassis name")
+        root = next((part for part in platform if part["name"] == "Switch%d" % position), None)
+        if root and (root["model"] != model or root["serial"] != serial):
+            raise ComponentDiscoveryError(
+                "Platform chassis identity contradicts hardware inventory"
+            )
+        if position in owners or serial in {owner["serial"] for owner in owners.values()}:
+            raise ComponentDiscoveryError("PSU owner identity or member position is ambiguous")
+        owners[position] = {
+            "model": model,
+            "serial": serial,
+            "position": position,
+            "root": root,
+            "identity_source": _identity_source(matches[0]),
+            "membership_source": deepcopy(candidate.get("sources", {}).get("membership")),
+        }
+    return owners
+
+
+def _psu_observations(part):
+    if part is None:
+        return {"reported_presence": "unknown", "oper_status": None, "status_description": None}
+    presence = (
+        "reported-empty"
+        if part["empty"] is True
+        else "reported-nonempty"
+        if part["empty"] is False
+        else "unknown"
+    )
+    return {
+        "reported_presence": presence,
+        "empty": part["empty"],
+        "oper_status": part["oper_status"],
+        "status_description": part["status_description"],
+        **(
+            {"platform_properties": deepcopy(part["platform_properties"])}
+            if "platform_properties" in part
+            else {}
+        ),
+        **(
+            {"platform_property_errors": deepcopy(part["platform_property_errors"])}
+            if "platform_property_errors" in part
+            else {}
+        ),
+        "meaning": "Reported occupancy and operational power state do not establish asset identity",
+    }
+
+
+def _psu_bay_part(part, owner, slot):
+    return (
+        part["name"] == "PowerSupply%d/%s" % (owner["position"], slot)
+        and part["parent"] == "Switch%d" % owner["position"]
+        and part["location"] == "%d/0/%s/0" % (owner["position"], slot)
+        and part["platform_type"] == "comp-power-supply"
+    )
+
+
+def _collect_power_supplies(result, flat, platform, pairs, owners, *, use_ntc_defaults):
+    """Separate documented chassis bay existence from serialized PSU identity."""
+    handled = set()
+    for owner in owners.values():
+        if psu_profiles.family_for_chassis(owner["model"]) is None:
+            continue
+        for slot in ("A", "B"):
+            part = next((part for part in platform if _psu_bay_part(part, owner, slot)), None)
+            source = {
+                "documentation": {
+                    "method": "reviewed-profile",
+                    "profile": psu_profiles.PROFILE,
+                    "documentation": psu_profiles.OVERVIEW_URL,
+                    "section": "Switch Models and Power Supply Modules: two internal supply slots",
+                    "meaning": "Physical bay exists independently of the identity of its occupant",
+                },
+                "bay_labels": {
+                    "method": "reviewed-profile",
+                    "profile": psu_profiles.PROFILE,
+                    "documentation": psu_profiles.BAY_LABELS_URL,
+                    "section": "StackPower verification: PSU slot A/B naming",
+                    "meaning": "A is the left PSU slot; B is the right slot at the chassis edge",
+                },
+                "identity": deepcopy(owner["identity_source"]),
+            }
+            if owner["membership_source"]:
+                source["membership"] = deepcopy(owner["membership_source"])
+            if part:
+                source["observations"] = _placement_source(part, profile=psu_profiles.PROFILE)
+            result["physical_bays"].append(
+                {
+                    "key": "psu:%d/%s" % (owner["position"], slot),
+                    "device_serial": owner["serial"],
+                    "member": owner["position"],
+                    "chassis_model": owner["model"],
+                    "bay": psu_profiles.bay(slot),
+                    "source": source,
+                    "observations": _psu_observations(part),
+                }
+            )
+    for fact in flat:
+        if fact["hw_type"] != "hw-type-pem" and fact["model"] not in psu_profiles.PSU_CONNECTORS:
+            continue
+        if fact["model"] in CATALOG and CATALOG[fact["model"]][1] != fact["hw_type"]:
+            raise ComponentDiscoveryError(
+                "Reviewed serialized part has contradictory hardware classification"
+            )
+        unresolved = {**fact, "source": {"identity": _identity_source(fact)}}
+        named = re.fullmatch(r"Switch (\d+) - Power Supply ([AB])", fact["name"] or "")
+        owner = owners.get(int(named.group(1))) if named else None
+        slot = named.group(2) if named else None
+        if not fact["model"] or not fact["serial"]:
+            reason = "Serialized component model or serial number is unavailable"
+        elif owner is None or not psu_profiles.supported_psu(owner["model"], fact["model"]):
+            reason = "Serialized PSU part or chassis has no reviewed component profile"
+        else:
+            if (
+                fact["hw_type"] != "hw-type-pem"
+                or fact["hardware_class"] != "hw-class-physical"
+                or fact["field_replaceable"] is not True
+            ):
+                raise ComponentDiscoveryError(
+                    "Reviewed serialized part has contradictory hardware classification"
+                )
+            if pairs[(fact["model"], fact["serial"])] != 1:
+                raise ComponentDiscoveryError(
+                    "Reviewed serialized identity occurs in multiple inventory entries"
+                )
+            matches = [
+                part
+                for part in platform
+                if (part["model"], part["serial"]) == (fact["model"], fact["serial"])
+            ]
+            if len(matches) > 1:
+                raise ComponentDiscoveryError(
+                    "Serialized identity matches multiple platform components"
+                )
+            if not matches:
+                expected = next(
+                    (
+                        part
+                        for part in platform
+                        if part["name"] == "PowerSupply%d/%s" % (owner["position"], slot)
+                    ),
+                    None,
+                )
+                if expected and expected["model"] and expected["serial"]:
+                    raise ComponentDiscoveryError(
+                        "Serialized inventory and platform identities disagree at a reviewed bay"
+                    )
+                reason = "No unique platform identity match establishes component placement"
+            elif owner["root"] is None:
+                reason = "Platform chassis identity is unavailable for parent validation"
+            else:
+                part = matches[0]
+                handled.add(part["name"])
+                unresolved["observations"] = part
+                unresolved["source"]["placement"] = _placement_source(
+                    part, profile=psu_profiles.PROFILE
+                )
+                if not _psu_bay_part(part, owner, slot):
+                    reason = "Power-supply placement does not match the verified member and bay"
+                elif part["empty"] is not False or part["removable"] is not True:
+                    reason = "Serialized component presence/removability needs review"
+                else:
+                    power_port = psu_profiles.power_port(fact["model"])
+                    if use_ntc_defaults:
+                        power_port["power_factor"] = "0.95"
+                        power_port["source"]["inference"] = {
+                            "policy": "ntc-power-factor-default",
+                            "value": "0.95",
+                            "source": (
+                                "https://github.com/nautobot/nautobot/blob/v3.2.5/nautobot/"
+                                "dcim/models/device_components.py"
+                            ),
+                            "meaning": (
+                                "Nautobot model default; not a measured or documented PSU value"
+                            ),
+                        }
+                    result["items"].append(
+                        {
+                            "key": "psu:%d/%s" % (owner["position"], slot),
+                            "kind": "power-supply",
+                            "manufacturer": "Cisco",
+                            "model": fact["model"],
+                            "part_number": fact["model"],
+                            "serial": fact["serial"],
+                            "hardware_revision": fact["hardware_revision"]
+                            or part["hardware_revision"],
+                            "device_serial": owner["serial"],
+                            "member": owner["position"],
+                            "bay": psu_profiles.bay(slot),
+                            "parent_key": None,
+                            "interfaces": [],
+                            "power_ports": [power_port],
+                            "source": {
+                                "identity": _identity_source(fact),
+                                "placement": _placement_source(part, profile=psu_profiles.PROFILE),
+                                "ownership": {
+                                    "method": "reviewed-profile",
+                                    "profile": psu_profiles.PROFILE,
+                                    "rule": "Power supply has no network interfaces",
+                                    "device_serial": owner["serial"],
+                                    "member": owner["position"],
+                                },
+                            },
+                            "observations": part,
+                        }
+                    )
+                    continue
+        result["unresolved"].append({**unresolved, "reason": reason})
+    return handled
+
+
+def collect(
+    client,
+    inventory,
+    *,
+    chassis_model,
+    chassis_serial,
+    member,
+    interfaces,
+    warnings,
+    stack=None,
+    use_ntc_defaults=False,
+):
     """Return reviewed items and visible unresolved/excluded observations."""
-    result = {"schema_version": 1, "items": [], "unresolved": [], "excluded": []}
+    result = {
+        "schema_version": 1,
+        "items": [],
+        "physical_bays": [],
+        "unresolved": [],
+        "excluded": [],
+    }
     flat = []
     for row in inventory:
         fact = _flat_fact(row)
@@ -231,6 +754,18 @@ def collect(client, inventory, *, chassis_model, chassis_serial, member, interfa
         raise ComponentDiscoveryError("Platform components reply must be a structured container")
     else:
         platform = [_platform_fact(row) for row in _rows(_value(container, "component"))]
+    for part in platform:
+        for error in part.get("platform_property_errors", []):
+            result["unresolved"].append(
+                {
+                    "name": part["name"],
+                    "model": part["model"],
+                    "serial": part["serial"],
+                    "property": error.get("property"),
+                    "reason": "Optional operational property skipped: " + error["reason"],
+                    "source": {"observation": deepcopy(error["source"])},
+                }
+            )
     names = Counter(fact["name"] for fact in platform)
     if any(count > 1 for count in names.values()):
         raise ComponentDiscoveryError("Platform component names are ambiguous")
@@ -241,10 +776,35 @@ def collect(client, inventory, *, chassis_model, chassis_serial, member, interfa
     pairs = Counter(
         (fact["model"], fact["serial"]) for fact in flat if fact["model"] and fact["serial"]
     )
-    handled_platform_names = set()
+    owners = _psu_owners(
+        inventory,
+        platform,
+        chassis_model=chassis_model,
+        chassis_serial=chassis_serial,
+        member=member,
+        stack=stack,
+    )
+    handled_platform_names = _collect_power_supplies(
+        result,
+        flat,
+        platform,
+        pairs,
+        owners,
+        use_ntc_defaults=use_ntc_defaults,
+    )
+    is_stack = bool(stack and stack.get("is_stack"))
     for fact in flat:
+        if fact["hw_type"] == "hw-type-pem" or fact["model"] in psu_profiles.PSU_CONNECTORS:
+            continue
+        if fact["hw_type"] == "hw-type-transceiver":
+            continue
         unresolved = {**fact, "source": {"identity": _identity_source(fact)}}
-        if not fact["model"] or not fact["serial"]:
+        if is_stack:
+            reason = (
+                "Non-PSU serialized component placement on stack members "
+                "requires a reviewed profile"
+            )
+        elif not fact["model"] or not fact["serial"]:
             reason = "Serialized component model or serial number is unavailable"
         elif chassis_model != "C9300-48UXM" or fact["model"] not in CATALOG:
             reason = "Serialized part or chassis has no reviewed component profile"
@@ -344,6 +904,29 @@ def collect(client, inventory, *, chassis_model, chassis_serial, member, interfa
                     )
                     continue
         result["unresolved"].append({**unresolved, "reason": reason})
+    if is_stack:
+        result["unresolved"].extend(
+            {
+                **fact,
+                "source": {"identity": _identity_source(fact)},
+                "reason": "Transceiver placement on stack members requires a reviewed profile",
+            }
+            for fact in flat
+            if fact["hw_type"] == "hw-type-transceiver"
+        )
+    else:
+        handled_platform_names.update(
+            _collect_transceivers(
+                result,
+                flat,
+                platform,
+                pairs,
+                root,
+                chassis_model=chassis_model,
+                member=member,
+                interfaces=interfaces,
+            )
+        )
     flat_pairs = {
         (fact["model"], fact["serial"]) for fact in flat if fact["model"] and fact["serial"]
     }
@@ -351,7 +934,7 @@ def collect(client, inventory, *, chassis_model, chassis_serial, member, interfa
         if part["name"] in handled_platform_names:
             continue
         if part["model"] and part["serial"]:
-            if part["name"] == expected_root:
+            if part["name"] in {"Switch%d" % position for position in owners}:
                 continue
             if (
                 chassis_model == "C9300-48UXM"
@@ -380,12 +963,16 @@ def collect(client, inventory, *, chassis_model, chassis_serial, member, interfa
                     **part,
                     "source": {"placement": _placement_source(part)},
                     "reason": (
-                        "Component identity is unavailable; presence or occupancy "
+                        "PSU serialized identity is unavailable; occupancy is retained from empty "
+                        "and asset identity is not inferred from operational power state"
+                        if part["platform_type"] == "comp-power-supply"
+                        else "Component identity is unavailable; presence or occupancy "
                         "is not inferred from operational state"
                     ),
                 }
             )
     result["items"].sort(key=lambda item: item["key"])
+    result["physical_bays"].sort(key=lambda item: item["key"])
     for collection in ("unresolved", "excluded"):
         result[collection].sort(
             key=lambda item: (
@@ -401,8 +988,13 @@ def collect(client, inventory, *, chassis_model, chassis_serial, member, interfa
 
 def add_revisions(components, modules):
     """Annotate provenance after the shared YANG-library evidence read."""
-    for collection in ("items", "unresolved", "excluded"):
-        for item in components[collection]:
+    for collection in ("items", "physical_bays", "unresolved", "excluded"):
+        for item in components.get(collection, []):
             for source in item.get("source", {}).values():
                 if isinstance(source, dict) and source.get("module"):
                     source["revision"] = modules.get(source["module"])
+            observations = item.get("observations", {})
+            for prop in observations.get("platform_properties", []):
+                prop["source"]["revision"] = modules.get(prop["source"]["module"])
+            for error in observations.get("platform_property_errors", []):
+                error["source"]["revision"] = modules.get(error["source"]["module"])

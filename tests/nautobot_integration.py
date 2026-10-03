@@ -381,12 +381,22 @@ def run(device_id=None):
     from jobs.discovery_job import DiscoverDevice
     from jobs.nautobot_inventory import apply_discovery, snapshot_inventory, validate_plan
     from jobs.reconcile import build_plan
+    from tests.nautobot_access_integration import catalog_counts as access_catalog_counts
+    from tests.nautobot_access_integration import run as verify_access_inventory
     from tests.nautobot_components_integration import (
         catalog_counts,
     )
     from tests.nautobot_components_integration import (
         run as verify_component_inventory,
     )
+    from tests.nautobot_ipam_integration import catalog_counts as ipam_catalog_counts
+    from tests.nautobot_ipam_integration import run as verify_ipam_inventory
+    from tests.nautobot_power_integration import catalog_counts as power_catalog_counts
+    from tests.nautobot_power_integration import run as verify_power_inventory
+    from tests.nautobot_stack_integration import catalog_counts as stack_catalog_counts
+    from tests.nautobot_stack_integration import run as verify_stack_inventory
+    from tests.nautobot_stack_power_integration import run as verify_stack_power_inventory
+    from tests.nautobot_transceiver_integration import run as verify_transceiver_inventory
     from tests.nautobot_vlan_integration import catalog_counts as vlan_catalog_counts
     from tests.nautobot_vlan_integration import run as verify_vlan_inventory
 
@@ -398,6 +408,10 @@ def run(device_id=None):
     initial_version_count = SoftwareVersion.objects.count()
     initial_component_catalog_counts = catalog_counts()
     initial_vlan_catalog_counts = vlan_catalog_counts()
+    initial_access_catalog_counts = access_catalog_counts()
+    initial_stack_catalog_counts = stack_catalog_counts()
+    initial_ipam_catalog_counts = ipam_catalog_counts()
+    initial_power_catalog_counts = power_catalog_counts()
     interface_status = Status.objects.filter(
         name="Active", content_types=ContentType.objects.get_for_model(Interface)
     ).first()
@@ -408,6 +422,13 @@ def run(device_id=None):
     assert form["dryrun"].value() is True, "The rendered Job must default to a preview"
     checks.append("Nautobot recognizes the dryrun field and renders it enabled by default")
     assert form["use_ntc_defaults"].value() is False
+    assert form["ipam_namespace"].value() is None
+    assert form["ipam_override_rfc1918"].value() is True
+    assert form["ipam_group_user_vrfs"].value() is False
+    assert form["ipam_local_vrf_names"].value() == "Mgmt-vrf"
+    checks.append(
+        "IPAM form is report-only by default with RFC1918 override and local Mgmt-vrf controls"
+    )
     assert form.fields["use_ntc_defaults"].label == "Use NTC defaults when guessing"
     assert "uncertain values blank" in form.fields["use_ntc_defaults"].help_text
     checks.append(
@@ -563,6 +584,12 @@ def run(device_id=None):
             _verify_lag_relationships(device, interface_status, checks)
             verify_component_inventory(device, interface_status, checks)
             verify_vlan_inventory(device, interface_status, checks)
+            verify_access_inventory(device, interface_status, checks)
+            verify_transceiver_inventory(device, interface_status, checks)
+            verify_stack_inventory(device, interface_status, checks)
+            verify_ipam_inventory(device, interface_status, checks)
+            verify_power_inventory(device, interface_status, checks)
+            verify_stack_power_inventory(device, interface_status, checks)
         finally:
             transaction.set_rollback(True)
 
@@ -571,6 +598,10 @@ def run(device_id=None):
     assert SoftwareVersion.objects.count() == initial_version_count
     assert catalog_counts() == initial_component_catalog_counts
     assert vlan_catalog_counts() == initial_vlan_catalog_counts
+    assert access_catalog_counts() == initial_access_catalog_counts
+    assert stack_catalog_counts() == initial_stack_catalog_counts
+    assert ipam_catalog_counts() == initial_ipam_catalog_counts
+    assert power_catalog_counts() == initial_power_catalog_counts
     checks.append("outer rollback restores original lab inventory and catalog counts")
     return {"device_id": str(device.pk), "passed": True, "checks": checks, "persistent_changes": 0}
 

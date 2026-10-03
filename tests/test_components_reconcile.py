@@ -37,6 +37,23 @@ def discovery(*items):
     }
 
 
+def reported_manufacturer_item(**values):
+    manufacturer = values.get("manufacturer", "CISCO-EQUIV")
+    return item(
+        manufacturer=manufacturer,
+        source={
+            "manufacturer": {
+                "module": "Cisco-IOS-XE-platform-oper",
+                "path": "/data/Cisco-IOS-XE-platform-oper:components",
+                "field": "state/mfg-name",
+                "component": "GigabitEthernet1/1/1",
+                "value": manufacturer,
+            }
+        },
+        **{key: value for key, value in values.items() if key != "manufacturer"},
+    )
+
+
 def inventory():
     return {
         "device": {"id": "device-1"},
@@ -83,8 +100,66 @@ def installed(before, *, serial="LABMODULE001", module_id="module-1", bay_name="
     return before
 
 
+def psu_item(**values):
+    return item(
+        **{
+            "key": "psu:1/B",
+            "kind": "psu",
+            "model": "PWR-C1-1100WAC-P",
+            "part_number": "PWR-C1-1100WAC-P",
+            "serial": "LABPSU001",
+            "device_serial": "LABCHASSIS001",
+            "member": 1,
+            "bay": {"name": "Power Supply B", "position": "PSU-B", "label": "B"},
+            "interfaces": [],
+            "power_ports": [
+                {
+                    "name": "Power Input",
+                    "type": "iec-60320-c16",
+                    "maximum_draw": None,
+                    "allocated_draw": None,
+                    "power_factor": "0.95",
+                    "source": {
+                        "inference": {"policy": "ntc-power-factor-default", "value": "0.95"}
+                    },
+                }
+            ],
+            **values,
+        }
+    )
+
+
+def physical_psu_bay(slot="B", *, serial="LABCHASSIS001", member=1, **values):
+    return {
+        "key": "psu:%s/%s" % (member, slot),
+        "device_serial": serial,
+        "member": member,
+        "chassis_model": "C9300-48UXM",
+        "bay": {"name": "Power Supply " + slot, "position": "PSU-" + slot, "label": slot},
+        "source": {"documentation": "Reviewed PSU slot documentation"},
+        "observations": {
+            "reported_presence": "reported-nonempty",
+            "empty": False,
+            "oper_status": "no-input",
+        },
+        **values,
+    }
+
+
+def psu_inventory():
+    before = inventory()
+    before["device"].update(serial="LABCHASSIS001", model="C9300-48UXM")
+    return before
+
+
 def apply_to_snapshot(plan, before):
     after = deepcopy(before)
+    manufacturer_ids = {}
+    for row in plan.get("manufacturers", []):
+        manufacturer_ids[row["key"]] = "created-manufacturer-" + row["key"]
+        after["components"]["manufacturers"].append(
+            {"id": manufacturer_ids[row["key"]], "name": row["name"]}
+        )
     type_ids, module_ids, bay_ids = {}, {}, {}
     for row in plan["module_types"]:
         type_ids[row["key"]] = row["id"] or "created-type-" + row["key"]
@@ -92,7 +167,8 @@ def apply_to_snapshot(plan, before):
             after["components"]["module_types"].append(
                 {
                     "id": type_ids[row["key"]],
-                    "manufacturer_id": row["manufacturer_id"],
+                    "manufacturer_id": row["manufacturer_id"]
+                    or manufacturer_ids[row["manufacturer_key"]],
                     "model": row["model"],
                     "part_number": row["part_number"],
                 }
@@ -111,7 +187,10 @@ def apply_to_snapshot(plan, before):
             after["components"]["module_bays"].append(
                 {
                     "id": bay_ids[row["key"]],
-                    "parent_device_id": after["device"]["id"],
+                    "parent_device_id": row.get("device_id")
+                    or "created-device-" + row["device_serial"]
+                    if row.get("device_serial")
+                    else after["device"]["id"],
                     "parent_module_id": module_ids.get(row["parent_key"]),
                     "name": row["name"],
                     "position": row["position"],
@@ -133,7 +212,9 @@ def apply_to_snapshot(plan, before):
                     "serial": row["serial"],
                     "parent_module_bay_id": bay_ids[row["bay_key"]],
                     "location_id": None,
-                    "device_id": after["device"]["id"],
+                    "device_id": row.get("device_id") or "created-device-" + row["device_serial"]
+                    if row.get("device_serial")
+                    else after["device"]["id"],
                 }
             )
         else:
@@ -145,6 +226,27 @@ def apply_to_snapshot(plan, before):
     for row in plan["interface_assignments"]:
         existing = next(value for value in after["interfaces"] if value["id"] == row["id"])
         existing["module_id"] = module_ids[row["module_key"]]
+    for row in plan.get("power_ports", []):
+        if row["create"]:
+            after["components"].setdefault("power_ports", []).append(
+                {
+                    "id": "created-power-" + row["key"],
+                    "module_id": module_ids[row["module_key"]],
+                    "device_id": row.get("device_id") or after["device"]["id"],
+                    "name": row["name"],
+                    "cable_id": None,
+                    **{
+                        field: row.get(field)
+                        for field in ("type", "maximum_draw", "allocated_draw", "power_factor")
+                    },
+                }
+            )
+        else:
+            port = next(
+                value for value in after["components"]["power_ports"] if value["id"] == row["id"]
+            )
+            for change in row["changes"]:
+                port[change["field"]] = change["after"]
     return after
 
 
@@ -441,6 +543,73 @@ class ComponentReconciliationTests(unittest.TestCase):
         self.assertTrue(plan["errors"])
         self.assertFalse(plan["module_types"])
 
+    def test_reported_manufacturer_is_created_and_repeat_reuses_it(self):
+        before = inventory()
+        observed = discovery(reported_manufacturer_item())
+        plan = planner.plan_components(observed, before)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["summary"]["manufacturers_created"], 1)
+        self.assertEqual(plan["manufacturers"][0]["name"], "CISCO-EQUIV")
+        self.assertIsNone(plan["module_types"][0]["manufacturer_id"])
+        after = apply_to_snapshot(plan, before)
+        repeat = planner.plan_components(observed, after)
+        self.assertFalse(repeat["errors"])
+        self.assertFalse(repeat["manufacturers"])
+        self.assertTrue(all(count == 0 for count in repeat["summary"].values()))
+
+    def test_reported_manufacturer_is_created_once_for_multiple_assets(self):
+        first = reported_manufacturer_item(interfaces=[])
+        second = reported_manufacturer_item(
+            key="uplink:1/2", serial="LABMODULE002", bay={"name": "Uplink Module 2"}, interfaces=[]
+        )
+        plan = planner.plan_components(discovery(first, second), inventory())
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["summary"]["manufacturers_created"], 1)
+        self.assertEqual(plan["summary"]["module_types_created"], 1)
+        self.assertEqual(plan["summary"]["modules_created"], 2)
+
+    def test_manufacturer_source_must_match_the_exact_reported_name_and_leaf(self):
+        for field, value in (
+            ("value", "Cisco"),
+            ("field", "state/description"),
+            ("component", None),
+        ):
+            with self.subTest(field=field):
+                part = reported_manufacturer_item()
+                part["source"]["manufacturer"][field] = value
+                plan = planner.plan_components(discovery(part), inventory())
+                self.assertTrue(plan["errors"])
+                self.assertFalse(plan["manufacturers"])
+                self.assertFalse(plan["modules"])
+
+    def test_existing_manufacturer_spelling_and_description_are_preserved(self):
+        before = inventory()
+        before["components"]["manufacturers"].append(
+            {"id": "equiv-1", "name": "Cisco-Equiv", "description": "Operator catalog name"}
+        )
+        plan = planner.plan_components(discovery(reported_manufacturer_item()), before)
+        self.assertFalse(plan["errors"])
+        self.assertFalse(plan["manufacturers"])
+        self.assertEqual(plan["module_types"][0]["manufacturer_id"], "equiv-1")
+
+    def test_ambiguous_manufacturer_names_block_even_with_source_evidence(self):
+        before = inventory()
+        before["components"]["manufacturers"].extend(
+            [{"id": "equiv-1", "name": "CISCO-EQUIV"}, {"id": "equiv-2", "name": "cisco-equiv"}]
+        )
+        plan = planner.plan_components(discovery(reported_manufacturer_item()), before)
+        self.assertTrue(plan["errors"])
+        self.assertFalse(plan["manufacturers"])
+        self.assertFalse(plan["modules"])
+
+    def test_blocked_occupied_bay_does_not_create_orphan_manufacturer(self):
+        before = installed(inventory())
+        plan = planner.plan_components(discovery(reported_manufacturer_item()), before)
+        self.assertFalse(plan["errors"])
+        self.assertTrue(plan["conflicts"])
+        self.assertFalse(plan["manufacturers"])
+        self.assertFalse(plan["module_types"])
+
     def test_populated_catalog_identity_is_not_changed(self):
         before = installed(inventory())
         before["components"]["module_types"][0]["part_number"] = "OPERATOR-PID"
@@ -473,6 +642,20 @@ class ComponentReconciliationTests(unittest.TestCase):
     def test_missing_feature_does_not_claim_existing_components_disappeared(self):
         self.assertFalse(planner.plan_components({}, installed(inventory()))["missing_modules"])
 
+    def test_deferred_stack_placement_does_not_claim_modules_disappeared(self):
+        observed = discovery()
+        observed["components"].update(
+            writes_deferred_reason="Member placement requires review",
+            unresolved=[{"name": "Switch 2 PSU B", "reason": "Member placement requires review"}],
+        )
+        plan = planner.plan_components(observed, installed(inventory()))
+        self.assertFalse(plan["errors"])
+        self.assertFalse(plan["missing_modules"])
+        self.assertFalse(plan["modules"])
+        self.assertEqual(plan["summary"]["unresolved_components"], 1)
+        observed["components"]["items"] = [item()]
+        self.assertTrue(planner.plan_components(observed, installed(inventory()))["errors"])
+
     def test_unsupported_runtime_and_adapter_unresolved_evidence_are_visible(self):
         before = inventory()
         before["components"]["supported"] = False
@@ -483,6 +666,305 @@ class ComponentReconciliationTests(unittest.TestCase):
         self.assertFalse(plan["errors"])
         self.assertEqual(plan["summary"]["unresolved_components"], 2)
         self.assertEqual(plan["excluded"], observed["components"]["excluded"])
+
+
+class PsuStructureReconciliationTests(unittest.TestCase):
+    def test_independent_bays_exist_without_serialized_assets(self):
+        observed = discovery()
+        observed["components"]["physical_bays"] = [physical_psu_bay("A"), physical_psu_bay("B")]
+        before = psu_inventory()
+        first = planner.plan_components(observed, before)
+        self.assertFalse(first["errors"])
+        self.assertEqual(first["summary"]["module_bays_created"], 2)
+        self.assertFalse(first["modules"])
+        repeat = planner.plan_components(observed, apply_to_snapshot(first, before))
+        self.assertTrue(all(value == 0 for value in repeat["summary"].values()))
+
+    def test_serialized_psu_and_physical_slot_share_one_bay(self):
+        observed = discovery(psu_item())
+        observed["components"]["physical_bays"] = [physical_psu_bay("A"), physical_psu_bay("B")]
+        before = psu_inventory()
+        first = planner.plan_components(observed, before)
+        self.assertFalse(first["errors"])
+        self.assertEqual(first["summary"]["module_bays_created"], 2)
+        self.assertEqual(first["summary"]["modules_created"], 1)
+        self.assertEqual(first["summary"]["power_ports_created"], 1)
+        self.assertEqual(first["summary"]["power_ports_inferred"], 1)
+        repeat = planner.plan_components(observed, apply_to_snapshot(first, before))
+        self.assertFalse(repeat["errors"])
+        self.assertTrue(all(value == 0 for value in repeat["summary"].values()))
+
+    def test_unknown_power_factor_defers_only_new_inlet(self):
+        part = psu_item()
+        part["power_ports"][0].update(
+            power_factor=None, source={"documentation": "Connector specification"}
+        )
+        plan = planner.plan_components(discovery(part), psu_inventory())
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["summary"]["modules_created"], 1)
+        self.assertEqual(plan["summary"]["module_bays_created"], 1)
+        self.assertFalse(plan["power_ports"])
+        self.assertIn("power factor", plan["unresolved"][0]["reason"])
+
+    def test_documented_connector_and_input_draw_fill_existing_inlet(self):
+        part = psu_item()
+        first = planner.plan_components(discovery(part), psu_inventory())
+        before = apply_to_snapshot(first, psu_inventory())
+        port = before["components"]["power_ports"][0]
+        port.update(
+            name="Operator inlet",
+            type="",
+            maximum_draw=None,
+            allocated_draw=300,
+            power_factor=0.98,
+            cable_id="cable-1",
+        )
+        part["power_ports"][0].update(
+            maximum_draw=1215, power_factor=None, source={"documentation": "Input specification"}
+        )
+        original = deepcopy(before)
+        plan = planner.plan_components(discovery(part), before)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["summary"]["power_ports_created"], 0)
+        self.assertEqual(plan["power_ports"][0]["name"], "Operator inlet")
+        self.assertEqual(
+            {row["field"] for row in plan["power_ports"][0]["changes"]}, {"type", "maximum_draw"}
+        )
+        self.assertEqual(plan["power_ports"][0]["power_factor"], 0.98)
+        self.assertEqual(before, original)
+        after = apply_to_snapshot(plan, before)
+        self.assertEqual(after["components"]["power_ports"][0]["cable_id"], "cable-1")
+
+    def test_populated_power_metadata_and_cable_are_preserved(self):
+        part = psu_item()
+        before = apply_to_snapshot(
+            planner.plan_components(discovery(part), psu_inventory()), psu_inventory()
+        )
+        before["components"]["power_ports"][0].update(
+            type="iec-60320-c14",
+            maximum_draw=999,
+            allocated_draw=300,
+            power_factor=0.99,
+            cable_id="cable-1",
+        )
+        part["power_ports"][0].update(maximum_draw=1215, allocated_draw=200)
+        plan = planner.plan_components(discovery(part), before)
+        self.assertFalse(plan["power_ports"][0]["changes"])
+        self.assertEqual(
+            {row["field"] for row in plan["conflicts"]},
+            {"type", "maximum_draw", "allocated_draw", "power_factor"},
+        )
+        self.assertEqual(plan["summary"]["power_ports_inferred"], 0)
+
+    def test_unique_operator_bay_name_is_adopted_by_documented_position(self):
+        before = psu_inventory()
+        before["components"]["module_bays"] = [
+            {
+                "id": "bay-1",
+                "parent_device_id": "device-1",
+                "parent_module_id": None,
+                "name": "Operator PSU B",
+                "position": "PSU-B",
+                "label": "Operator",
+            }
+        ]
+        observed = discovery(psu_item())
+        observed["components"]["physical_bays"] = [physical_psu_bay()]
+        plan = planner.plan_components(observed, before)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["bays"][0]["id"], "bay-1")
+        self.assertEqual(plan["bays"][0]["name"], "Operator PSU B")
+        self.assertEqual(plan["summary"]["module_bays_created"], 0)
+        self.assertIn("name", {row["field"] for row in plan["conflicts"]})
+
+    def test_ambiguous_existing_slot_positions_are_not_guessed(self):
+        before = psu_inventory()
+        before["components"]["module_bays"] = [
+            {
+                "id": "bay-" + str(index),
+                "parent_device_id": "device-1",
+                "parent_module_id": None,
+                "name": "Operator " + str(index),
+                "position": "PSU-B",
+                "label": "",
+            }
+            for index in (1, 2)
+        ]
+        observed = discovery(psu_item())
+        observed["components"]["physical_bays"] = [physical_psu_bay()]
+        plan = planner.plan_components(observed, before)
+        self.assertTrue(plan["errors"])
+        self.assertFalse(plan["bays"])
+        self.assertFalse(plan["modules"])
+
+    def test_unidentified_nonempty_psu_preserves_manual_module_and_inlet(self):
+        part = psu_item(key="psu:1/A", bay=physical_psu_bay("A")["bay"])
+        before = apply_to_snapshot(
+            planner.plan_components(discovery(part), psu_inventory()), psu_inventory()
+        )
+        before["components"]["power_ports"][0]["cable_id"] = "manual-cable"
+        observed = discovery()
+        observed["components"].update(
+            physical_bays=[physical_psu_bay("A")],
+            unresolved=[{"key": "psu:1/A", "reason": "Source has no part number or serial"}],
+        )
+        original = deepcopy(before)
+        plan = planner.plan_components(observed, before)
+        self.assertFalse(plan["errors"])
+        self.assertFalse(plan["modules"])
+        self.assertFalse(plan["power_ports"])
+        self.assertIn("reported nonempty", plan["missing_modules"][0]["reason"])
+        self.assertEqual(before, original)
+
+    def test_named_stack_members_resolve_to_validated_device_owners(self):
+        before = psu_inventory()
+        second = psu_item(
+            key="psu:2/B", serial="LABPSU002", device_serial="LABCHASSIS002", member=2
+        )
+        observed = discovery(psu_item(), second)
+        observed["components"]["physical_bays"] = [
+            physical_psu_bay(),
+            physical_psu_bay(serial="LABCHASSIS002", member=2),
+        ]
+        stack = {
+            "errors": [],
+            "members": [
+                {
+                    "position": 1,
+                    "serial": "LABCHASSIS001",
+                    "model": "C9300-48UXM",
+                    "existing_id": "device-1",
+                    "create": False,
+                },
+                {
+                    "position": 2,
+                    "serial": "LABCHASSIS002",
+                    "model": "C9300-48UXM",
+                    "existing_id": "device-2",
+                    "create": False,
+                },
+            ],
+        }
+        plan = planner.plan_components(observed, before, stack_plan=stack)
+        self.assertFalse(plan["errors"])
+        self.assertEqual({row["device_id"] for row in plan["bays"]}, {"device-1", "device-2"})
+        self.assertEqual(
+            {row["device_id"] for row in plan["power_ports"]}, {"device-1", "device-2"}
+        )
+        repeat = planner.plan_components(
+            observed, apply_to_snapshot(plan, before), stack_plan=stack
+        )
+        self.assertFalse(repeat["errors"])
+        self.assertTrue(all(value == 0 for value in repeat["summary"].values()))
+        stack["members"][1].update(existing_id=None, create=True)
+        new_plan = planner.plan_components(observed, before, stack_plan=stack)
+        second_module = next(
+            row for row in new_plan["modules"] if row["device_serial"] == "LABCHASSIS002"
+        )
+        self.assertIsNone(second_module["device_id"])
+        self.assertEqual(second_module["member_position"], 2)
+
+    def test_unknown_or_unvalidated_member_owners_are_rejected(self):
+        part = psu_item(device_serial="LABCHASSIS002", member=2)
+        before = psu_inventory()
+        before["components"]["devices"] = [{"id": "device-2", "serial": "LABCHASSIS002"}]
+        for stack in (
+            None,
+            {"errors": ["Invalid membership"], "members": [{"serial": "LABCHASSIS002"}]},
+        ):
+            plan = planner.plan_components(discovery(part), before, stack_plan=stack)
+            self.assertTrue(plan["errors"])
+            self.assertFalse(plan["modules"])
+
+    def test_invalid_and_duplicate_bay_evidence_is_rejected(self):
+        for bays in (
+            [physical_psu_bay(), physical_psu_bay()],
+            [physical_psu_bay(source={})],
+            [physical_psu_bay(chassis_model="OTHER")],
+            [physical_psu_bay(member=True)],
+            [
+                physical_psu_bay(),
+                physical_psu_bay(key="other", bay={"name": "Alias", "position": "PSU-B"}),
+            ],
+        ):
+            observed = discovery()
+            observed["components"]["physical_bays"] = bays
+            self.assertTrue(planner.plan_components(observed, psu_inventory())["errors"])
+
+    def test_invalid_and_duplicate_power_inlet_claims_are_rejected(self):
+        for field, value in (
+            ("power_factor", None),
+            ("power_factor", "NaN"),
+            ("power_factor", 0),
+            ("power_factor", 1.5),
+            ("power_factor", True),
+            ("maximum_draw", True),
+            ("maximum_draw", -1),
+            ("type", {}),
+        ):
+            if value is None:
+                continue
+            part = psu_item()
+            part["power_ports"][0][field] = value
+            plan = planner.plan_components(discovery(part), psu_inventory())
+            self.assertTrue(plan["errors"])
+            self.assertFalse(plan["power_ports"])
+        part = psu_item()
+        part["power_ports"].append(deepcopy(part["power_ports"][0]))
+        self.assertTrue(planner.plan_components(discovery(part), psu_inventory())["errors"])
+
+    def test_incompatible_module_family_blocks_asset_placement(self):
+        part = psu_item()
+        before = psu_inventory()
+        before["components"]["module_bays"] = [
+            {
+                "id": "bay-1",
+                "parent_device_id": "device-1",
+                "parent_module_id": None,
+                "name": "Power Supply B",
+                "position": "PSU-B",
+                "label": "B",
+                "module_family_id": "operator-family",
+            }
+        ]
+        plan = planner.plan_components(discovery(part), before)
+        self.assertTrue(plan["errors"])
+        self.assertFalse(plan["modules"])
+
+    def test_module_type_template_conflict_is_preserved_and_reported(self):
+        part = psu_item()
+        before = psu_inventory()
+        before["components"]["module_types"] = [
+            {
+                "id": "type-psu",
+                "manufacturer_id": "manufacturer-1",
+                "model": part["model"],
+                "part_number": part["part_number"],
+                "power_port_templates": [
+                    {
+                        "name": "Catalog Input",
+                        "type": "iec-60320-c14",
+                        "maximum_draw": None,
+                        "allocated_draw": None,
+                        "power_factor": 0.95,
+                    }
+                ],
+            }
+        ]
+        plan = planner.plan_components(discovery(part), before)
+        self.assertFalse(plan["errors"])
+        self.assertFalse(plan["power_ports"])
+        self.assertEqual(plan["conflicts"][0]["field"], "type")
+        before["components"]["module_types"][0]["power_port_templates"][0]["type"] = "iec-60320-c16"
+        matched = planner.plan_components(discovery(part), before)
+        self.assertEqual(matched["power_ports"][0]["name"], "Catalog Input")
+        before["components"]["module_types"][0]["power_port_templates"][0]["name"] = (
+            "Input {module}"
+        )
+        templated = planner.plan_components(discovery(part), before)
+        self.assertFalse(templated["errors"])
+        self.assertFalse(templated["power_ports"])
+        self.assertIn("template rendering", templated["unresolved"][0]["reason"])
 
 
 if __name__ == "__main__":

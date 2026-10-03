@@ -15,15 +15,17 @@ def load_discovery_job():
     """Import the job with temporary Nautobot stubs that cannot leak into other tests."""
     job_api = ModuleType("nautobot.apps.jobs")
     job_api.Job = type("Job", (), {})
-    for name in ("BooleanVar", "DryRunVar", "IntegerVar", "ObjectVar"):
+    for name in ("BooleanVar", "DryRunVar", "IntegerVar", "ObjectVar", "TextVar"):
         setattr(job_api, name, lambda **kwargs: SimpleNamespace(**kwargs))
     dcim = ModuleType("nautobot.dcim.models")
     dcim.Device = type("Device", (), {"objects": SimpleNamespace(get=Mock())})
+    dcim.Location = type("Location", (), {"objects": SimpleNamespace(get=Mock())})
     extras = ModuleType("nautobot.extras.models")
     extras.SecretsGroup = type("SecretsGroup", (), {})
     extras.Status = type("Status", (), {})
     ipam = ModuleType("nautobot.ipam.models")
     ipam.VLANGroup = type("VLANGroup", (), {})
+    ipam.Namespace = type("Namespace", (), {})
     inventory = ModuleType("jobs.nautobot_inventory")
     inventory.InventoryError = type("InventoryError", (RuntimeError,), {})
     for name in ("apply_discovery", "snapshot_inventory", "validate_plan"):
@@ -74,6 +76,9 @@ def discovery():
 CHANGE_COUNTERS = {
     "interfaces_created": (r"interfaces?", r"creat|new|add"),
     "interfaces_updated": (r"interfaces?", r"updat|enrich"),
+    "console_ports_created": (r"console ports?", r"creat|new|add"),
+    "console_ports_updated": (r"console ports?", r"updat|enrich"),
+    "management_interfaces_updated": (r"management interfaces?", r"mark"),
     "lag_memberships_updated": (r"lag|link aggregation|port-channel", r"members|updat"),
     "device_fields_updated": (r"device fields?", r"updat|fill"),
     "module_types_created": (r"(?:module|hardware) types?", r"creat|new|add"),
@@ -82,10 +87,20 @@ CHANGE_COUNTERS = {
     "module_bays_updated": (r"(?:module )?bays?", r"updat|enrich"),
     "modules_created": (r"modules?", r"creat|new|add"),
     "modules_updated": (r"modules?", r"updat|enrich"),
+    "power_ports_created": (r"power inlets?", r"creat|new|add"),
+    "power_ports_updated": (r"power inlets?", r"updat|enrich"),
     "interface_modules_updated": (r"interface", r"ownership|module|link"),
     "vlans_created": (r"vlans?", r"creat|new|add"),
     "vlans_updated": (r"vlans?", r"updat|enrich"),
     "interface_vlan_assignments_updated": (r"interface vlan assignments?", r"updat"),
+    "prefixes_created": (r"(?:networks?|prefixes)", r"creat|new|add"),
+    "ip_addresses_created": (r"ip addresses?", r"creat|new|add"),
+    "ip_assignments_created": (r"ip address assignments?", r"creat|new|add|link"),
+    "vrfs_created": (r"vrfs?", r"creat|new|add"),
+    "vrf_device_assignments_created": (r"device vrf assignments?", r"creat|new|add|link"),
+    "vrf_device_assignments_updated": (r"device vrf assignments?", r"updat|enrich|fill"),
+    "interface_vrfs_updated": (r"interface vrf assignments?", r"updat|link"),
+    "prefix_vrf_associations_created": (r"prefix vrf assignments?", r"creat|new|add|link"),
 }
 
 
@@ -102,6 +117,7 @@ def plan(**counts):
         switching_not_applicable=0,
         switching_inferred=0,
         interface_vlan_assignments_inferred=0,
+        unresolved_console_ports=0,
         blocked=False,
     )
     summary.update(counts)
@@ -179,6 +195,102 @@ class DiscoveryJobTests(unittest.TestCase):
         for name in names:
             self.assertIs(sys.modules.get(name), before[name])
         self.assertIs(getattr(package, "discovery_job", None), before_attribute)
+
+    def test_ipam_policy_and_statuses_are_forwarded_to_preview_and_atomic_apply(self):
+        namespace = SimpleNamespace(pk="namespace-1", name="Global")
+        override = SimpleNamespace(pk="namespace-2", name="Corporate")
+        location = {"id": "location-1", "name": "lab"}
+        prefix_status = object()
+        address_status = object()
+        with patch.object(self.module, "_prefix_location", return_value=(location, None)):
+            self.job.run(
+                self.device,
+                dryrun=False,
+                ipam_namespace=namespace,
+                ipam_override_namespace=override,
+                ipam_override_networks="100.64.0.0/10",
+                ipam_group_user_vrfs=True,
+                ipam_local_vrf_names="Mgmt-vrf\nLOCAL",
+                ipam_prefix_status=prefix_status,
+                ipam_ip_address_status=address_status,
+            )
+        policy = self.assert_saved_report()["ipam_policy"]
+        self.assertEqual(policy["default_namespace"]["id"], namespace.pk)
+        self.assertEqual(policy["override_namespace"]["id"], override.pk)
+        self.assertEqual(policy["override_networks"], ["100.64.0.0/10"])
+        self.assertEqual(policy["local_vrf_names"], ["LOCAL", "Mgmt-vrf"])
+        self.assertEqual(policy["location"], location)
+        self.assertEqual(self.module.snapshot_inventory.call_args.kwargs["ipam_policy"], policy)
+        self.assertEqual(self.module.apply_discovery.call_args.kwargs["ipam_policy"], policy)
+        self.assertIs(
+            self.module.validate_plan.call_args.kwargs["ipam_prefix_status"], prefix_status
+        )
+        self.assertIs(
+            self.module.apply_discovery.call_args.kwargs["ipam_ip_address_status"], address_status
+        )
+
+    def test_invalid_ipam_policy_fails_before_credentials_or_requests(self):
+        with self.assertRaises(ValueError):
+            self.job.run(self.device, ipam_override_networks="not-a-network")
+        self.module.resolve_credentials.assert_not_called()
+        self.module.RestconfClient.assert_not_called()
+        self.assertIn("error", self.assert_saved_report())
+
+    def test_prefix_location_defaults_to_site_and_rejects_unrelated_locations(self):
+        def location(identifier, type_name, depth):
+            return SimpleNamespace(
+                pk=identifier,
+                name=identifier,
+                tree_depth=depth,
+                location_type=SimpleNamespace(
+                    name=type_name,
+                    content_types=SimpleNamespace(
+                        filter=lambda **_kwargs: SimpleNamespace(
+                            exists=lambda: True,
+                        )
+                    ),
+                ),
+            )
+
+        site = location("site-1", "Site", 0)
+        room = location("room-1", "Room", 1)
+        room.ancestors = lambda **_kwargs: [site, room]
+        self.device.location = room
+        self.assertEqual(
+            self.module._prefix_location(self.device, None),
+            ({"id": "site-1", "name": "site-1"}, None),
+        )
+        unrelated = location("elsewhere", "Site", 0)
+        self.module.Location.objects.get.return_value = unrelated
+        with self.assertRaises(ValueError):
+            self.module._prefix_location(self.device, unrelated)
+
+    def test_ineligible_prefix_location_preserves_reason_for_planner(self):
+        location = SimpleNamespace(pk="lab", name="lab")
+        location.ancestors = lambda **_kwargs: [location]
+        location.location_type = SimpleNamespace(
+            name="Lab",
+            content_types=SimpleNamespace(
+                filter=lambda **_kwargs: SimpleNamespace(
+                    exists=lambda: False,
+                )
+            ),
+        )
+        self.device.location = location
+        chosen, reason = self.module._prefix_location(self.device, None)
+        self.assertIsNone(chosen)
+        self.assertIn("does not permit Prefix", reason)
+
+    def test_unresolved_ipam_is_explained_without_an_error_or_raw_evidence(self):
+        self.preview_plan["summary"]["unresolved_ipam"] = 2
+        self.preview_plan["ipam"] = {
+            "unresolved": [{"reason": "private-ipam-sentinel"}, {"reason": "missing mask"}]
+        }
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "info"))
+        self.assertIn("2 IPAM observations", messages)
+        self.assertNotIn("private-ipam-sentinel", messages)
+        self.job.logger.error.assert_not_called()
 
     def test_preview_saves_complete_report_under_advanced_and_returns_none(self):
         self.preview_plan["summary"].update(interfaces_created=2, conflicts=1)
@@ -292,6 +404,9 @@ class DiscoveryJobTests(unittest.TestCase):
             module_status=None,
             vlan_group=None,
             vlan_status=None,
+            ipam_policy=None,
+            ipam_prefix_status=None,
+            ipam_ip_address_status=None,
         )
         self.module.validate_plan.assert_called_once()
         messages = "\n".join(rendered_logs(self.job.logger)).lower()
@@ -364,6 +479,45 @@ class DiscoveryJobTests(unittest.TestCase):
         self.job.logger.error.assert_not_called()
         self.assertEqual(self.assert_saved_report()["plan"], self.preview_plan)
 
+    def test_optional_actual_source_failures_continue_without_exposing_raw_evidence(self):
+        for status in ("unsupported", "unavailable", "invalid"):
+            with self.subTest(status=status):
+                self.job.logger.reset_mock()
+                self.preview_plan["layer2"] = {
+                    "operational_source": {
+                        "status": status,
+                        "reason": "private-response-sentinel",
+                    }
+                }
+                self.job.run(self.device)
+                messages = "\n".join(rendered_logs(self.job.logger))
+                self.assertIn(status, messages)
+                self.assertIn("Preview complete", messages)
+                self.assertNotIn("private-response-sentinel", messages)
+                self.job.logger.error.assert_not_called()
+                if status == "invalid":
+                    self.assertIn("NTC mode guessing", messages)
+                self.assertEqual(
+                    self.assert_saved_report()["plan"]["layer2"]["operational_source"]["status"],
+                    status,
+                )
+
+    def test_valid_direct_probe_explains_unknown_revision_without_guessing(self):
+        self.preview_plan["layer2"] = {
+            "operational_source": {
+                "status": "available",
+                "capability_status": "unknown",
+                "probed_without_advertisement": True,
+                "revision": None,
+            }
+        }
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger))
+        self.assertIn("validated by a direct RESTCONF probe", messages)
+        self.assertIn("revision remains unknown", messages)
+        self.job.logger.warning.assert_not_called()
+        self.job.logger.error.assert_not_called()
+
     def test_known_type_conflict_identifies_the_preserved_interface(self):
         self.preview_plan["summary"].update(conflicts=1)
         self.preview_plan["conflicts"] = [
@@ -399,6 +553,15 @@ class DiscoveryJobTests(unittest.TestCase):
         self.assertNotIn("Interface Vlan2:", messages)
         self.assertEqual(self.assert_saved_report()["plan"], self.preview_plan)
 
+    def test_power_factor_inference_is_explicit_and_preview_does_not_claim_apply(self):
+        self.preview_plan["summary"].update(power_ports_created=1, power_ports_inferred=1)
+        self.job.run(self.device, use_ntc_defaults=True)
+        messages = "\n".join(rendered_logs(self.job.logger, "info"))
+        self.assertIn("Would use Nautobot's power-factor default of 0.95", messages)
+        self.assertIn("inferred value, not a measurement", messages)
+        self.assertIn("NTC defaults option explicitly permits it", messages)
+        self.assertTrue(self.assert_saved_report()["dry_run"])
+
     def test_hardware_warning_identifies_missing_identity_and_other_gaps_separately(self):
         self.preview_plan["summary"].update(unresolved_components=5)
         self.preview_plan["components"] = {
@@ -411,7 +574,10 @@ class DiscoveryJobTests(unittest.TestCase):
                     "empty": False,
                     "oper_status": "disabled" if type_ == "comp-power-supply" else "enabled",
                     "reason": (
-                        "Component identity is unavailable; presence or occupancy "
+                        "PSU serialized identity is unavailable; occupancy is retained from empty "
+                        "and asset identity is not inferred from operational power state"
+                        if type_ == "comp-power-supply"
+                        else "Component identity is unavailable; presence or occupancy "
                         "is not inferred from operational state"
                     ),
                 }
@@ -434,6 +600,24 @@ class DiscoveryJobTests(unittest.TestCase):
         self.job.logger.error.assert_not_called()
         self.assertEqual(self.assert_saved_report()["plan"], self.preview_plan)
 
+    def test_strict_unknown_power_factor_is_logged_as_an_expected_inlet_deferral(self):
+        self.preview_plan["summary"].update(unresolved_components=1, module_bays_created=1)
+        self.preview_plan["components"] = {
+            "unresolved": [
+                {
+                    "key": "psu:1/B:power:Power Input",
+                    "reason": "New PowerPort requires a power factor; "
+                    "no documented value or enabled NtC default is available",
+                }
+            ]
+        }
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "info"))
+        self.assertIn("Deferred 1 new PSU power inlet because", messages)
+        self.assertIn("Bays and identified assets remain eligible", messages)
+        self.job.logger.warning.assert_not_called()
+        self.job.logger.error.assert_not_called()
+
     def test_repeat_run_keeps_dynamic_classification_without_reporting_a_change(self):
         repeated = plan(switching_dynamic=34, switching_defaults=53, switching_not_applicable=5)
         self.module.apply_discovery.return_value = repeated
@@ -444,6 +628,46 @@ class DiscoveryJobTests(unittest.TestCase):
         self.assertNotIn("recorded", messages)
         self.job.logger.warning.assert_not_called()
         self.assertEqual(self.assert_saved_report()["plan"], repeated)
+
+    def test_management_evidence_is_reported_without_namespace_or_address_writes(self):
+        self.observed["management"] = {
+            "interfaces": [{"name": "GigabitEthernet0/0", "vrf": "private-vrf-sentinel"}],
+            "writes_deferred_reason": "Namespace mapping has not been selected",
+        }
+        self.preview_plan["summary"].update(
+            console_ports_created=2, management_interfaces_updated=1, interfaces_updated=1
+        )
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "info"))
+        self.assertIn("Would add 2 console ports", messages)
+        self.assertIn("Would mark 1 dedicated management interface", messages)
+        self.assertIn("VRF/IP assignments are deferred", messages)
+        self.assertNotIn("private-vrf-sentinel", messages)
+        self.assertEqual(self.assert_saved_report()["discovery"], self.observed)
+
+    def test_ambiguous_console_inventory_has_readable_warning_without_raw_evidence(self):
+        self.preview_plan["summary"]["unresolved_console_ports"] = 1
+        self.preview_plan["console_ports"] = {
+            "unresolved": [{"reason": "private-console-sentinel"}]
+        }
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "warning"))
+        self.assertIn("1 console-port observations unresolved", messages)
+        self.assertNotIn("private-console-sentinel", messages)
+        self.job.logger.error.assert_not_called()
+
+    def test_optional_management_gaps_keep_available_hardware_and_report_evidence(self):
+        self.observed["management"] = {
+            "interfaces": [],
+            "unresolved": [{"reason": "private-management-gap-sentinel"}],
+        }
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "warning"))
+        self.assertIn("1 management configuration observations", messages)
+        self.assertIn("Available hardware and configuration evidence", messages)
+        self.assertNotIn("private-management-gap-sentinel", messages)
+        self.job.logger.error.assert_not_called()
+        self.assertEqual(self.assert_saved_report()["discovery"], self.observed)
 
     def test_expected_collection_failure_saves_report_and_suppresses_exception_cause(self):
         failure = self.module.RestconfError("Device connection timed out")

@@ -5,6 +5,7 @@ from collections import defaultdict
 from .adapters.cisco_iosxe import canonical_interface_name, canonical_software_version
 from .reconcile_components import plan_components
 from .reconcile_console import plan_console_ports, reviewed_profile
+from .reconcile_ipam import plan_ipam
 from .reconcile_stack import plan_stack
 from .reconcile_vlans import plan_vlans
 
@@ -310,6 +311,9 @@ def build_plan(discovery, existing):
     plan["console_ports"] = plan_console_ports(discovery, existing)
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["console_ports"][key])
+    plan["ipam"] = plan_ipam(discovery, existing, interface_plan=plan)
+    for key in ("conflicts", "errors", "warnings"):
+        plan[key].extend(plan["ipam"][key])
     changed_interfaces = {row["id"] for row in plan["interface_updates"]}
     changed_interfaces.update(
         row["member_id"] for row in plan["lag_assignments"] if row["member_id"] is not None
@@ -319,6 +323,9 @@ def build_plan(discovery, existing):
     )
     changed_interfaces.update(
         row["id"] for row in plan["layer2"]["assignments"] if row["id"] is not None
+    )
+    changed_interfaces.update(
+        row["id"] for row in plan["ipam"]["interface_vrfs"] if row["id"] is not None
     )
     plan["missing_interfaces"] = [
         {"id": str(row["id"]), "name": row["name"]}
@@ -342,6 +349,7 @@ def build_plan(discovery, existing):
         **plan["components"]["summary"],
         **plan["layer2"]["summary"],
         **plan["console_ports"]["summary"],
+        **plan["ipam"]["summary"],
         **stack["summary"],
     }
     return plan

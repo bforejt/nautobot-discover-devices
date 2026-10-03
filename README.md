@@ -2,7 +2,9 @@
 
 `Discover Device` verifies an existing Nautobot Device against structured facts
 from the device, then fills missing identity, interface, console connector,
-reviewed serialized hardware inventory, and scoped 802.1Q assignments. The first adapter supports Cisco IOS XE switches on 17.9
+reviewed serialized hardware inventory, scoped 802.1Q assignments, configured
+static IPv4 addressing, and explicitly mapped named VRFs. The first adapter
+supports Cisco IOS XE switches on 17.9
 or later using RESTCONF JSON exclusively. The job defaults to a preview.
 
 This project targets Nautobot 3.2. Native `SoftwareVersion` is used for
@@ -73,6 +75,16 @@ The job form contains these inputs:
 | VLAN Group | None | Explicit Layer-2 domain required for VLAN catalog and interface switching writes |
 | VLAN status | Applicable `Active` | Operator-selected status for newly created VLANs |
 | Use NTC defaults when guessing | Disabled | Apply the reviewed Network to Code Device Onboarding fallback for eligible down dynamic switchports; mark inferred values in the report |
+| Default IPAM namespace | None | Select an existing Namespace to enable static IPv4/VRF reconciliation; blank keeps IPAM report-only |
+| Override IPAM namespace | None | Optional Namespace for RFC1918 and manually entered override networks |
+| Use override for RFC1918 | Enabled | With an override selected, match the three exact RFC1918 ranges |
+| Additional override networks | Blank | IPv4 network CIDRs, one per line, combined with RFC1918 matches |
+| Create missing networks | Enabled | Create exact connected Network Prefixes attached to the Prefix Location |
+| Group matching user VRF names across devices | Disabled | Explicitly group matching user VRF names within one Namespace |
+| Keep these VRF names device-local | `Mgmt-vrf` | Exact exceptions to grouping, one per line |
+| Prefix Location | Closest Site ancestor, otherwise Device Location | Optional Device ancestor override; Location Type must permit Prefixes |
+| New Prefix status | Applicable `Active` | Status for newly created connected Prefixes |
+| New IP Address status | Applicable `Active` | Status for newly created configured IPv4 hosts |
 
 Start with Dry run enabled. The main job log shows progress, readable change
 counts, and brief notices for preserved differences and skipped observations.
@@ -133,7 +145,7 @@ MAC addresses, and descriptions.
 | Configured copper duplex | Fill blank `Interface.duplex` from explicit configuration or the narrowly reviewed configured default |
 | Reviewed dedicated management hardware | Mark the confirmed `Gi0/0` as management-only using the narrow purpose-correction policy below |
 | Reviewed physical console connectors | Create or adopt native ConsolePorts, preserving existing names, UUIDs and cables |
-| Management VRF/address configuration | Retain structured evidence; defer assignments until the Namespace mapping is selected |
+| Configured static IPv4 and named VRFs | Reconcile connected Prefixes, hosts and explicit routing memberships after a default Namespace is selected; otherwise report-only |
 | Negotiated and MAC duplex | Retain as observations; never substitute for the configured duplex setting |
 | Supported configured 802.1Q bundle | Fill blank mode and VLAN assignments in the selected VLAN Group |
 | Directly reported ordinary dynamic access/trunk mode | Use the actual mode with known configured VLAN policy to fill the existing 802.1Q fields |
@@ -168,8 +180,10 @@ not change lifecycle status. The supported fields are type, enabled, description
 MTU, MAC, operational speed, supported connector type, documented management-only
 purpose, and configured 802.1Q assignments, including directly reported
 access/trunk selection for ordinary dynamic ports when available.
-Routing/Namespace interpretation, IP addresses, cables, unreviewed transceiver
-placements, and additional component profiles are future increments.
+Configured static IPv4 and named VRFs are reconciled through the selected
+Namespace policy below. IPv6, dynamic addressing, shared/FHRP addressing,
+cables, unreviewed transceiver placements, and additional component profiles
+are future increments.
 
 LAG membership comes from native interface configuration's structured
 `Cisco-IOS-XE-ethernet:channel-group/number` leaf. The collector includes
@@ -193,6 +207,46 @@ speed. The initial hardware map covers:
 An unsupported physical type or unknown administrative state skips creation
 with an explicit warning. Existing interfaces can still receive independently
 known blank fields. No generic physical type is invented.
+
+## IPAM and named VRFs
+
+Select **Default IPAM namespace** to enable configured static IPv4 and named
+VRF reconciliation. Leaving it blank keeps IPAM report-only even when other
+inventory changes are applied. To use the common split, choose **Internet** as
+the default, **Corporate** as **Override IPAM namespace**, and leave **Use override
+for RFC1918** checked. Add internally used public ranges or other exceptions to
+**Additional override networks**, one IPv4 network CIDR per line. Unchecking
+RFC1918 makes only those manual networks match. The names are operator labels;
+all unmatched addresses use the default without an inferred public designation.
+
+The complete connected network must resolve to one selected Namespace.
+A rule covering only part of its reported subnet remains unresolved. Discovery
+uses explicit configured host/mask data, including shutdown interfaces and
+secondary addresses. With **Create missing networks** enabled, an absent
+connected Prefix is created as a Network and attached to **Prefix Location**.
+The default Location is the closest Site ancestor or the Device's own Location;
+its Location Type must permit Prefix records. Existing network types, Locations,
+IP masks, populated Interface VRFs, statuses and assignments stay preserved.
+
+New named VRFs are device-local by default: local `Mgmt-vrf` on `switch-A`
+becomes canonical **switch-A / Mgmt-vrf**, with the actual name and reported RD
+stored on its VRF Device Assignment. Unused named VRFs are included; newly
+created ones without static addressing use the default Namespace. Existing Device Assignments
+establish identity on repeats, including after a Device rename. **Group matching
+user VRF names across devices** explicitly enables shared names within a
+Namespace; **Keep these VRF names device-local** defaults to `Mgmt-vrf` and
+retains local exceptions. One named VRF cannot span the two selected Namespaces.
+Changing grouping does not migrate existing assignments.
+
+The preview lists rule matches, VRF identities, networks, hosts, assignments and
+hierarchy effects. More specific Prefixes can reparent existing inventory;
+changes to inherited VRF associations, incompatible masks, duplicate/shared
+hosts, exclusive ranges and conflicting site scope are deferred or blocked.
+DHCP, unnumbered and IPv6 remain observations. Device primary IPs are preserved.
+No custom fields are created. Namespace policy is independent of NTC guessing.
+
+See [IPAM discovery](docs/ipam-discovery.md) for the exact input fields,
+RESTCONF/YANG sources, preservation guards, report structure and test coverage.
 
 ## StackWise discovery
 
@@ -257,9 +311,11 @@ Management VRF definitions and configured static IPv4/IPv6 addresses are
 collected separately under `discovery.management`. Operational address values
 remain observations: `0.0.0.0` is not assigned, and an IPv6 address without a
 prefix length does not establish a mask. DHCP, autoconfiguration, EUI-64 and
-anycast flags retain their explicit meaning. VRF/IP writes are deferred until
-the intended Nautobot Namespace and Device-local VRF mapping are selected.
-Existing primary IPs and assignments remain unchanged.
+anycast flags retain their explicit meaning. The broader `discovery.ipam`
+collector supplies static IPv4 and all named VRF facts independently of this
+hardware profile. Select the Namespace policy above to enable those writes;
+IPv6 and dynamic addressing stay observation-only. Existing primary IPs and
+populated assignments remain preserved.
 
 The lab exposes shutdown `Gi0/0` in `Mgmt-vrf` with no configured address;
 its existing primary management address belongs to `Vlan2`. Its console line
@@ -558,7 +614,9 @@ request `application/yang-data+json`.
 | Optional logical console settings | `/data/Cisco-IOS-XE-native:native/line/console=0` with safe terminal-setting fields only |
 | Optional management configuration | `/data/Cisco-IOS-XE-native:native/interface/GigabitEthernet=0%2F0` with VRF/address fields |
 | Optional management operational evidence | `/data/Cisco-IOS-XE-interfaces-oper:interfaces/interface=GigabitEthernet0%2F0` with VRF/address fields |
-| Optional management VRF definition | `/data/Cisco-IOS-XE-native:native/vrf` with name/RD/address-family fields |
+| Optional named VRF definitions | `/data/Cisco-IOS-XE-native:native/vrf` with definition name/RD/address-family fields |
+| Optional legacy named VRFs | `/data/Cisco-IOS-XE-native:native/ip/vrf` with name/RD fields |
+| Optional configured IPAM | `/data/Cisco-IOS-XE-native:native/interface` with safe family/key/VRF/address field filters |
 | Configured duplex | `/data/Cisco-IOS-XE-native:native/interface` with scoped qualified `Cisco-IOS-XE-ethernet:duplex` fields |
 | Configured LAG membership | `/data/Cisco-IOS-XE-native:native/interface` with qualified `Cisco-IOS-XE-ethernet:channel-group` field filters |
 | Configured 802.1Q mode, native VLAN, and allowed VLANs | `/data/Cisco-IOS-XE-native:native/interface` with complete scoped switchport containers |
@@ -578,8 +636,11 @@ Unavailable switching sources leave affected bundles unresolved; malformed or
 ambiguous native configuration or VLAN identity data blocks discovery. Invalid
 optional actual switchport data is discarded as described above. Defaults do
 not replace failed or incomplete source reads.
-HTTPS redirects are rejected. A legacy TLS retry is available only when the
-operator explicitly disables certificate verification.
+IPAM and console/management configuration reads never retry without safe field
+filters; unavailable or malformed IPAM sources preserve existing routing
+inventory and remain in the report. An HTTP 204 VRF subtree records explicit
+absence. HTTPS redirects are rejected. A legacy TLS retry is available only
+when the operator explicitly disables certificate verification.
 
 The channel-group mapping follows the published Cisco Ethernet YANG module
 for [IOS XE 17.9.1](https://raw.githubusercontent.com/YangModels/yang/main/vendor/cisco/xe/1791/Cisco-IOS-XE-ethernet.yang)
@@ -595,9 +656,9 @@ The architecture separates four boundaries:
 
 1. `jobs/transport_restconf.py` owns the GET-only JSON session.
 2. `jobs/adapters/` converts vendor data into versioned common facts and source evidence.
-3. `jobs/reconcile.py`, with component and VLAN subplanners, builds a pure,
+3. `jobs/reconcile.py`, with component, VLAN and IPAM subplanners, builds a pure,
    deterministic fill-only plan.
-4. `jobs/nautobot_inventory.py`, with component and VLAN staging helpers,
+4. `jobs/nautobot_inventory.py`, with component, VLAN and IPAM staging helpers,
    validates and applies it through the Nautobot ORM in one transaction.
 
 RESTCONF, credential resolution, payload helpers, and interface naming reuse

@@ -12,6 +12,7 @@ from . import (
     cisco_access_ports,
     cisco_components,
     cisco_duplex,
+    cisco_ipam,
     cisco_layer2,
     cisco_stack,
     cisco_switchport_oper,
@@ -563,6 +564,16 @@ def collect(client, *, use_ntc_defaults=False):
             % (" (HTTP %s)" % status if status else "")
         )
     try:
+        ipam = cisco_ipam.collect(
+            client,
+            interfaces,
+            canonical_name=canonical_interface_name,
+            excluded_interfaces=excluded,
+            revisions=modules if library_known else None,
+        )
+    except cisco_ipam.IpamDiscoveryError as exc:
+        raise DiscoveryError(str(exc)) from None
+    try:
         switchport_oper = cisco_switchport_oper.collect(
             client,
             interfaces,
@@ -758,6 +769,7 @@ def collect(client, *, use_ntc_defaults=False):
         "components": components,
         "console_ports": console_ports,
         "management": management,
+        "ipam": ipam,
         "layer2": layer2,
         "excluded_interfaces": excluded,
         "warnings": warnings,

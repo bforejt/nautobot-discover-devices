@@ -564,6 +564,20 @@ class ComponentReconciliationTests(unittest.TestCase):
     def test_missing_feature_does_not_claim_existing_components_disappeared(self):
         self.assertFalse(planner.plan_components({}, installed(inventory()))["missing_modules"])
 
+    def test_deferred_stack_placement_does_not_claim_modules_disappeared(self):
+        observed = discovery()
+        observed["components"].update(
+            writes_deferred_reason="Member placement requires review",
+            unresolved=[{"name": "Switch 2 PSU B", "reason": "Member placement requires review"}],
+        )
+        plan = planner.plan_components(observed, installed(inventory()))
+        self.assertFalse(plan["errors"])
+        self.assertFalse(plan["missing_modules"])
+        self.assertFalse(plan["modules"])
+        self.assertEqual(plan["summary"]["unresolved_components"], 1)
+        observed["components"]["items"] = [item()]
+        self.assertTrue(planner.plan_components(observed, installed(inventory()))["errors"])
+
     def test_unsupported_runtime_and_adapter_unresolved_evidence_are_visible(self):
         before = inventory()
         before["components"]["supported"] = False

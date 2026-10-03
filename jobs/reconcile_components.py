@@ -77,6 +77,12 @@ def plan_components(discovery, existing, interface_plan=None):
         return _finish(plan)
     plan["unresolved"] = list(source.get("unresolved", []))
     plan["excluded"] = list(source.get("excluded", []))
+    if source.get("writes_deferred_reason") is not None:
+        if not _text(source["writes_deferred_reason"]) or source["items"]:
+            plan["errors"].append("Deferred component placement cannot include resolved items")
+        # No placement inventory was collected. Do not claim that existing
+        # modules disappeared merely because their ownership remains unresolved.
+        return _finish(plan)
     catalog = existing.get("components", {})
     if not catalog.get("supported", False):
         if source.get("items"):

@@ -2,8 +2,16 @@
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
-from nautobot.dcim.models import Device, Interface, InterfaceTemplate, Platform, SoftwareVersion
+from nautobot.dcim.models import (
+    Device,
+    Interface,
+    InterfaceTemplate,
+    Manufacturer,
+    Platform,
+    SoftwareVersion,
+)
 from nautobot.extras.models import Status
+from nautobot.ipam.models import Namespace
 
 from .adapters.cisco_iosxe import canonical_interface_name
 from .exceptions import InventoryError
@@ -19,6 +27,14 @@ from .nautobot_console import (
     snapshot_console_ports,
     validate_console_ports,
 )
+from .nautobot_ipam import (
+    ipam_objects,
+    save_ipam_assignments,
+    save_ipam_catalog,
+    snapshot_ipam,
+    validate_ipam_objects,
+)
+from .nautobot_stack import save_stack, snapshot_stack, stack_objects, validate_stack
 from .nautobot_vlans import (
     save_vlan_assignments,
     save_vlan_catalog,
@@ -29,7 +45,7 @@ from .nautobot_vlans import (
 from .reconcile import INTERFACE_FIELDS, build_plan
 
 
-def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None):
+def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None, ipam_policy=None):
     """Serialize only the fields this job may reconcile."""
     interfaces = device.all_interfaces if hasattr(device, "all_interfaces") else device.interfaces
     if lock:
@@ -42,6 +58,7 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None):
             "lag_id": str(interface.lag_id) if interface.lag_id else None,
             "lag": interface.lag.name if interface.lag_id else None,
             "module_id": str(interface.module_id) if interface.module_id else None,
+            "vrf_id": str(interface.vrf_id) if interface.vrf_id else None,
             "mode": interface.mode,
             "untagged_vlan_id": str(interface.untagged_vlan_id)
             if interface.untagged_vlan_id
@@ -83,6 +100,8 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None):
         "components": snapshot_components(device, lock=lock, discovery=discovery),
         "vlan_inventory": snapshot_vlans(device, vlan_group, lock=lock),
         "console_inventory": snapshot_console_ports(device, lock=lock),
+        "stack": snapshot_stack(device, lock=lock, discovery=discovery),
+        "ipam_inventory": snapshot_ipam(device, ipam_policy, lock=lock, discovery=discovery),
     }
 
 
@@ -100,7 +119,16 @@ def _status(model, selected):
     return status
 
 
-def _objects(plan, device, interface_status, software_version_status, module_status, vlan_status):
+def _objects(
+    plan,
+    device,
+    interface_status,
+    software_version_status,
+    module_status,
+    vlan_status,
+    ipam_prefix_status=None,
+    ipam_ip_address_status=None,
+):
     if plan["errors"]:
         raise InventoryError("; ".join(plan["errors"]))
     version = None
@@ -145,7 +173,9 @@ def _objects(plan, device, interface_status, software_version_status, module_sta
     vlan_work = bool(vlan_plan["assignments"]) or any(
         spec["create"] or spec["changes"] for spec in vlan_plan["catalog"]
     )
-    if plan["lag_assignments"] or component_plan["interface_assignments"] or vlan_work:
+    ipam_plan = plan.get("ipam")
+    ipam_work = bool(ipam_plan and ipam_plan.get("policy"))
+    if plan["lag_assignments"] or component_plan["interface_assignments"] or vlan_work or ipam_work:
         interfaces = (
             device.all_interfaces if hasattr(device, "all_interfaces") else device.interfaces
         )
@@ -162,13 +192,25 @@ def _objects(plan, device, interface_status, software_version_status, module_sta
             vlans = vlan_objects(
                 vlan_plan, objects, vlan_status=vlan_status, status_resolver=_status
             )
+    ipam = (
+        ipam_objects(
+            ipam_plan,
+            objects,
+            device,
+            prefix_status=ipam_prefix_status,
+            ip_address_status=ipam_ip_address_status,
+            status_resolver=_status,
+        )
+        if ipam_work
+        else None
+    )
     console_plan = plan["console_ports"]
     consoles = (
         console_objects(console_plan, device)
         if console_plan["creates"] or console_plan["updates"]
         else []
     )
-    return version, creates, updates, memberships, components, ownerships, vlans, consoles
+    return version, creates, updates, memberships, components, ownerships, vlans, consoles, ipam
 
 
 def _validate_interface(interface):
@@ -219,11 +261,24 @@ def validate_plan(
     software_version_status=None,
     module_status=None,
     vlan_status=None,
+    ipam_prefix_status=None,
+    ipam_ip_address_status=None,
 ):
     """Validate without saving. Re-fetch the Device to avoid mutating inputs."""
     device = Device.objects.get(pk=device.pk)
-    version, creates, updates, memberships, components, ownerships, vlans, consoles = _objects(
-        plan, device, interface_status, software_version_status, module_status, vlan_status
+    stack = stack_objects(plan.get("stack"), device)
+    validate_stack(stack)
+    version, creates, updates, memberships, components, ownerships, vlans, consoles, ipam = (
+        _objects(
+            plan,
+            device,
+            interface_status,
+            software_version_status,
+            module_status,
+            vlan_status,
+            ipam_prefix_status,
+            ipam_ip_address_status,
+        )
     )
     if version is not None:
         version.full_clean()
@@ -236,6 +291,8 @@ def validate_plan(
             if version is not None and plan["software_version"]["create"]
             else []
         )
+        if device.virtual_chassis is not None and device.virtual_chassis._state.adding:
+            excluded.append("virtual_chassis")
         device.full_clean(exclude=excluded)
     if components is not None:
         validate_components(components)
@@ -258,6 +315,8 @@ def validate_plan(
     if vlans is not None:
         for interface, _spec in vlans["assignments"]:
             _validate_interface(interface)
+    if ipam is not None:
+        validate_ipam_objects(ipam, device)
 
 
 def apply_discovery(
@@ -269,16 +328,52 @@ def apply_discovery(
     module_status=None,
     vlan_group=None,
     vlan_status=None,
+    ipam_policy=None,
+    ipam_prefix_status=None,
+    ipam_ip_address_status=None,
 ):
     """Re-read under lock and apply the complete valid change set in one transaction."""
     with transaction.atomic():
+        if ipam_policy is not None:
+            namespace_ids = sorted(
+                {
+                    row["id"]
+                    for row in (
+                        ipam_policy["default_namespace"],
+                        ipam_policy.get("override_namespace"),
+                    )
+                    if row is not None
+                }
+            )
+            # Serialize shared Namespace catalogs before the per-Device locks.
+            locked = list(
+                Namespace.objects.filter(pk__in=namespace_ids).order_by("pk").select_for_update()
+            )
+            if len(locked) != len(namespace_ids):
+                raise InventoryError("A selected IPAM Namespace no longer exists")
+        context = Device.objects.values("platform_id", "device_type__manufacturer_id").get(
+            pk=device.pk
+        )
+        # Stack jobs can target different members while touching the same asset
+        # graph. Acquire shared catalog locks before any member Device lock.
+        Manufacturer.objects.select_for_update().get(pk=context["device_type__manufacturer_id"])
+        if context["platform_id"]:
+            Platform.objects.select_for_update().get(pk=context["platform_id"])
         device = Device.objects.select_for_update().get(pk=device.pk)
-        # Serialize catalog creation across participating jobs for this platform.
-        if device.platform_id:
-            Platform.objects.select_for_update().get(pk=device.platform_id)
+        if (
+            device.platform_id != context["platform_id"]
+            or device.device_type.manufacturer_id != context["device_type__manufacturer_id"]
+        ):
+            raise InventoryError("Selected Device catalog context changed; retry discovery")
         plan = build_plan(
             discovery,
-            snapshot_inventory(device, lock=True, discovery=discovery, vlan_group=vlan_group),
+            snapshot_inventory(
+                device,
+                lock=True,
+                discovery=discovery,
+                vlan_group=vlan_group,
+                ipam_policy=ipam_policy,
+            ),
         )
         validate_plan(
             plan,
@@ -287,10 +382,23 @@ def apply_discovery(
             software_version_status=software_version_status,
             module_status=module_status,
             vlan_status=vlan_status,
+            ipam_prefix_status=ipam_prefix_status,
+            ipam_ip_address_status=ipam_ip_address_status,
         )
-        version, creates, updates, memberships, components, ownerships, vlans, consoles = _objects(
-            plan, device, interface_status, software_version_status, module_status, vlan_status
+        stack = stack_objects(plan.get("stack"), device)
+        version, creates, updates, memberships, components, ownerships, vlans, consoles, ipam = (
+            _objects(
+                plan,
+                device,
+                interface_status,
+                software_version_status,
+                module_status,
+                vlan_status,
+                ipam_prefix_status,
+                ipam_ip_address_status,
+            )
         )
+        save_stack(stack)
         if version is not None:
             if plan["software_version"]["create"]:
                 version.validated_save()
@@ -314,5 +422,8 @@ def apply_discovery(
             member.validated_save()
         if vlans is not None:
             save_vlan_assignments(vlans, device)
+        if ipam is not None:
+            save_ipam_catalog(ipam, device)
+            save_ipam_assignments(ipam, device)
         save_console_ports(consoles)
         return plan

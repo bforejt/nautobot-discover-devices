@@ -8,7 +8,15 @@ or unstructured software-banner parser is included.
 import re
 
 from ..transport_restconf import RestconfError
-from . import cisco_access_ports, cisco_components, cisco_duplex, cisco_layer2
+from . import (
+    cisco_access_ports,
+    cisco_components,
+    cisco_duplex,
+    cisco_ipam,
+    cisco_layer2,
+    cisco_stack,
+    cisco_switchport_oper,
+)
 from .cisco_hardware import interface_type
 
 HOSTNAME_PATH = "/data/Cisco-IOS-XE-native:native/hostname"
@@ -52,6 +60,8 @@ MODULES = (
     "Cisco-IOS-XE-switch",
     "Cisco-IOS-XE-vlan",
     "Cisco-IOS-XE-vlan-oper",
+    "Cisco-IOS-XE-stack-oper",
+    "Cisco-IOS-XE-switchport-oper",
 )
 _PREFIXES = (
     ("TwentyFiveGigE", "Twe"),
@@ -153,7 +163,7 @@ def _filtered(client, path, fields, warnings):
         return client.get(path)
 
 
-def _install_identity(payload):
+def _install_identity(payload, *, required_members=None, active_member=None):
     locations = _value(payload, "install-location-information")
     if locations is None:
         locations = _value(_value(payload, "install-oper-data"), "install-location-information")
@@ -163,12 +173,24 @@ def _install_identity(payload):
     rows = [row for row in rows if _enum(row.get("fru")) == "fru-rp"]
     if not rows:
         raise DiscoveryError("install-oper contains no control-plane installation row")
-    members = {row.get("chassis") for row in rows}
-    if len(members) != 1:
-        raise DiscoveryError("Multiple install chassis members require an approved stack mapping")
-    member = next(iter(members))
-    if isinstance(member, bool) or not isinstance(member, int) or member < 1:
-        raise DiscoveryError("install-oper chassis member must be a positive integer")
+    for row in rows:
+        member = row.get("chassis")
+        if isinstance(member, bool) or not isinstance(member, int) or member < 1:
+            raise DiscoveryError("install-oper chassis member must be a positive integer")
+    if required_members is not None:
+        rows = [row for row in rows if row["chassis"] in required_members]
+        if {row["chassis"] for row in rows} != set(required_members):
+            raise DiscoveryError(
+                "Every physical stack member requires a running install-oper image"
+            )
+        member = active_member
+    else:
+        members = {row["chassis"] for row in rows}
+        if len(members) != 1:
+            raise DiscoveryError(
+                "Multiple install chassis members require an approved stack mapping"
+            )
+        member = next(iter(members))
     releases = set()
     evidence = []
     for row in rows:
@@ -204,7 +226,7 @@ def _install_identity(payload):
                 "fru": row.get("fru"),
                 "slot": row.get("slot"),
                 "bay": row.get("bay"),
-                "chassis": member,
+                "chassis": row["chassis"],
                 "version": selected[0].get("version"),
                 "version-extension": extension,
                 "current": selected[0].get("current"),
@@ -242,7 +264,7 @@ def _uint(value):
     return None
 
 
-def _interfaces(payload, model, member, inventory, warnings):
+def _interfaces(payload, model, member, inventory, warnings, *, stack_members=None):
     container = _value(payload, "interfaces")
     if not isinstance(container, dict) or _value(container, "interface") is None:
         raise DiscoveryError("interfaces-oper reply lacks the interface list")
@@ -266,14 +288,29 @@ def _interfaces(payload, model, member, inventory, warnings):
             excluded.append({"name": name, "reason": "Internal application-hosting interface"})
             continue
         port_location = re.fullmatch(r"[A-Za-z][A-Za-z-]*(\d+)/(\d+)/(\d+)(?:\.\d+)?", name)
-        if port_location and int(port_location.group(1)) != member:
+        owner = None
+        type_model, type_member, type_inventory = model, member, inventory
+        if stack_members is not None:
+            # The first coordinate is the device's explicit switch member.
+            # Names without that coordinate do not establish physical ownership.
+            if port_location:
+                owner = stack_members.get(int(port_location.group(1)))
+                if owner is None:
+                    raise DiscoveryError(
+                        "Present interface %s has no validated physical stack owner" % name
+                    )
+                type_model, type_member = owner["model"], owner["position"]
+                type_inventory = cisco_stack.inventory_for_member(inventory, owner)
+            else:
+                type_model, type_member, type_inventory = None, None, []
+        elif port_location and int(port_location.group(1)) != member:
             raise DiscoveryError(
                 "Present interface %s belongs to a different stack member; "
                 "stack mapping needs review" % name
             )
         # Unsupported families remain explicit observations; the planner can
         # use an existing interface/template type without guessing capability.
-        type_, source = interface_type(name, model, member, inventory)
+        type_, source = interface_type(name, type_model, type_member, type_inventory)
         mtu = row.get("mtu")
         if mtu is not None and (
             isinstance(mtu, bool) or not isinstance(mtu, int) or not 1 <= mtu <= 65535
@@ -318,31 +355,32 @@ def _interfaces(payload, model, member, inventory, warnings):
                     operational_duplex = negotiated
                 elif mac_mode is not None or negotiated is not None:
                     warnings.append("%s: operational duplex lacks agreeing MAC evidence" % name)
-        interfaces.append(
-            {
-                "name": name,
-                "type": type_,
-                "enabled": enabled,
-                "description": _text(row.get("description")),
-                "mtu": mtu,
-                "mac_address": _mac(row.get("phys-address"), name, warnings),
-                "speed": speed,
-                "duplex": None,
-                "port_type": port_type,
-                "type_source": source,
-                "observations": {
-                    "admin_status": admin,
-                    "oper_status": oper,
-                    "speed_bps": _SPEEDS.get(_enum(ether.get("negotiated-port-speed"))),
-                    "media_type": _enum(ether.get("media-type")),
-                    "reported_speed_bps": reported_speed,
-                    "negotiated_duplex": _enum(ether.get("negotiated-duplex-mode")),
-                    "auto_negotiate": ether.get("auto-negotiate"),
-                    "mac_duplex_status": mac_duplex,
-                    "corroborated_operational_duplex": operational_duplex,
-                },
-            }
-        )
+        facts = {
+            "name": name,
+            "type": type_,
+            "enabled": enabled,
+            "description": _text(row.get("description")),
+            "mtu": mtu,
+            "mac_address": _mac(row.get("phys-address"), name, warnings),
+            "speed": speed,
+            "duplex": None,
+            "port_type": port_type,
+            "type_source": source,
+            "observations": {
+                "admin_status": admin,
+                "oper_status": oper,
+                "speed_bps": _SPEEDS.get(_enum(ether.get("negotiated-port-speed"))),
+                "media_type": _enum(ether.get("media-type")),
+                "reported_speed_bps": reported_speed,
+                "negotiated_duplex": _enum(ether.get("negotiated-duplex-mode")),
+                "auto_negotiate": ether.get("auto-negotiate"),
+                "mac_duplex_status": mac_duplex,
+                "corroborated_operational_duplex": operational_duplex,
+            },
+        }
+        if owner is not None:
+            facts["stack_member"] = owner["position"]
+        interfaces.append(facts)
     return sorted(interfaces, key=lambda row: row["name"]), sorted(
         excluded, key=lambda row: row["name"]
     )
@@ -436,6 +474,18 @@ def _lag_memberships(client, interfaces, excluded, warnings):
     return sorted(memberships, key=lambda row: (row["member"], row["lag"]))
 
 
+def _library_value(mapping, name):
+    """Read a library leaf without accepting a foreign namespace or collision."""
+    if not isinstance(mapping, dict) or any(not isinstance(key, str) for key in mapping):
+        raise DiscoveryError("YANG library requires structured containers with string keys")
+    matches = [(key, value) for key, value in mapping.items() if key.split(":")[-1] == name]
+    if len(matches) > 1 or any(
+        ":" in key and key.split(":", 1)[0] != "ietf-yang-library" for key, _ in matches
+    ):
+        raise DiscoveryError("YANG library field is ambiguous or belongs to another module")
+    return matches[0][1] if matches else None
+
+
 def collect(client, *, use_ntc_defaults=False):
     """Collect common facts; required identity/interface failures abort application."""
     if type(use_ntc_defaults) is not bool:
@@ -447,17 +497,23 @@ def collect(client, *, use_ntc_defaults=False):
     hardware = _value(client.get(HARDWARE_PATH), "device-hardware-data")
     device_hardware = _value(hardware, "device-hardware")
     inventory = _rows(_value(device_hardware, "device-inventory"), "device-inventory")
+    try:
+        stack = cisco_stack.collect(client, inventory, hostname=hostname, warnings=warnings)
+    except cisco_stack.StackDiscoveryError as exc:
+        raise DiscoveryError(str(exc)) from None
     chassis = [row for row in inventory if _enum(row.get("hw-type")) == "hw-type-chassis"]
-    if len(chassis) != 1:
-        raise DiscoveryError(
-            "Initial discovery requires exactly one hardware chassis; "
-            "stack interpretation needs review"
-        )
-    model, serial = _text(chassis[0].get("part-number")), _text(chassis[0].get("serial-number"))
-    if model is None or serial is None:
-        raise DiscoveryError("Chassis inventory lacks structured part-number or serial-number")
+    active = stack["active_identity"]
+    if active:
+        model, serial = active["model"], active["serial"]
+    else:
+        model, serial = _text(chassis[0].get("part-number")), _text(chassis[0].get("serial-number"))
+    install = _filtered(client, INSTALL_PATH, INSTALL_FIELDS, warnings)
     version, member, install_evidence = _install_identity(
-        _filtered(client, INSTALL_PATH, INSTALL_FIELDS, warnings)
+        install,
+        required_members={row["position"] for row in stack["members"]}
+        if stack["members"]
+        else None,
+        active_member=stack["active_position"],
     )
     interfaces, excluded = _interfaces(
         _filtered(client, INTERFACES_PATH, INTERFACE_FIELDS, warnings),
@@ -465,55 +521,32 @@ def collect(client, *, use_ntc_defaults=False):
         member,
         inventory,
         warnings,
+        stack_members={row["position"]: row for row in stack["members"]}
+        if stack["is_stack"]
+        else None,
     )
     lag_memberships = _lag_memberships(client, interfaces, excluded, warnings)
-    try:
-        layer2 = cisco_layer2.collect(
-            client,
-            interfaces,
-            model=model,
-            software_version=version,
-            canonical_name=canonical_interface_name,
-            warnings=warnings,
-            use_ntc_defaults=use_ntc_defaults,
-        )
-    except cisco_layer2.Layer2DiscoveryError as exc:
-        raise DiscoveryError(str(exc)) from None
-    try:
-        configured_duplex = cisco_duplex.collect(
-            client,
-            interfaces,
-            model=model,
-            software_version=version,
-            member=member,
-            canonical_name=canonical_interface_name,
-            warnings=warnings,
-        )
-    except cisco_duplex.DuplexDiscoveryError as exc:
-        raise DiscoveryError(str(exc)) from None
-    try:
-        components = cisco_components.collect(
-            client,
-            inventory,
-            chassis_model=model,
-            chassis_serial=serial,
-            member=member,
-            interfaces=interfaces,
-            warnings=warnings,
-        )
-    except cisco_components.ComponentDiscoveryError as exc:
-        raise DiscoveryError(str(exc)) from None
-    console_ports, management = cisco_access_ports.collect(
-        client, interfaces, model=model, member=member
-    )
     modules = {}
+    library_known = False
     try:
-        library = _value(
+        library = _library_value(
             client.get(YANG_LIBRARY_PATH + "?fields=module(name;revision)"), "modules-state"
         )
-        for module in _rows(_value(library, "module"), "yang-library module"):
-            if module.get("name") in MODULES:
-                modules[module["name"]] = _text(module.get("revision"))
+        entries = _library_value(library, "module")
+        if not isinstance(entries, list):
+            raise DiscoveryError("YANG library did not provide a complete module list")
+        for module in _rows(entries, "yang-library module"):
+            name = _library_value(module, "name")
+            revision = _library_value(module, "revision")
+            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", name) is None:
+                raise DiscoveryError("YANG library module requires a valid structured name")
+            if revision is not None and not isinstance(revision, str):
+                raise DiscoveryError("YANG library module revision must be structured text")
+            if name in MODULES:
+                if name in modules:
+                    raise DiscoveryError("YANG library has ambiguous relevant module revisions")
+                modules[name] = _text(revision)
+        library_known = True
         if not modules:
             warnings.append(
                 "YANG library did not provide relevant module revisions; "
@@ -524,10 +557,109 @@ def collect(client, *, use_ntc_defaults=False):
         # worker time limits and programming errors must propagate unchanged.
         # Optional evidence must not mask a required discovery failure, and
         # transport/provider exception bodies are never copied into artifacts.
+        modules.clear()
         status = getattr(exc, "status_code", None)
         warnings.append(
             "YANG module revision evidence unavailable%s"
             % (" (HTTP %s)" % status if status else "")
+        )
+    try:
+        ipam = cisco_ipam.collect(
+            client,
+            interfaces,
+            canonical_name=canonical_interface_name,
+            excluded_interfaces=excluded,
+            revisions=modules if library_known else None,
+        )
+    except cisco_ipam.IpamDiscoveryError as exc:
+        raise DiscoveryError(str(exc)) from None
+    try:
+        switchport_oper = cisco_switchport_oper.collect(
+            client,
+            interfaces,
+            canonical_name=canonical_interface_name,
+            revisions=modules if library_known else None,
+            warnings=warnings,
+            excluded_interfaces=excluded,
+        )
+    except cisco_switchport_oper.SwitchportOperDiscoveryError as exc:
+        raise DiscoveryError(str(exc)) from None
+    try:
+        layer2 = cisco_layer2.collect(
+            client,
+            interfaces,
+            # The chassis profile is singular; applying the active model's
+            # omitted-leaf defaults across other members would guess capability.
+            model=None if stack["is_stack"] else model,
+            software_version=version,
+            canonical_name=canonical_interface_name,
+            warnings=warnings,
+            use_ntc_defaults=use_ntc_defaults,
+            switchport_oper=switchport_oper,
+            lag_memberships=lag_memberships,
+        )
+    except cisco_layer2.Layer2DiscoveryError as exc:
+        raise DiscoveryError(str(exc)) from None
+    try:
+        configured_duplex = cisco_duplex.collect(
+            client,
+            interfaces,
+            model=None if stack["is_stack"] else model,
+            software_version=version,
+            member=member,
+            canonical_name=canonical_interface_name,
+            warnings=warnings,
+        )
+    except cisco_duplex.DuplexDiscoveryError as exc:
+        raise DiscoveryError(str(exc)) from None
+    if stack["is_stack"]:
+        reason = cisco_stack.DEFERRED_PLACEMENT
+        components = {
+            "schema_version": 1,
+            "items": [],
+            "writes_deferred_reason": reason,
+            "excluded": [],
+            "unresolved": [
+                {
+                    "name": _text(row.get("dev-name")),
+                    "model": _text(row.get("part-number")),
+                    "serial": _text(row.get("serial-number")),
+                    "hw_type": _enum(row.get("hw-type")),
+                    "reason": reason,
+                }
+                for row in inventory
+                if _enum(row.get("hw-type")) != "hw-type-chassis"
+                and _text(row.get("serial-number"))
+            ],
+        }
+        console_ports = {
+            "schema_version": 1,
+            "items": [],
+            "unresolved": [{"reason": reason}],
+            "observations": {},
+        }
+        management = {
+            "schema_version": 1,
+            "interfaces": [],
+            "unresolved": [{"reason": reason}],
+            "observations": {},
+            "writes_deferred_reason": reason,
+        }
+    else:
+        try:
+            components = cisco_components.collect(
+                client,
+                inventory,
+                chassis_model=model,
+                chassis_serial=serial,
+                member=member,
+                interfaces=interfaces,
+                warnings=warnings,
+            )
+        except cisco_components.ComponentDiscoveryError as exc:
+            raise DiscoveryError(str(exc)) from None
+        console_ports, management = cisco_access_ports.collect(
+            client, interfaces, model=model, member=member
         )
     safe_inventory = [
         {
@@ -609,6 +741,11 @@ def collect(client, *, use_ntc_defaults=False):
     cisco_layer2.add_revisions(layer2, modules)
     cisco_duplex.add_revisions(configured_duplex, modules)
     cisco_access_ports.add_revisions(console_ports, management, interfaces, modules)
+    cisco_stack.add_revisions(stack, modules)
+    if active:
+        sources["identity"]["serial"].update(active["sources"]["identity"])
+        sources["identity"]["model"].update(active["sources"]["identity"])
+    sources["stack"] = stack["source"]
     sources["configured_duplex"] = configured_duplex
     sources["lag_memberships"] = {
         "module": "Cisco-IOS-XE-ethernet",
@@ -626,11 +763,13 @@ def collect(client, *, use_ntc_defaults=False):
             "model": model,
             "software_version": version,
         },
+        "stack": stack,
         "interfaces": interfaces,
         "lag_memberships": lag_memberships,
         "components": components,
         "console_ports": console_ports,
         "management": management,
+        "ipam": ipam,
         "layer2": layer2,
         "excluded_interfaces": excluded,
         "warnings": warnings,

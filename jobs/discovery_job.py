@@ -2,19 +2,20 @@
 
 import json
 
-from nautobot.apps.jobs import BooleanVar, DryRunVar, IntegerVar, Job, ObjectVar
-from nautobot.dcim.models import Device
+from nautobot.apps.jobs import BooleanVar, DryRunVar, IntegerVar, Job, ObjectVar, TextVar
+from nautobot.dcim.models import Device, Location
 from nautobot.extras.models import SecretsGroup, Status
-from nautobot.ipam.models import VLANGroup
+from nautobot.ipam.models import Namespace, VLANGroup
 
 from .adapters import cisco_iosxe
 from .credentials import CredentialsError, resolve_credentials
+from .ipam_policy import normalize_ipam_policy
 from .nautobot_inventory import InventoryError, apply_discovery, snapshot_inventory, validate_plan
 from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.8.0-dev"
+JOB_VERSION = "0.12.0-dev"
 
 
 def _host(device):
@@ -41,6 +42,24 @@ def _adapter(device):
     if "cisco" not in manufacturer:
         raise ValueError("The selected Device must have a Cisco DeviceType")
     return cisco_iosxe
+
+
+def _prefix_location(device, selected):
+    """Resolve an explicit Location or an applicable Site in the Device hierarchy."""
+    locations = list(device.location.ancestors(include_self=True))
+    if selected is not None:
+        selected = Location.objects.get(pk=selected.pk)
+        if selected.pk not in {location.pk for location in locations}:
+            raise ValueError("The Prefix Location must be in the Device's location hierarchy")
+    else:
+        # An explicit Site ancestor is preferable to a room or rack location.
+        sites = [
+            location for location in locations if location.location_type.name.lower() == "site"
+        ]
+        selected = max(sites, key=lambda item: item.tree_depth) if sites else device.location
+    if not selected.location_type.content_types.filter(app_label="ipam", model="prefix").exists():
+        return None, "The selected Location Type does not permit Prefix associations"
+    return {"id": str(selected.pk), "name": selected.name}, None
 
 
 class DiscoverDevice(Job):
@@ -94,12 +113,89 @@ class DiscoverDevice(Job):
         query_params={"content_types": "ipam.vlan"},
         description="Status for new VLAN records; defaults to an applicable Active status.",
     )
+    ipam_namespace = ObjectVar(
+        model=Namespace,
+        required=False,
+        label="Default IPAM namespace",
+        description=(
+            "Select an existing Namespace to enable static IPv4 and named VRF discovery. "
+            "Unmatched addresses use this Namespace. Leave blank for report-only IPAM."
+        ),
+    )
+    ipam_override_namespace = ObjectVar(
+        model=Namespace,
+        required=False,
+        label="Override IPAM namespace",
+        description="Optional destination for RFC1918 and manually entered override networks.",
+    )
+    ipam_override_rfc1918 = BooleanVar(
+        default=True,
+        label="Use override for RFC1918",
+        description=(
+            "With an override Namespace selected, place 10.0.0.0/8, 172.16.0.0/12 "
+            "and 192.168.0.0/16 there. Additional networks are combined with these ranges."
+        ),
+    )
+    ipam_override_networks = TextVar(
+        required=False,
+        default="",
+        label="Additional override networks",
+        description="IPv4 network CIDRs, one per line. Requires an override Namespace.",
+    )
+    ipam_create_missing_prefixes = BooleanVar(
+        default=True,
+        label="Create missing networks",
+        description=(
+            "Create exact connected Prefixes from configured addresses and masks, attached "
+            "to the Prefix Location. Disabled: defer addresses requiring a missing network."
+        ),
+    )
+    ipam_group_user_vrfs = BooleanVar(
+        default=False,
+        label="Group matching user VRF names across devices",
+        description=(
+            "Enabled: matching names within one Namespace represent a shared domain. "
+            "Disabled: new VRFs are device-local. Existing Device assignments take precedence."
+        ),
+    )
+    ipam_local_vrf_names = TextVar(
+        required=False,
+        default="Mgmt-vrf",
+        label="Keep these VRF names device-local",
+        description=(
+            "Exact, case-sensitive names, one per line. These remain device-local when "
+            "grouping is enabled. The actual switch name is retained on its Device assignment."
+        ),
+    )
+    ipam_location = ObjectVar(
+        model=Location,
+        required=False,
+        label="Prefix Location",
+        description=(
+            "Optional Device ancestor override. Defaults to its closest Site ancestor, "
+            "otherwise the Device Location. Its Location Type must permit Prefixes."
+        ),
+    )
+    ipam_prefix_status = ObjectVar(
+        model=Status,
+        required=False,
+        query_params={"content_types": "ipam.prefix"},
+        label="New Prefix status",
+        description="Defaults to an applicable Active status; existing statuses are preserved.",
+    )
+    ipam_ip_address_status = ObjectVar(
+        model=Status,
+        required=False,
+        query_params={"content_types": "ipam.ipaddress"},
+        label="New IP Address status",
+        description="Defaults to an applicable Active status; existing statuses are preserved.",
+    )
 
     class Meta:
         name = "Discover Device"
         description = (
             "Verify Cisco IOS XE identity and fill interfaces, console ports, VLANs, "
-            "and serialized hardware."
+            "serialized hardware, static IPv4 addressing and named VRFs."
         )
         dryrun_default = True
         read_only = False
@@ -118,6 +214,16 @@ class DiscoverDevice(Job):
             "module_status",
             "vlan_group",
             "vlan_status",
+            "ipam_namespace",
+            "ipam_override_namespace",
+            "ipam_override_rfc1918",
+            "ipam_override_networks",
+            "ipam_create_missing_prefixes",
+            "ipam_group_user_vrfs",
+            "ipam_local_vrf_names",
+            "ipam_location",
+            "ipam_prefix_status",
+            "ipam_ip_address_status",
         )
 
     def run(
@@ -133,6 +239,16 @@ class DiscoverDevice(Job):
         vlan_group=None,
         vlan_status=None,
         use_ntc_defaults=False,
+        ipam_namespace=None,
+        ipam_override_namespace=None,
+        ipam_override_rfc1918=True,
+        ipam_override_networks="",
+        ipam_create_missing_prefixes=True,
+        ipam_group_user_vrfs=False,
+        ipam_local_vrf_names="Mgmt-vrf",
+        ipam_location=None,
+        ipam_prefix_status=None,
+        ipam_ip_address_status=None,
     ):
         device = Device.objects.get(pk=device.pk)
         report = {
@@ -151,6 +267,23 @@ class DiscoverDevice(Job):
             "Starting %s for %s.", "discovery preview" if dryrun else "discovery", device.name
         )
         try:
+            location, location_reason = (
+                _prefix_location(device, ipam_location)
+                if ipam_namespace is not None
+                else (None, None)
+            )
+            ipam_policy = normalize_ipam_policy(
+                ipam_namespace,
+                ipam_override_namespace,
+                override_rfc1918=ipam_override_rfc1918,
+                override_networks=ipam_override_networks,
+                create_missing_prefixes=ipam_create_missing_prefixes,
+                group_user_vrfs=ipam_group_user_vrfs,
+                local_vrf_names=ipam_local_vrf_names,
+                location=location,
+                location_reason=location_reason,
+            )
+            report["ipam_policy"] = ipam_policy
             if type(use_ntc_defaults) is not bool:
                 raise ValueError("Use NTC defaults when guessing must be true or false")
             if use_ntc_defaults:
@@ -170,8 +303,10 @@ class DiscoverDevice(Job):
                 report["requests"] = client.trace
             discovery = report["discovery"]
             management = discovery.get("management", {})
-            if (management.get("interfaces") or management.get("observations")) and management.get(
-                "writes_deferred_reason"
+            if (
+                ipam_policy is None
+                and (management.get("interfaces") or management.get("observations"))
+                and management.get("writes_deferred_reason")
             ):
                 self.logger.info(
                     "Management VRF and address evidence is available under Advanced. "
@@ -192,7 +327,12 @@ class DiscoverDevice(Job):
             self.logger.info("Comparing discovered details with Nautobot inventory.")
             report["plan"] = build_plan(
                 report["discovery"],
-                snapshot_inventory(device, discovery=report["discovery"], vlan_group=vlan_group),
+                snapshot_inventory(
+                    device,
+                    discovery=report["discovery"],
+                    vlan_group=vlan_group,
+                    ipam_policy=ipam_policy,
+                ),
             )
             plan = report["plan"]
             validate_plan(
@@ -202,6 +342,8 @@ class DiscoverDevice(Job):
                 software_version_status=software_version_status,
                 module_status=module_status,
                 vlan_status=vlan_status,
+                ipam_prefix_status=ipam_prefix_status,
+                ipam_ip_address_status=ipam_ip_address_status,
             )
             if not dryrun:
                 self.logger.info("Validation passed. Saving missing inventory details.")
@@ -213,6 +355,9 @@ class DiscoverDevice(Job):
                     module_status=module_status,
                     vlan_group=vlan_group,
                     vlan_status=vlan_status,
+                    ipam_policy=ipam_policy,
+                    ipam_prefix_status=ipam_prefix_status,
+                    ipam_ip_address_status=ipam_ip_address_status,
                 )
                 report["applied"] = True
             self._log_plan(report["plan"], dryrun=dryrun)
@@ -256,6 +401,11 @@ class DiscoverDevice(Job):
                 "empty device fields",
             ),
             ("interfaces_created", "add", "Added", "interface", "interfaces"),
+            ("virtual_chassis_created", "add", "Added", "virtual chassis", "virtual chassis"),
+            ("virtual_chassis_updated", "update", "Updated", "virtual chassis", "virtual chassis"),
+            ("stack_members_created", "add", "Added", "stack member", "stack members"),
+            ("stack_members_updated", "update", "Updated", "stack member", "stack members"),
+            ("device_types_created", "add", "Added", "device type", "device types"),
             ("console_ports_created", "add", "Added", "console port", "console ports"),
             ("console_ports_updated", "update", "Updated", "console port", "console ports"),
             (
@@ -302,6 +452,44 @@ class DiscoverDevice(Job):
                 "interface VLAN assignment",
                 "interface VLAN assignments",
             ),
+            ("prefixes_created", "add", "Added", "network Prefix", "network Prefixes"),
+            ("ip_addresses_created", "add", "Added", "IP address", "IP addresses"),
+            (
+                "ip_assignments_created",
+                "link",
+                "Linked",
+                "IP address assignment",
+                "IP address assignments",
+            ),
+            ("vrfs_created", "add", "Added", "VRF", "VRFs"),
+            (
+                "vrf_device_assignments_created",
+                "add",
+                "Added",
+                "Device VRF assignment",
+                "Device VRF assignments",
+            ),
+            (
+                "vrf_device_assignments_updated",
+                "fill",
+                "Filled",
+                "Device VRF assignment",
+                "Device VRF assignments",
+            ),
+            (
+                "interface_vrfs_updated",
+                "update",
+                "Updated",
+                "interface VRF assignment",
+                "interface VRF assignments",
+            ),
+            (
+                "prefix_vrf_associations_created",
+                "link",
+                "Linked",
+                "Prefix VRF assignment",
+                "Prefix VRF assignments",
+            ),
         )
         if not any(summary.get(key, 0) for key, *_ in changes):
             self.logger.info("No inventory changes are needed.")
@@ -314,6 +502,13 @@ class DiscoverDevice(Job):
                     count,
                     singular if count == 1 else plural,
                 )
+        ipam = plan.get("ipam", {})
+        if ipam.get("unresolved"):
+            self.logger.info(
+                "Left %s IPAM observations unresolved. The report explains missing evidence, "
+                "Namespace policy and routing conflicts; existing IPAM is preserved.",
+                len(ipam["unresolved"]),
+            )
         if plan["warnings"]:
             count = len(plan["warnings"])
             self.logger.warning(
@@ -393,6 +588,43 @@ class DiscoverDevice(Job):
                 "configuration reads; their source evidence is under Advanced.",
                 summary["switching_defaults"],
             )
+        operational_source = plan.get("layer2", {}).get("operational_source") or {}
+        if operational_source.get("status") in (
+            "not-advertised",
+            "unsupported",
+            "capability-unknown",
+        ):
+            self.logger.info(
+                "Operational switchport mode source is %s. Negotiated mode stays blank "
+                "without supported evidence; configured assignments remain available.",
+                operational_source["status"],
+            )
+        if operational_source.get("status") in ("unavailable", "invalid"):
+            self.logger.warning(
+                "Optional operational switchport source is %s. Discovery continues with "
+                "independently verified configuration; source details are under Advanced.",
+                operational_source["status"],
+            )
+            if operational_source["status"] == "invalid":
+                self.logger.warning(
+                    "Rejected operational switchport data cannot be used for assignments "
+                    "or NTC mode guessing. Existing inventory is preserved."
+                )
+        if operational_source.get("status") == "available" and operational_source.get(
+            "probed_without_advertisement"
+        ):
+            self.logger.info(
+                "Operational switchport source was validated by a direct RESTCONF probe "
+                "because module-library evidence was unavailable. Its revision remains unknown."
+            )
+        if summary.get("switching_operational"):
+            self.logger.info(
+                "Observed actual negotiated access/trunk mode on %s interfaces; %s dynamic "
+                "switchports also have complete, supported configured VLAN assignments. "
+                "The operational source and administrative mode are separate in the report.",
+                summary["switching_operational"],
+                summary["switching_dynamic_resolved"],
+            )
         if summary.get("switching_dynamic"):
             if summary.get("switching_inferred"):
                 self.logger.info(
@@ -405,9 +637,10 @@ class DiscoverDevice(Job):
             else:
                 self.logger.info(
                     "%s interfaces have dynamic switchport configuration. Available configuration "
-                    "is retained separately; their negotiated 802.1Q mode remains blank unless "
-                    "it is established by supported evidence.",
+                    "is retained separately; %s have complete assignments established from their "
+                    "reported negotiated mode. Any unknown negotiated 802.1Q mode remains blank.",
                     summary["switching_dynamic"],
+                    summary.get("switching_dynamic_resolved", 0),
                 )
         if summary.get("interface_vlan_assignments_inferred"):
             self.logger.info(

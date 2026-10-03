@@ -37,8 +37,15 @@ def _finish(plan):
             for row in plan["settings"]
         ),
         "switching_dynamic": sum(
-            row.get("configured_mode") in ("dynamic-auto", "dynamic-desirable")
+            row.get("configured_mode") in ("dynamic-auto", "dynamic-desirable", "dynamic-access")
             for row in plan["settings"]
+        ),
+        "switching_operational": sum(
+            row.get("operational_mode") in ("access", "trunk")
+            for row in plan.get("operational_interfaces", [])
+        ),
+        "switching_dynamic_resolved": sum(
+            row.get("operational_assignment_supported") is True for row in plan["settings"]
         ),
         "switching_inferred": sum(
             isinstance(row.get("inference"), dict) for row in plan["settings"]
@@ -86,12 +93,17 @@ def plan_vlans(discovery, existing, interface_plan=None):
     if not isinstance(source.get("unresolved", []), list):
         plan["errors"].append("Unresolved switching evidence must be a structured list")
         return _finish(plan)
-    for key in ("settings", "not_applicable", "unresolved"):
+    for key in ("settings", "not_applicable", "unresolved", "operational_interfaces"):
         rows = source.get(key, [])
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
             plan["errors"].append("Switching %s evidence must be structured objects" % key)
             return _finish(plan)
         plan[key] = list(rows)
+    operational_source = source.get("operational_source")
+    if operational_source is not None and not isinstance(operational_source, dict):
+        plan["errors"].append("Switchport operational source must be a structured object")
+        return _finish(plan)
+    plan["operational_source"] = operational_source
     for row in plan["settings"]:
         if not isinstance(row.get("field_sources", {}), dict):
             plan["settings"] = []

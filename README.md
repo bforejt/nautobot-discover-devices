@@ -2,7 +2,9 @@
 
 `Discover Device` verifies an existing Nautobot Device against structured facts
 from the device, then fills missing identity, interface, console connector,
-reviewed serialized hardware inventory, and scoped 802.1Q assignments. The first adapter supports Cisco IOS XE switches on 17.9
+reviewed serialized hardware inventory, scoped 802.1Q assignments, configured
+static IPv4 addressing, and explicitly mapped named VRFs. The first adapter
+supports Cisco IOS XE switches on 17.9
 or later using RESTCONF JSON exclusively. The job defaults to a preview.
 
 This project targets Nautobot 3.2. Native `SoftwareVersion` is used for
@@ -11,7 +13,8 @@ Only Nautobot 3.2.5 has been tested. Compatibility with older releases is not
 claimed until the same implementation has been tested on them, including native
 Module inventory and template suppression.
 
-Verified on the lab's Nautobot 3.2.5 and C9300-48UXM running IOS XE 17.12.8.
+Verified on the lab's Nautobot 3.2.5 and C9300-48UXM running IOS XE 17.12.8
+and 17.18.4.
 The live worker apply created 57 missing interfaces and enriched one existing
 interface; a second worker apply produced zero inventory changes. Real ORM
 checks verified software catalog creation, fill-only
@@ -72,6 +75,16 @@ The job form contains these inputs:
 | VLAN Group | None | Explicit Layer-2 domain required for VLAN catalog and interface switching writes |
 | VLAN status | Applicable `Active` | Operator-selected status for newly created VLANs |
 | Use NTC defaults when guessing | Disabled | Apply the reviewed Network to Code Device Onboarding fallback for eligible down dynamic switchports; mark inferred values in the report |
+| Default IPAM namespace | None | Select an existing Namespace to enable static IPv4/VRF reconciliation; blank keeps IPAM report-only |
+| Override IPAM namespace | None | Optional Namespace for RFC1918 and manually entered override networks |
+| Use override for RFC1918 | Enabled | With an override selected, match the three exact RFC1918 ranges |
+| Additional override networks | Blank | IPv4 network CIDRs, one per line, combined with RFC1918 matches |
+| Create missing networks | Enabled | Create exact connected Network Prefixes attached to the Prefix Location |
+| Group matching user VRF names across devices | Disabled | Explicitly group matching user VRF names within one Namespace |
+| Keep these VRF names device-local | `Mgmt-vrf` | Exact exceptions to grouping, one per line |
+| Prefix Location | Closest Site ancestor, otherwise Device Location | Optional Device ancestor override; Location Type must permit Prefixes |
+| New Prefix status | Applicable `Active` | Status for newly created connected Prefixes |
+| New IP Address status | Applicable `Active` | Status for newly created configured IPv4 hosts |
 
 Start with Dry run enabled. The main job log shows progress, readable change
 counts, and brief notices for preserved differences and skipped observations.
@@ -121,6 +134,7 @@ MAC addresses, and descriptions.
 | Native hostname | Fill blank `Device.name`; preserve and report populated disagreement |
 | Chassis serial | Fill blank `Device.serial`; populated disagreement blocks apply |
 | Chassis model | Verify existing DeviceType; disagreement blocks apply |
+| Multiple ready StackWise members | Create or reuse a native VirtualChassis and serial-matched member Devices; record positions, priorities and active master |
 | Provisioned install release | Fill blank native software field using a matching platform SoftwareVersion, creating one if needed |
 | Present interface | Match canonical name within the Device; create missing or enrich blank fields |
 | Configured channel-group | Fill blank member `Interface.lag` with its discovered port-channel |
@@ -131,9 +145,10 @@ MAC addresses, and descriptions.
 | Configured copper duplex | Fill blank `Interface.duplex` from explicit configuration or the narrowly reviewed configured default |
 | Reviewed dedicated management hardware | Mark the confirmed `Gi0/0` as management-only using the narrow purpose-correction policy below |
 | Reviewed physical console connectors | Create or adopt native ConsolePorts, preserving existing names, UUIDs and cables |
-| Management VRF/address configuration | Retain structured evidence; defer assignments until the Namespace mapping is selected |
+| Configured static IPv4 and named VRFs | Reconcile connected Prefixes, hosts and explicit routing memberships after a default Namespace is selected; otherwise report-only |
 | Negotiated and MAC duplex | Retain as observations; never substitute for the configured duplex setting |
 | Supported configured 802.1Q bundle | Fill blank mode and VLAN assignments in the selected VLAN Group |
+| Directly reported ordinary dynamic access/trunk mode | Use the actual mode with known configured VLAN policy to fill the existing 802.1Q fields |
 | Known configuration with unresolved forwarding mode | Retain separate access/native/allowed settings and provenance in the report; leave unsupported native assignments blank |
 | Eligible down dynamic switchport with NTC fallback enabled | Fill blank 802.1Q mode as `tagged-all` and assign its known native VLAN, with explicit inference provenance |
 | Complete structured VLAN database | Reconcile all named VLANs in the selected group, including VLANs without current interface membership |
@@ -154,17 +169,21 @@ The software release comes from explicit `install-oper` version/state leaves.
 An uncommitted provisioned release takes precedence over an older committed
 release. Numeric build suffixes are retained as evidence while releases such
 as `17.12.8` and `17.12.08.0.770` match as `17.12.08`. Software banners are
-not parsed. Unsupported image extensions and multi-member stacks require
-another interpretation increment.
+not parsed. Unsupported image extensions require another interpretation increment.
+For multiple physically present StackWise members, the provisioned installation
+release must be established for every member and agree across the stack.
 
 Interfaces include present physical ports, management ports, SVIs, loopbacks,
 and port-channels. Disconnected ports remain eligible. Administrative state
 maps to `Interface.enabled`; operational state remains an observation and does
 not change lifecycle status. The supported fields are type, enabled, description,
 MTU, MAC, operational speed, supported connector type, documented management-only
-purpose, and configured 802.1Q assignments.
-Routing/Namespace interpretation, IP addresses, cables, unreviewed transceiver
-placements, and additional component profiles are future increments.
+purpose, and configured 802.1Q assignments, including directly reported
+access/trunk selection for ordinary dynamic ports when available.
+Configured static IPv4 and named VRFs are reconciled through the selected
+Namespace policy below. IPv6, dynamic addressing, shared/FHRP addressing,
+cables, unreviewed transceiver placements, and additional component profiles
+are future increments.
 
 LAG membership comes from native interface configuration's structured
 `Cisco-IOS-XE-ethernet:channel-group/number` leaf. The collector includes
@@ -188,6 +207,61 @@ speed. The initial hardware map covers:
 An unsupported physical type or unknown administrative state skips creation
 with an explicit warning. Existing interfaces can still receive independently
 known blank fields. No generic physical type is invented.
+
+## IPAM and named VRFs
+
+Select **Default IPAM namespace** to enable configured static IPv4 and named
+VRF reconciliation. Leaving it blank keeps IPAM report-only even when other
+inventory changes are applied. To use the common split, choose **Internet** as
+the default, **Corporate** as **Override IPAM namespace**, and leave **Use override
+for RFC1918** checked. Add internally used public ranges or other exceptions to
+**Additional override networks**, one IPv4 network CIDR per line. Unchecking
+RFC1918 makes only those manual networks match. The names are operator labels;
+all unmatched addresses use the default without an inferred public designation.
+
+The complete connected network must resolve to one selected Namespace.
+A rule covering only part of its reported subnet remains unresolved. Discovery
+uses explicit configured host/mask data, including shutdown interfaces and
+secondary addresses. With **Create missing networks** enabled, an absent
+connected Prefix is created as a Network and attached to **Prefix Location**.
+The default Location is the closest Site ancestor or the Device's own Location;
+its Location Type must permit Prefix records. Existing network types, Locations,
+IP masks, populated Interface VRFs, statuses and assignments stay preserved.
+
+New named VRFs are device-local by default: local `Mgmt-vrf` on `switch-A`
+becomes canonical **switch-A / Mgmt-vrf**, with the actual name and reported RD
+stored on its VRF Device Assignment. Unused named VRFs are included; newly
+created ones without static addressing use the default Namespace. Existing Device Assignments
+establish identity on repeats, including after a Device rename. **Group matching
+user VRF names across devices** explicitly enables shared names within a
+Namespace; **Keep these VRF names device-local** defaults to `Mgmt-vrf` and
+retains local exceptions. One named VRF cannot span the two selected Namespaces.
+Changing grouping does not migrate existing assignments.
+
+The preview lists rule matches, VRF identities, networks, hosts, assignments and
+hierarchy effects. More specific Prefixes can reparent existing inventory;
+changes to inherited VRF associations, incompatible masks, duplicate/shared
+hosts, exclusive ranges and conflicting site scope are deferred or blocked.
+DHCP, unnumbered and IPv6 remain observations. Device primary IPs are preserved.
+No custom fields are created. Namespace policy is independent of NTC guessing.
+
+See [IPAM discovery](docs/ipam-discovery.md) for the exact input fields,
+RESTCONF/YANG sources, preservation guards, report structure and test coverage.
+
+## StackWise discovery
+
+Stacking follows NtC Device Onboarding's native VirtualChassis/member model and
+`hostname:position` naming for newly created additional members. The selected
+Device keeps its identity, interface ownership, addressing and credentials.
+Stack role selects the VirtualChassis master independently of member number.
+Reported serials join stack nodes to hardware records; response ordering and
+physical inventory indexes never establish member identity. Standalone switches
+remain standalone, and provisioning alone cannot create a physical Device.
+
+See [stacking.md](docs/stacking.md) for the source fields, preservation rules,
+differences from NtC, and current placement limits. Multi-member module/console
+placement is retained as unresolved evidence for a separate increment; the
+existing single-member component and connector discovery continues unchanged.
 
 ## Console and dedicated management ports
 
@@ -237,9 +311,11 @@ Management VRF definitions and configured static IPv4/IPv6 addresses are
 collected separately under `discovery.management`. Operational address values
 remain observations: `0.0.0.0` is not assigned, and an IPv6 address without a
 prefix length does not establish a mask. DHCP, autoconfiguration, EUI-64 and
-anycast flags retain their explicit meaning. VRF/IP writes are deferred until
-the intended Nautobot Namespace and Device-local VRF mapping are selected.
-Existing primary IPs and assignments remain unchanged.
+anycast flags retain their explicit meaning. The broader `discovery.ipam`
+collector supplies static IPv4 and all named VRF facts independently of this
+hardware profile. Select the Namespace policy above to enable those writes;
+IPv6 and dynamic addressing stay observation-only. Existing primary IPs and
+populated assignments remain preserved.
 
 The lab exposes shutdown `Gi0/0` in `Mgmt-vrf` with no configured address;
 its existing primary management address belongs to `Vlan2`. Its console line
@@ -350,14 +426,15 @@ untagged and omitted from the tagged set. An all-VLAN trunk maps to `tagged-all`
 without expanding thousands of tagged relationships. Operational membership,
 an SVI, or the absence of switchport configuration does not establish a mode.
 
-The reviewed `C9300-48UXM` profile for IOS XE 17.9 and 17.12 permits documented
+The reviewed `C9300-48UXM` profile for IOS XE 17.9, 17.12, 17.15, and 17.18 permits documented
 defaults of dynamic auto, access VLAN 1, trunk native VLAN 1, all allowed trunk
 VLANs, and disabled global native tagging. These defaults apply only after
 successful complete reads of the relevant native configuration and an
 identified supported switchport; the report records explicit versus default
 provenance. An explicitly configured ordinary access port with an omitted
-access VID can therefore receive `access` and untagged VLAN 1. A missing mode
-does not become `access`: dynamic auto can negotiate a trunk.
+access VID can therefore receive `access` and untagged VLAN 1. An omitted mode
+alone does not establish `access`: dynamic auto can negotiate a trunk. The
+optional actual-mode source below can resolve that distinction.
 
 Partial known configuration is retained in **Advanced → Worker → Meta →
 discovery_report → discovery → layer2 → settings**, and in the report download.
@@ -372,11 +449,83 @@ below. This increment creates no custom fields.
 
 Management, SVI, and explicitly routed interfaces are classified as not
 applicable to switchport mapping rather than missing switchport information.
-Known dynamic administrative modes are informational; source failures, unknown
-configuration outside a reviewed default profile, voice VLANs, private VLANs,
-802.1Q tunnels, incremental allowed-list operations, and unsupported native
-tagging remain unresolved. Disconnected switchports use the same configuration
+Dynamic administrative modes without a usable actual-mode source are
+informational; source failures, unknown configuration outside a reviewed
+default profile, voice VLANs, private VLANs, 802.1Q tunnels, incremental
+allowed-list operations, and unsupported native tagging remain unresolved.
+Disconnected switchports use the same configuration
 and default rules as connected ports.
+
+### Optional operational switchport mode
+
+When the YANG library advertises `Cisco-IOS-XE-switchport-oper`, discovery reads
+`switchport-oper-data/switchport-info/port-details/oper-mode`. Cisco's
+[published IOS XE 17.14.1 model](https://github.com/YangModels/yang/blob/main/vendor/cisco/xe/17141/Cisco-IOS-XE-switchport-oper.yang),
+revision `2024-03-01`, defines this as actual status after negotiation. A usable
+ordinary dynamic port reported as access or trunk can therefore fill the
+existing Nautobot 802.1Q mode as **Access**, **Tagged**, or **Tagged all**, with
+its VLAN assignments, without enabling guessing. The configured access/native
+VID, allowed policy, and native-tagging checks still determine the VLAN
+assignment; operational VLAN IDs or ranges never substitute for configuration.
+Explicit configured access or trunk mode retains precedence.
+
+The source's `enabled` leaf means switchport rather than routed operation;
+it does not set Nautobot `Interface.enabled`. Usable rows also require present
+hardware and compatible ordinary administrative mode. A directly reported
+dynamic administrative enum can establish an omitted mode on a complete native
+configuration row, but does not extend the reviewed VLAN-default profile to
+other models or releases. Reported voice/private-VLAN/tunnel semantics, routed
+operation, suspended aggregation, or disagreement with configured LAG membership
+block the affected mapping. Down or unknown actual mode leaves unresolved
+assignments blank. The existing opt-in down-port fallback remains available
+only with its independent link-down proof and other guards; it never replaces
+a positive or conflicting actual-mode report.
+
+All raw per-interface facts remain in `discovery.layer2.operational_interfaces`,
+including interfaces without a native configuration row. Compatible
+configuration rows also retain actual
+mode and raw evidence in `discovery.layer2.settings`. Operational VLAN IDs,
+pruning, voice, and aggregation details remain observations. This adds no custom
+fields or new Interface column. `discovery.layer2.operational_source` records
+source status: `not-advertised`, `unsupported`, `unavailable`, `invalid`, or
+`available`. A complete YANG library that does not advertise the module skips
+the request. If the library is unreadable or invalid, the job probes the
+endpoint directly and accepts only validated structured facts, with revision
+left unknown. `capability_status` and `probed_without_advertisement` distinguish
+library evidence from a direct probe. Partial invalid library results are
+discarded rather than supplying module revisions.
+
+The optional operational source uses a 15-second read timeout. HTTP 400 permits
+one unfiltered read of the same endpoint; HTTP 404/501 means `unsupported`,
+and other expected read failures mean `unavailable`. Successful HTTP responses
+with invalid JSON, a non-object body, or malformed or ambiguous structured
+replies mean `invalid`: the entire source is discarded, discovery
+continues, and NTC mode guessing is disabled for that invalid scope even when
+the Job's guessing flag is enabled. Independently validated explicit native
+configuration remains usable. No invalid row or partial result becomes a
+configured default. Required device identity, interfaces, collector input
+validation, cancellation, and unexpected programming errors remain fatal.
+There is no new software-version minimum, SSH transport, or CLI parser.
+Summary `switching_operational` counts positive access/trunk observations;
+`switching_dynamic_resolved` counts complete dynamic bundles resolved from
+those observations, rather than newly written assignments.
+
+Operational rows that match the mandatory interface collector's exact excluded
+names remain observations with `applicability.eligible = false`, `usable = false`,
+and no normalized operational mode. This covers explicitly absent uplink aliases
+and the internal application-hosting interface. They cannot create interfaces,
+contribute positive mode counts, or supply VLAN assignments. Every excluded row
+still receives full schema and duplicate-name validation. A genuinely unknown
+name, inconsistent input exclusion, or malformed row is not silently skipped.
+
+The earlier IOS XE 17.12.8 lab did not advertise this module, and a separate read-only
+probe returned HTTP 404. Three correctly keyed RESTCONF VTP-MIB probes timed
+out after 30 seconds each; the job does not use that alternative. OpenConfig
+VLAN `state/interface-mode` represents
+[applied configuration](https://github.com/YangModels/yang/blob/main/vendor/cisco/xe/17121/openconfig-extensions.yang#L159),
+which does not prove the negotiated DTP result. No device configuration or MIB
+access changes were made. The subsequent IOS XE 17.18.4 live validation is
+recorded below; positive 17.15 behavior remains covered by schema-based fixtures.
 
 ### Optional NTC inference
 
@@ -465,10 +614,13 @@ request `application/yang-data+json`.
 | Optional logical console settings | `/data/Cisco-IOS-XE-native:native/line/console=0` with safe terminal-setting fields only |
 | Optional management configuration | `/data/Cisco-IOS-XE-native:native/interface/GigabitEthernet=0%2F0` with VRF/address fields |
 | Optional management operational evidence | `/data/Cisco-IOS-XE-interfaces-oper:interfaces/interface=GigabitEthernet0%2F0` with VRF/address fields |
-| Optional management VRF definition | `/data/Cisco-IOS-XE-native:native/vrf` with name/RD/address-family fields |
+| Optional named VRF definitions | `/data/Cisco-IOS-XE-native:native/vrf` with definition name/RD/address-family fields |
+| Optional legacy named VRFs | `/data/Cisco-IOS-XE-native:native/ip/vrf` with name/RD fields |
+| Optional configured IPAM | `/data/Cisco-IOS-XE-native:native/interface` with safe family/key/VRF/address field filters |
 | Configured duplex | `/data/Cisco-IOS-XE-native:native/interface` with scoped qualified `Cisco-IOS-XE-ethernet:duplex` fields |
 | Configured LAG membership | `/data/Cisco-IOS-XE-native:native/interface` with qualified `Cisco-IOS-XE-ethernet:channel-group` field filters |
 | Configured 802.1Q mode, native VLAN, and allowed VLANs | `/data/Cisco-IOS-XE-native:native/interface` with complete scoped switchport containers |
+| Optional actual switchport mode, advertised or directly probed when capability is unknown | `/data/Cisco-IOS-XE-switchport-oper:switchport-oper-data` with `switchport-info(if-name;enabled;admin-mode;hardware-present;port-details)` fields |
 | Global native-VLAN tagging configuration | `/data/Cisco-IOS-XE-native:native/vlan` |
 | Structured VLAN names and operational evidence | `/data/Cisco-IOS-XE-vlan-oper:vlans` |
 | Optional model revision evidence | `/data/ietf-yang-library:modules-state` |
@@ -481,10 +633,14 @@ Unavailable platform component data leaves serialized parts unresolved and
 preserves the usable Device and interface discovery. Malformed or contradictory
 serialized identity blocks discovery.
 Unavailable switching sources leave affected bundles unresolved; malformed or
-ambiguous structured switching data blocks discovery. Defaults do not replace
-failed or incomplete source reads.
-HTTPS redirects are rejected. A legacy TLS retry is available only when the
-operator explicitly disables certificate verification.
+ambiguous native configuration or VLAN identity data blocks discovery. Invalid
+optional actual switchport data is discarded as described above. Defaults do
+not replace failed or incomplete source reads.
+IPAM and console/management configuration reads never retry without safe field
+filters; unavailable or malformed IPAM sources preserve existing routing
+inventory and remain in the report. An HTTP 204 VRF subtree records explicit
+absence. HTTPS redirects are rejected. A legacy TLS retry is available only
+when the operator explicitly disables certificate verification.
 
 The channel-group mapping follows the published Cisco Ethernet YANG module
 for [IOS XE 17.9.1](https://raw.githubusercontent.com/YangModels/yang/main/vendor/cisco/xe/1791/Cisco-IOS-XE-ethernet.yang)
@@ -500,9 +656,9 @@ The architecture separates four boundaries:
 
 1. `jobs/transport_restconf.py` owns the GET-only JSON session.
 2. `jobs/adapters/` converts vendor data into versioned common facts and source evidence.
-3. `jobs/reconcile.py`, with component and VLAN subplanners, builds a pure,
+3. `jobs/reconcile.py`, with component, VLAN and IPAM subplanners, builds a pure,
    deterministic fill-only plan.
-4. `jobs/nautobot_inventory.py`, with component and VLAN staging helpers,
+4. `jobs/nautobot_inventory.py`, with component, VLAN and IPAM staging helpers,
    validates and applies it through the Nautobot ORM in one transaction.
 
 RESTCONF, credential resolution, payload helpers, and interface naming reuse
@@ -664,3 +820,46 @@ preserved. A second successful worker apply reported zero inventory changes
 and identical complete snapshots, including the new SFP UUID. The previously
 documented four missing hardware identities and `Vlan2` type conflict remain
 unchanged; there are no new unresolved SFP observations on the lab switch.
+
+The `0.11.0-dev` increment makes optional operational switchport RESTCONF
+discovery best effort while retaining strict validation of required facts.
+It passed 383 offline regressions, lint/format/syntax checks, and 73 real
+Nautobot 3.2.5 ORM checks with zero persistent integration changes. Four live
+GET-only preview cases on the unchanged IOS XE 17.12.8 lab issued zero
+inventory mutation statements: normal discovery; an injected unavailable
+YANG library followed by a real endpoint probe returning HTTP 404; an invalid
+optional structured reply; and an invalid successful-HTTP JSON response.
+The invalid-source cases kept NTC guessing enabled to verify that rejected
+evidence produces zero inferred bundles. The two invalid responses and the
+unavailable library were process-local test injections, not device changes.
+Both the real worker preview and strict apply succeeded with identical
+before/after inventory snapshots and attached reports. The existing `Vlan2`
+type conflict and four unresolved hardware identities remained unchanged.
+At that stage, positive operational-mode cases on 17.15/17.18 were covered by
+offline schema-based tests, and the omitted-leaf default profile had been
+reviewed only for 17.9/17.12/17.15.
+
+The `0.11.1-dev` increment was validated live on IOS XE 17.18.4. Its advertised
+operational switchport model (revision `2024-03-01`) returned HTTP 200 and 66
+rows: 53 eligible interfaces, 12 explicitly absent uplink aliases, and one
+internal application-hosting interface. Only exact exclusions already
+established by required interface discovery are retained as observation-only
+records; unknown names, malformed rows and duplicate canonical names still
+invalidate the whole optional source. The eligible observations include
+access on `TwoGigabitEthernet1/0/1`, trunk on `TenGigabitEthernet1/0/47`, and 51
+down ports. Down dynamic ports do not establish negotiated access/trunk mode.
+The narrow C9300-48UXM configuration-default profile now includes documented
+17.18 defaults; the separate duplex and hardware profiles are unchanged.
+
+Validation passed 388 offline regressions, lint/format/syntax checks, and 73
+real Nautobot 3.2.5 ORM checks with zero persistent integration changes. Live
+strict and opt-in GET-only previews issued zero inventory mutation statements.
+A process-local unavailable-library injection also successfully probed the
+real operational endpoint, retaining an unknown revision and issuing zero
+inventory writes. Real registered worker preview and strict apply both
+succeeded with attached reports and equal before/after inventory snapshots.
+All proposed inventory changes were zero. The source produced no discovery
+warnings. Two suspended LACP member observations (ports 22 and 23) remained
+unresolved without changing their existing configuration or LAG membership;
+the previously recorded `Vlan2` type conflict and four missing hardware
+identities also remain preserved.

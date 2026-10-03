@@ -305,7 +305,7 @@ def build_plan(discovery, existing):
     plan["layer2"] = plan_vlans(discovery, existing, interface_plan=plan)
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["layer2"][key])
-    plan["components"] = plan_components(discovery, existing, interface_plan=plan)
+    plan["components"] = plan_components(discovery, existing, interface_plan=plan, stack_plan=stack)
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["components"][key])
     plan["console_ports"] = plan_console_ports(discovery, existing)

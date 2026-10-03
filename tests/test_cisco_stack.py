@@ -104,15 +104,17 @@ class StackCollectionTests(unittest.TestCase):
         self.assertTrue(result["components"]["items"])
         self.assertEqual(len(result["console_ports"]["items"]), 2)
 
-    def test_stack_physical_components_console_and_management_writes_are_deferred(self):
+    def test_stack_unreviewed_components_console_and_management_writes_are_deferred(self):
         client = FixtureClient(stack_payloads())
         result = cisco.collect(client)
-        self.assertEqual(result["components"]["items"], [])
+        self.assertTrue(
+            all(item["kind"] == "power-supply" for item in result["components"]["items"])
+        )
         self.assertTrue(result["components"]["unresolved"])
         self.assertEqual(result["console_ports"]["items"], [])
         self.assertEqual(result["management"]["interfaces"], [])
         self.assertTrue(result["evidence"]["inventory"])
-        self.assertNotIn(
+        self.assertIn(
             cisco.cisco_components.PLATFORM_PATH,
             [request.split("?", 1)[0] for request in client.requests],
         )

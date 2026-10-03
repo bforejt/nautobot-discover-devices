@@ -91,11 +91,13 @@ member's port type. Explicit configuration remains eligible for duplex, LAG and
 VLAN discovery; single-member default profiles are not extended across a stack.
 The NTC guessing checkbox does not relax stack identity or placement checks.
 
-Serialized module/transceiver placement and physical console/dedicated-management
-classification on multi-member stacks require a separate reviewed ownership
-profile. They remain unresolved with hardware evidence in the report; existing
-records are preserved. The current single-member component/console discovery
-continues unchanged. StackWise link cabling is not inferred from ring status.
+Reviewed PSU bays, serialized assets and native power inlets belong to their
+physical serial-matched member Device, including newly created members. See
+[power-supply-discovery.md](power-supply-discovery.md) for identity, inlet and
+strict-mode requirements. Network modules, transceivers, physical console ports
+and dedicated management-port placement on multi-member stacks remain unresolved
+with hardware evidence in the report. Existing records are preserved. StackWise
+link cabling is not inferred from ring status.
 
 ## Preview and apply
 

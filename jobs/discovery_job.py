@@ -15,7 +15,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.12.0-dev"
+JOB_VERSION = "0.13.0-dev"
 
 
 def _host(device):
@@ -71,8 +71,10 @@ class DiscoverDevice(Job):
         description=(
             "Disabled: leave uncertain values blank. Enabled: use the reviewed Network to Code "
             "Device Onboarding fallback for down dynamic switchports that allow all VLANs: "
-            "Tagged all and their known native VLAN. Guessed values are identified in the report; "
-            "other unresolved data stays blank. Existing populated values are preserved."
+            "Tagged all and their known native VLAN. Also permits Nautobot's 0.95 power-factor "
+            "default for identified PSU inlets when no verified factor is available. Strict "
+            "mode defers new inlets that lack this required value. Guessed values are identified "
+            "in the report; other unresolved data stays blank. Populated values are preserved."
         ),
     )
     verify_tls = BooleanVar(default=True, description="Verify the device HTTPS certificate.")
@@ -436,6 +438,8 @@ class DiscoverDevice(Job):
             ("module_bays_updated", "update", "Updated", "module bay", "module bays"),
             ("modules_created", "add", "Added", "hardware module", "hardware modules"),
             ("modules_updated", "update", "Updated", "hardware module", "hardware modules"),
+            ("power_ports_created", "add", "Added", "power inlet", "power inlets"),
+            ("power_ports_updated", "update", "Updated", "power inlet", "power inlets"),
             (
                 "interface_modules_updated",
                 "link",
@@ -554,6 +558,8 @@ class DiscoverDevice(Job):
                 "Serialized component model or serial number is unavailable",
                 "Component identity is unavailable; presence or occupancy "
                 "is not inferred from operational state",
+                "PSU serialized identity is unavailable; occupancy is retained from empty "
+                "and asset identity is not inferred from operational power state",
             }
             missing_identity = sum(
                 row.get("reason") in missing_identity_reasons
@@ -567,7 +573,20 @@ class DiscoverDevice(Job):
                     missing_identity,
                     "record" if missing_identity == 1 else "records",
                 )
-            remaining = summary["unresolved_components"] - missing_identity
+            unknown_power_factor = sum(
+                row.get("reason") == "New PowerPort requires a power factor; "
+                "no documented value or enabled NtC default is available"
+                for row in plan.get("components", {}).get("unresolved", [])
+            )
+            if unknown_power_factor:
+                self.logger.info(
+                    "Deferred %s new PSU power %s because Nautobot requires a power factor "
+                    "and the device did not provide a verified value. Bays and identified assets "
+                    "remain eligible; the NTC defaults option permits the inferred 0.95 default.",
+                    unknown_power_factor,
+                    "inlet" if unknown_power_factor == 1 else "inlets",
+                )
+            remaining = summary["unresolved_components"] - missing_identity - unknown_power_factor
             if remaining:
                 self.logger.warning(
                     "Left %s hardware %s unresolved because identity or placement "
@@ -576,6 +595,15 @@ class DiscoverDevice(Job):
                     remaining,
                     "observation" if remaining == 1 else "observations",
                 )
+        if summary.get("power_ports_inferred"):
+            self.logger.info(
+                "%s Nautobot's power-factor default of 0.95 for %s PSU "
+                "inlet observations. This is an inferred value, not a measurement; "
+                "the NTC defaults option explicitly permits it and its provenance is in "
+                "the report.",
+                "Would use" if dryrun else "Used",
+                summary["power_ports_inferred"],
+            )
         if summary.get("switching_not_applicable"):
             self.logger.info(
                 "Switchport VLAN mapping does not apply to %s management, routed, or "

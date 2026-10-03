@@ -128,6 +128,7 @@ def _objects(
     vlan_status,
     ipam_prefix_status=None,
     ipam_ip_address_status=None,
+    stack=None,
 ):
     if plan["errors"]:
         raise InventoryError("; ".join(plan["errors"]))
@@ -161,11 +162,26 @@ def _objects(
             setattr(device, change["field"], change["after"])
     memberships, ownerships = [], []
     component_plan = plan["components"]
+    devices_by_serial = {}
+    selected_serial = plan.get("stack", {}).get("identity", {}).get("serial")
+    if selected_serial:
+        devices_by_serial[selected_serial] = device
+    if stack is not None:
+        devices_by_serial.update(
+            {member.serial: member for member in stack["members"].values() if member.serial}
+        )
     components = (
         component_objects(
-            component_plan, device, module_status=module_status, status_resolver=_status
+            component_plan,
+            device,
+            module_status=module_status,
+            status_resolver=_status,
+            devices_by_serial=devices_by_serial,
         )
-        if component_plan["modules"] or component_plan["module_types"]
+        if component_plan["modules"]
+        or component_plan["module_types"]
+        or component_plan["bays"]
+        or component_plan.get("power_ports")
         else None
     )
     vlan_plan = plan["layer2"]
@@ -278,6 +294,7 @@ def validate_plan(
             vlan_status,
             ipam_prefix_status,
             ipam_ip_address_status,
+            stack=stack,
         )
     )
     if version is not None:
@@ -396,6 +413,7 @@ def apply_discovery(
                 vlan_status,
                 ipam_prefix_status,
                 ipam_ip_address_status,
+                stack=stack,
             )
         )
         save_stack(stack)

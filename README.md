@@ -74,7 +74,7 @@ The job form contains these inputs:
 | Module status | Applicable `Active` | Status for newly created serialized Modules |
 | VLAN Group | None | Explicit Layer-2 domain required for VLAN catalog and interface switching writes |
 | VLAN status | Applicable `Active` | Operator-selected status for newly created VLANs |
-| Use NTC defaults when guessing | Disabled | Apply the reviewed Network to Code Device Onboarding fallback for eligible down dynamic switchports; mark inferred values in the report |
+| Use NTC defaults when guessing | Disabled | Apply the reviewed Network to Code Device Onboarding fallback for eligible down dynamic switchports and Nautobot's 0.95 power-factor default for new PSU inlets; mark inferred values in the report |
 | Default IPAM namespace | None | Select an existing Namespace to enable static IPv4/VRF reconciliation; blank keeps IPAM report-only |
 | Override IPAM namespace | None | Optional Namespace for RFC1918 and manually entered override networks |
 | Use override for RFC1918 | Enabled | With an override selected, match the three exact RFC1918 ranges |
@@ -259,9 +259,9 @@ physical inventory indexes never establish member identity. Standalone switches
 remain standalone, and provisioning alone cannot create a physical Device.
 
 See [stacking.md](docs/stacking.md) for the source fields, preservation rules,
-differences from NtC, and current placement limits. Multi-member module/console
-placement is retained as unresolved evidence for a separate increment; the
-existing single-member component and connector discovery continues unchanged.
+differences from NtC, and current placement limits. Reviewed PSU bays, assets
+and inlets belong to physical member Devices. Other multi-member components and
+console placement remain unresolved pending separate reviewed profiles.
 
 ## Console and dedicated management ports
 
@@ -326,9 +326,10 @@ and [management-port guide](https://www.cisco.com/c/en/us/td/docs/switches/lan/c
 
 ## Serialized components
 
-The current component profile covers only the `C9300-48UXM` chassis with a
-`C3850-NM-4-1G` uplink module and `PWR-C1-1100WAC-P` power supplies. Resolved
-parts use Nautobot's native `ModuleType`, `ModuleBay`, and `Module` models and
+Uplink and transceiver profiles cover the `C9300-48UXM` chassis with a
+`C3850-NM-4-1G` uplink module. PSU profiles cover exact reviewed C9300, C9300L,
+C9300LM and C9300X chassis and compatible power supplies. Resolved parts use
+Nautobot's native `ModuleType`, `ModuleBay`, and `Module` models and
 appear in the normal module inventory GUI. The Device's module bays represent
 placement; its uplink interfaces reference their installed Module. Existing
 interfaces are adopted in place, preserving UUIDs, names, Device association,
@@ -356,11 +357,21 @@ ports before the discovered interfaces are adopted. On a release without the
 required suppression support, populated templates block apply.
 
 PSU A and three fans in the lab have no structured PID or serial and remain
-unresolved observations. A disabled PSU reporting `no-input` does not establish
-that its bay is vacant. Unknown serialized parts and unreviewed placement also
+unresolved assets. Both documented PSU bays can be created independently of
+asset identity. A disabled PSU reporting `no-input` does not establish that its
+bay is vacant; no recorded Module means that no identified asset is recorded.
+Unknown serialized parts and unreviewed placement also
 remain unresolved, with evidence for the next interpretation increment. Exact
 reviewed stack aggregate aliases are excluded; matching a chassis serial alone
 does not exclude another component.
+
+Identified PSUs can own native PowerPorts with documented inlet connector
+types. Strict mode defers new inlets when their required power factor is
+unknown. The existing guessing option permits Nautobot's 0.95 default and marks
+it as inferred. Existing inlet values and cables are preserved; output ratings
+and operational readings do not become configured input draw. See
+[power-supply-discovery.md](docs/power-supply-discovery.md) for coverage,
+stack-member placement and validation.
 
 SFPs installed in the reviewed C3850-NM-4-1G uplink ports are serialized native
 Modules in nested ModuleBays under the uplink Module, following

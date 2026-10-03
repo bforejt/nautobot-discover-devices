@@ -612,26 +612,22 @@ def collect(client, *, use_ntc_defaults=False):
         )
     except cisco_duplex.DuplexDiscoveryError as exc:
         raise DiscoveryError(str(exc)) from None
+    try:
+        components = cisco_components.collect(
+            client,
+            inventory,
+            chassis_model=model,
+            chassis_serial=serial,
+            member=member,
+            interfaces=interfaces,
+            warnings=warnings,
+            stack=stack,
+            use_ntc_defaults=use_ntc_defaults,
+        )
+    except cisco_components.ComponentDiscoveryError as exc:
+        raise DiscoveryError(str(exc)) from None
     if stack["is_stack"]:
         reason = cisco_stack.DEFERRED_PLACEMENT
-        components = {
-            "schema_version": 1,
-            "items": [],
-            "writes_deferred_reason": reason,
-            "excluded": [],
-            "unresolved": [
-                {
-                    "name": _text(row.get("dev-name")),
-                    "model": _text(row.get("part-number")),
-                    "serial": _text(row.get("serial-number")),
-                    "hw_type": _enum(row.get("hw-type")),
-                    "reason": reason,
-                }
-                for row in inventory
-                if _enum(row.get("hw-type")) != "hw-type-chassis"
-                and _text(row.get("serial-number"))
-            ],
-        }
         console_ports = {
             "schema_version": 1,
             "items": [],
@@ -646,18 +642,6 @@ def collect(client, *, use_ntc_defaults=False):
             "writes_deferred_reason": reason,
         }
     else:
-        try:
-            components = cisco_components.collect(
-                client,
-                inventory,
-                chassis_model=model,
-                chassis_serial=serial,
-                member=member,
-                interfaces=interfaces,
-                warnings=warnings,
-            )
-        except cisco_components.ComponentDiscoveryError as exc:
-            raise DiscoveryError(str(exc)) from None
         console_ports, management = cisco_access_ports.collect(
             client, interfaces, model=model, member=member
         )

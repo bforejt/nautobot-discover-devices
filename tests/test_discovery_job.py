@@ -87,6 +87,8 @@ CHANGE_COUNTERS = {
     "module_bays_updated": (r"(?:module )?bays?", r"updat|enrich"),
     "modules_created": (r"modules?", r"creat|new|add"),
     "modules_updated": (r"modules?", r"updat|enrich"),
+    "power_ports_created": (r"power inlets?", r"creat|new|add"),
+    "power_ports_updated": (r"power inlets?", r"updat|enrich"),
     "interface_modules_updated": (r"interface", r"ownership|module|link"),
     "vlans_created": (r"vlans?", r"creat|new|add"),
     "vlans_updated": (r"vlans?", r"updat|enrich"),
@@ -551,6 +553,15 @@ class DiscoveryJobTests(unittest.TestCase):
         self.assertNotIn("Interface Vlan2:", messages)
         self.assertEqual(self.assert_saved_report()["plan"], self.preview_plan)
 
+    def test_power_factor_inference_is_explicit_and_preview_does_not_claim_apply(self):
+        self.preview_plan["summary"].update(power_ports_created=1, power_ports_inferred=1)
+        self.job.run(self.device, use_ntc_defaults=True)
+        messages = "\n".join(rendered_logs(self.job.logger, "info"))
+        self.assertIn("Would use Nautobot's power-factor default of 0.95", messages)
+        self.assertIn("inferred value, not a measurement", messages)
+        self.assertIn("NTC defaults option explicitly permits it", messages)
+        self.assertTrue(self.assert_saved_report()["dry_run"])
+
     def test_hardware_warning_identifies_missing_identity_and_other_gaps_separately(self):
         self.preview_plan["summary"].update(unresolved_components=5)
         self.preview_plan["components"] = {
@@ -563,7 +574,10 @@ class DiscoveryJobTests(unittest.TestCase):
                     "empty": False,
                     "oper_status": "disabled" if type_ == "comp-power-supply" else "enabled",
                     "reason": (
-                        "Component identity is unavailable; presence or occupancy "
+                        "PSU serialized identity is unavailable; occupancy is retained from empty "
+                        "and asset identity is not inferred from operational power state"
+                        if type_ == "comp-power-supply"
+                        else "Component identity is unavailable; presence or occupancy "
                         "is not inferred from operational state"
                     ),
                 }
@@ -585,6 +599,24 @@ class DiscoveryJobTests(unittest.TestCase):
         self.assertNotIn("private-placement-sentinel", warnings)
         self.job.logger.error.assert_not_called()
         self.assertEqual(self.assert_saved_report()["plan"], self.preview_plan)
+
+    def test_strict_unknown_power_factor_is_logged_as_an_expected_inlet_deferral(self):
+        self.preview_plan["summary"].update(unresolved_components=1, module_bays_created=1)
+        self.preview_plan["components"] = {
+            "unresolved": [
+                {
+                    "key": "psu:1/B:power:Power Input",
+                    "reason": "New PowerPort requires a power factor; "
+                    "no documented value or enabled NtC default is available",
+                }
+            ]
+        }
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "info"))
+        self.assertIn("Deferred 1 new PSU power inlet because", messages)
+        self.assertIn("Bays and identified assets remain eligible", messages)
+        self.job.logger.warning.assert_not_called()
+        self.job.logger.error.assert_not_called()
 
     def test_repeat_run_keeps_dynamic_classification_without_reporting_a_change(self):
         repeated = plan(switching_dynamic=34, switching_defaults=53, switching_not_applicable=5)

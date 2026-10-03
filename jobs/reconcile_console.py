@@ -21,15 +21,17 @@ def _name(value):
     return value.strip().casefold() if isinstance(value, str) else None
 
 
-def reviewed_profile(source, model):
-    """Accept only provenance for this explicitly reviewed, single-member chassis."""
+def reviewed_profile(source, model, member=1):
+    """Accept the documented connector profile for a validated physical member."""
     return (
         isinstance(source, dict)
         and source.get("method") == "reviewed-hardware-profile"
         and source.get("profile") == PROFILE
         and source.get("model") == model == MODEL
         and type(source.get("member")) is int
-        and source["member"] == 1
+        and type(member) is int
+        and 1 <= member <= 255
+        and source["member"] == member
         and isinstance(source.get("documents"), list)
         and all(isinstance(url, str) for url in source["documents"])
         and bool(DOCUMENTS.intersection(source["documents"]))
@@ -45,7 +47,7 @@ def _finish(plan):
     return plan
 
 
-def plan_console_ports(discovery, existing):
+def _plan_console_ports(discovery, existing, *, member=1):
     """Fill native connector fields while preserving existing identity and cabling.
 
     A reviewed profile establishes one connector of each supported type. A
@@ -118,7 +120,7 @@ def plan_console_ports(discovery, existing):
             or item.get("key") not in CONNECTORS
             or item.get("type") != CONNECTORS[item["key"]]
             or not _name(item.get("name"))
-            or not reviewed_profile(item.get("source"), discovery["identity"].get("model"))
+            or not reviewed_profile(item.get("source"), discovery["identity"].get("model"), member)
             or any(
                 item.get(field) is not None and not isinstance(item[field], str)
                 for field in ("label", "description")
@@ -210,4 +212,104 @@ def plan_console_ports(discovery, existing):
                 else "discovery-standardized connector name",
             }
         )
+    return _finish(plan)
+
+
+def plan_console_ports(discovery, existing, *, stack_plan=None):
+    """Reconcile physical connectors independently within each validated Device."""
+    source = discovery.get("console_ports")
+    stack_source = discovery.get("stack")
+    if (
+        not isinstance(stack_source, dict)
+        or stack_source.get("is_stack") is not True
+        or not isinstance(source, dict)
+        or not isinstance(source.get("items"), list)
+        or not source["items"]
+    ):
+        return _plan_console_ports(discovery, existing)
+    empty = {**discovery, "console_ports": {**source, "items": []}}
+    plan = _plan_console_ports(empty, existing)
+    if plan["errors"]:
+        return plan
+    if (
+        not isinstance(stack_plan, dict)
+        or stack_plan.get("errors")
+        or not stack_plan.get("virtual_chassis")
+        or not isinstance(stack_plan.get("members"), list)
+        or len(stack_plan["members"]) < 2
+    ):
+        plan["errors"].append("Console placement requires a validated physical stack plan")
+        return _finish(plan)
+    owners = {row["serial"]: row for row in stack_plan["members"]}
+    groups = defaultdict(list)
+    for item in source["items"]:
+        owner = owners.get(item.get("device_serial")) if isinstance(item, dict) else None
+        evidence = item.get("source") if isinstance(item, dict) else None
+        if (
+            owner is None
+            or item.get("member") != owner["position"]
+            or type(item.get("member")) is not int
+            or item.get("chassis_model") != owner["model"]
+            or not isinstance(evidence, dict)
+            or evidence.get("device_serial") != owner["serial"]
+            or not isinstance(evidence.get("identity"), dict)
+            or not isinstance(evidence.get("membership"), dict)
+            or not evidence["identity"]
+            or not evidence["membership"]
+        ):
+            plan["errors"].append("Console connector ownership disagrees with the physical member")
+            continue
+        groups[owner["serial"]].append(item)
+    if plan["errors"]:
+        return _finish(plan)
+    catalog = existing.get("console_inventory", {})
+    type_ids = {row["model"]: row.get("existing_id") for row in stack_plan["device_types"]}
+    template_map = catalog.get("templates_by_device_type", {})
+    for serial in sorted(groups):
+        owner = owners[serial]
+        device_id = owner.get("existing_id")
+        rows = [
+            row
+            for row in catalog.get("ports", [])
+            if device_id is not None
+            and (
+                str(row.get("device_id")) == str(device_id)
+                or owner["selected"]
+                and row.get("device_id") is None
+            )
+        ]
+        templates = template_map.get(type_ids[owner["model"]], [])
+        if not template_map and owner["selected"]:
+            templates = catalog.get("templates", [])
+        scoped = _plan_console_ports(
+            {
+                **discovery,
+                "identity": {**discovery["identity"], "model": owner["model"]},
+                "console_ports": {
+                    **source,
+                    "items": groups[serial],
+                    "unresolved": [],
+                    "observations": {},
+                },
+            },
+            {
+                **existing,
+                "console_inventory": {
+                    "supported": catalog.get("supported", False),
+                    "ports": rows,
+                    "templates": templates,
+                },
+            },
+            member=owner["position"],
+        )
+        for field in ("creates", "updates", "conflicts", "errors", "warnings", "unresolved"):
+            for row in scoped[field]:
+                if isinstance(row, dict):
+                    row = {
+                        **row,
+                        "device_serial": serial,
+                        "device_id": device_id,
+                        "member_position": owner["position"],
+                    }
+                plan[field].append(row)
     return _finish(plan)

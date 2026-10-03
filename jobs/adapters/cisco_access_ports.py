@@ -340,6 +340,96 @@ def _vrf_config(payload, wanted):
     return {"definitions": result, "source": _source(NATIVE_MODULE, VRF_PATH, VRF_FIELDS)}
 
 
+def _console_connectors(model, member):
+    profile = _hardware_source(model, member)
+    items = []
+    for key, name, connector, position in (
+        ("console:rj45", "Console RJ45", "rj-45", "rear"),
+        ("console:usb", "Console USB", "usb-mini-b", "front"),
+    ):
+        source = deepcopy(profile)
+        source.update(
+            {
+                "meaning": "Physical console connector documented for the observed chassis PID",
+                "position": position,
+                "name_origin": (
+                    "Discovery-standardized connector name; not an observed faceplate label"
+                ),
+                "shared_logical_console": "0",
+            }
+        )
+        items.append({"key": key, "name": name, "type": connector, "label": None, "source": source})
+    return items
+
+
+def collect_stack_consoles(stack):
+    """Documented physical connectors on serial-validated, present stack members.
+
+    Console line configuration from the active control plane cannot establish
+    terminal settings on every member. Only physical inventory is emitted.
+    """
+    if not isinstance(stack, dict) or stack.get("is_stack") is not True:
+        raise _ScopedDataError("Physical stack consoles require validated stack membership")
+    members = stack.get("members")
+    if not isinstance(members, list) or len(members) < 2:
+        raise _ScopedDataError("Physical stack consoles require multiple present members")
+    result = {
+        "schema_version": 1,
+        "items": [],
+        "unresolved": [],
+        "observations": {
+            "stack_scope": {
+                "source": {
+                    "module": "Cisco-IOS-XE-stack-oper",
+                    "path": "/data/Cisco-IOS-XE-stack-oper:stack-oper-data",
+                },
+                "meaning": "Physical member connectors; logical console settings are not copied",
+            },
+        },
+    }
+    serials, positions = set(), set()
+    for owner in members:
+        if not isinstance(owner, dict):
+            raise _ScopedDataError("Console owner must be a structured stack member")
+        serial, position, model = owner.get("serial"), owner.get("position"), owner.get("model")
+        if (
+            not isinstance(serial, str)
+            or not serial.strip()
+            or serial != serial.strip()
+            or type(position) is not int
+            or not 1 <= position <= 255
+            or serial in serials
+            or position in positions
+            or owner.get("state") != "state-ready"
+            or owner.get("stack_mode") != "mode-stackwise-rear"
+            or not isinstance(owner.get("sources"), dict)
+            or not owner["sources"].get("identity")
+            or not owner["sources"].get("membership")
+        ):
+            raise _ScopedDataError("Console owner lacks unique validated physical identity")
+        serials.add(serial)
+        positions.add(position)
+        if model != MODEL:
+            result["unresolved"].append(
+                {
+                    "device_serial": serial,
+                    "member": position,
+                    "model": model,
+                    "reason": "No reviewed console hardware profile for this chassis",
+                }
+            )
+            continue
+        for item in _console_connectors(model, position):
+            item.update(device_serial=serial, member=position, chassis_model=model)
+            item["source"].update(
+                device_serial=serial,
+                identity=deepcopy(owner["sources"]["identity"]),
+                membership=deepcopy(owner["sources"]["membership"]),
+            )
+            result["items"].append(item)
+    return result
+
+
 def collect(client, interfaces, *, model, member):
     """Inventory reviewed connectors; retain safe optional configuration evidence."""
     console = {"schema_version": 1, "items": [], "unresolved": [], "observations": {}}
@@ -356,24 +446,7 @@ def collect(client, interfaces, *, model, member):
         )
         return console, management
     profile = _hardware_source(model, member)
-    for key, name, connector, position in (
-        ("console:rj45", "Console RJ45", "rj-45", "rear"),
-        ("console:usb", "Console USB", "usb-mini-b", "front"),
-    ):
-        source = deepcopy(profile)
-        source.update(
-            {
-                "meaning": "Physical console connector documented for the observed chassis PID",
-                "position": position,
-                "name_origin": (
-                    "Discovery-standardized connector name; not an observed faceplate label"
-                ),
-                "shared_logical_console": "0",
-            }
-        )
-        console["items"].append(
-            {"key": key, "name": name, "type": connector, "label": None, "source": source}
-        )
+    console["items"] = _console_connectors(model, member)
     line = _read(client, CONSOLE_PATH, CONSOLE_FIELDS, "console_line", console["unresolved"])
     observed = _optional(_console_line, line, "console_line", CONSOLE_PATH, console["unresolved"])
     if observed is not None:

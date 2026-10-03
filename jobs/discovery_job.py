@@ -15,7 +15,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.13.0-dev"
+JOB_VERSION = "0.14.0-dev"
 
 
 def _host(device):
@@ -407,6 +407,13 @@ class DiscoverDevice(Job):
             ("virtual_chassis_updated", "update", "Updated", "virtual chassis", "virtual chassis"),
             ("stack_members_created", "add", "Added", "stack member", "stack members"),
             ("stack_members_updated", "update", "Updated", "stack member", "stack members"),
+            (
+                "stack_member_software_assigned",
+                "assign",
+                "Assigned",
+                "stack member software version",
+                "stack member software versions",
+            ),
             ("device_types_created", "add", "Added", "device type", "device types"),
             ("console_ports_created", "add", "Added", "console port", "console ports"),
             ("console_ports_updated", "update", "Updated", "console port", "console ports"),
@@ -595,6 +602,13 @@ class DiscoverDevice(Job):
                     remaining,
                     "observation" if remaining == 1 else "observations",
                 )
+        if summary.get("deferred_interface_ownership"):
+            self.logger.info(
+                "Deferred %s interface-to-module links across stack member Devices. "
+                "Physical modules remain eligible on their confirmed members; existing "
+                "network interface ownership is preserved. Details are in the report.",
+                summary["deferred_interface_ownership"],
+            )
         if summary.get("power_ports_inferred"):
             self.logger.info(
                 "%s Nautobot's power-factor default of 0.95 for %s PSU "

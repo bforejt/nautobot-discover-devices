@@ -42,6 +42,9 @@ class CiscoComponentTests(unittest.TestCase):
         self.assertEqual(optic["serial"], "LABOPTIC001")
         self.assertEqual(optic["hardware_revision"], "V03")
         self.assertEqual(optic["parent_key"], "uplink:1/1")
+        self.assertEqual(optic["device_serial"], "LAB93000001")
+        self.assertEqual(optic["member"], 1)
+        self.assertEqual(optic["chassis_model"], "C9300-48UXM")
         self.assertEqual(optic["interfaces"], [])
         self.assertEqual(
             optic["bay"],
@@ -230,6 +233,9 @@ class CiscoComponentTests(unittest.TestCase):
         self.assertEqual(uplink["model"], "C3850-NM-4-1G")
         self.assertEqual(uplink["serial"], "LABUPLINK001")
         self.assertEqual(uplink["hardware_revision"], "V01")
+        self.assertEqual(uplink["device_serial"], "LAB93000001")
+        self.assertEqual(uplink["member"], 1)
+        self.assertEqual(uplink["chassis_model"], "C9300-48UXM")
         self.assertEqual(
             uplink["bay"], {"name": "Uplink Module 1", "position": "1", "label": "Uplink Module 1"}
         )

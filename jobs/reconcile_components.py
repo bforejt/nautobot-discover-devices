@@ -29,6 +29,7 @@ def _finish(plan):
         "module_bays_created": sum(row["create"] for row in plan["bays"]),
         "module_bays_updated": sum(bool(row["changes"]) for row in plan["bays"]),
         "interface_modules_updated": len(plan["interface_assignments"]),
+        "deferred_interface_ownership": len(plan["interface_ownership_deferred"]),
         "power_ports_created": sum(row["create"] for row in plan["power_ports"]),
         "power_ports_updated": sum(bool(row["changes"]) for row in plan["power_ports"]),
         "power_ports_inferred": sum(
@@ -61,6 +62,7 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
         "modules": [],
         "power_ports": [],
         "interface_assignments": [],
+        "interface_ownership_deferred": [],
         "conflicts": [],
         "errors": [],
         "warnings": [],
@@ -212,11 +214,21 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
             if member is not None:
                 error("Component %s requires a chassis serial for member placement" % raw["key"])
                 return None
-            return inherited or selected_owner
-        if _text(serial) != serial or serial not in owners:
-            error("Component %s has an unresolved chassis owner" % raw["key"])
+            owner = inherited or selected_owner
+            serial = owner["device_serial"]
+        else:
+            if _text(serial) != serial or serial not in owners:
+                error("Component %s has an unresolved chassis owner" % raw["key"])
+                return None
+            owner = owners[serial]
+        chassis_model = raw.get("chassis_model")
+        if chassis_model is not None and (
+            _text(chassis_model) != chassis_model
+            or owner_models.get(serial) is not None
+            and owner_models[serial] != chassis_model
+        ):
+            error("Component %s disagrees with its validated chassis model" % raw["key"])
             return None
-        owner = owners[serial]
         if member is not None and (
             type(member) is not int
             or not 1 <= member <= 255
@@ -362,6 +374,54 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
                 invalid_keys.add(key)
             else:
                 item["owner"] = owner
+                ownership = item.get("source", {}).get("ownership")
+                if ownership is not None and not isinstance(ownership, dict):
+                    error("Component %s has unstructured ownership provenance" % key)
+                    invalid_keys.add(key)
+                    continue
+                ownership = ownership or {}
+                owner_claims = {
+                    "device_serial": owner["device_serial"],
+                    "member": owner["member_position"] or item.get("member"),
+                    "chassis_model": owner_models.get(owner["device_serial"]),
+                }
+                if item["parent_key"] is not None:
+                    parent_item = items[item["parent_key"]]
+                    owner_claims.update(
+                        parent_key=parent_item["key"],
+                        parent_model=parent_item["model"],
+                        parent_serial=parent_item["serial"],
+                    )
+                    parent_interface = ownership.get("interface")
+                    if parent_interface is not None and (
+                        _text(parent_interface) is None
+                        or canonical_interface_name(parent_interface)
+                        not in parent_item["interfaces"]
+                    ):
+                        error("Component %s claims an interface outside its parent module" % key)
+                        invalid_keys.add(key)
+                        continue
+                elif any(
+                    ownership.get(field) is not None
+                    for field in ("parent_key", "parent_model", "parent_serial")
+                ):
+                    error("Component %s claims a module parent without nested placement" % key)
+                    invalid_keys.add(key)
+                    continue
+                if any(
+                    field in ownership
+                    and (
+                        ownership[field] != expected
+                        or field == "member"
+                        and type(ownership[field]) is not int
+                    )
+                    for field, expected in owner_claims.items()
+                ):
+                    error(
+                        "Component %s ownership provenance contradicts its parent or chassis" % key
+                    )
+                    invalid_keys.add(key)
+                    continue
                 owner_key = owner["device_serial"] or owner["device_id"]
                 bay_claims[(owner_key, item["parent_key"], item["bay"]["name"])].append(key)
     for keys in bay_claims.values():
@@ -871,10 +931,36 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
                     continue
                 interface = matches[0] if matches else None
                 interface_owner = _id(interface.get("device_id")) if interface else None
-                if item["owner"]["device_id"] != (interface_owner or device_id):
-                    plan["warnings"].append(
-                        "Component %s: preserving interface %s on its existing Device" % (key, name)
+                if item["owner"]["device_id"] != device_id or interface_owner not in (
+                    None,
+                    device_id,
+                ):
+                    reason = (
+                        "Interface and physical component are not both owned by the selected Device"
                     )
+                    plan["interface_ownership_deferred"].append(
+                        {
+                            "name": interface["name"] if interface else name,
+                            "id": _id(interface["id"]) if interface else None,
+                            "module_key": key,
+                            "module_id": module["id"],
+                            "interface_device_id": interface_owner or device_id,
+                            **item["owner"],
+                            "reason": reason,
+                        }
+                    )
+                    expected_defer = item["owner"][
+                        "device_id"
+                    ] != device_id and interface_owner in (
+                        None,
+                        device_id,
+                        item["owner"]["device_id"],
+                    )
+                    if not expected_defer:
+                        plan["warnings"].append(
+                            "Component %s: preserving interface %s on its existing Device"
+                            % (key, name)
+                        )
                     continue
                 if interface is None and name not in planned_interfaces:
                     plan["warnings"].append(

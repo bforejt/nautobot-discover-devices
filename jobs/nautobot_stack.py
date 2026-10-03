@@ -4,6 +4,7 @@ from contextlib import nullcontext
 
 from django.db.models import Q
 
+from .adapters.cisco_iosxe import canonical_software_version
 from .exceptions import InventoryError
 
 
@@ -31,6 +32,11 @@ def _device_row(device):
         "role_id": str(device.role_id),
         "status_id": str(device.status_id),
         "platform_id": str(device.platform_id) if device.platform_id else None,
+        "platform_network_driver": device.platform.network_driver if device.platform_id else None,
+        "software_version_id": str(device.software_version_id)
+        if device.software_version_id
+        else None,
+        "software_version": device.software_version.version if device.software_version_id else None,
         "virtual_chassis_id": str(device.virtual_chassis_id) if device.virtual_chassis_id else None,
         "vc_position": device.vc_position,
         "vc_priority": device.vc_priority,
@@ -83,7 +89,7 @@ def snapshot_stack(device, *, discovery=None, lock=False):
     candidates |= Q(virtual_chassis_id__in=chassis_ids)
     devices = list(
         _locked(Device.objects.filter(candidates), lock)
-        .select_related("device_type__manufacturer")
+        .select_related("device_type__manufacturer", "software_version", "platform")
         .order_by("pk")
     )
     manufacturer_ids = {device.device_type.manufacturer_id}
@@ -93,6 +99,14 @@ def snapshot_stack(device, *, discovery=None, lock=False):
             Manufacturer.objects.filter(pk__in=manufacturer_ids).select_for_update().order_by("pk")
         )
     types = _locked(DeviceType.objects.filter(manufacturer_id__in=manufacturer_ids), lock)
+    from nautobot.dcim.models import Platform, SoftwareVersion
+
+    platform_ids = {row.platform_id for row in devices if row.platform_id}
+    if device.platform_id:
+        platform_ids.add(device.platform_id)
+    if lock:
+        list(Platform.objects.filter(pk__in=platform_ids).order_by("pk").select_for_update())
+    versions = _locked(SoftwareVersion.objects.filter(platform_id__in=platform_ids), lock)
     return {
         "supported": True,
         "selected": _device_row(device),
@@ -108,6 +122,10 @@ def snapshot_stack(device, *, discovery=None, lock=False):
         "device_types": [
             {"id": str(row.pk), "model": row.model, "manufacturer_id": str(row.manufacturer_id)}
             for row in types.order_by("pk")
+        ],
+        "software_versions": [
+            {"id": str(row.pk), "version": row.version, "platform_id": str(row.platform_id)}
+            for row in versions.order_by("pk")
         ],
     }
 
@@ -140,7 +158,7 @@ def _suppression_context(device_type):
     return SkipAutoComponentCreation()
 
 
-def stack_objects(plan, device):
+def stack_objects(plan, device, *, software_version_status=None, status_resolver=None):
     """Construct a complete cached native graph without writing inventory."""
     if not plan or plan.get("virtual_chassis") is None:
         return None
@@ -165,6 +183,38 @@ def stack_objects(plan, device):
         if obj.model != spec["model"] or str(obj.manufacturer_id) != spec["manufacturer_id"]:
             raise InventoryError("Stack member DeviceType identity changed after planning")
         types[spec["model"]] = obj
+    from nautobot.dcim.models import SoftwareVersion
+
+    versions = {}
+    for spec in plan.get("software_versions", []):
+        if spec["create"]:
+            if status_resolver is None:
+                from nautobot.extras.models import Status
+
+                status = Status.objects.get_for_model(SoftwareVersion).filter(name="Active").first()
+                if software_version_status is not None:
+                    status = (
+                        Status.objects.get_for_model(SoftwareVersion)
+                        .filter(pk=software_version_status.pk)
+                        .first()
+                    )
+                if status is None:
+                    raise InventoryError(
+                        "Select an applicable status for new SoftwareVersion records"
+                    )
+            else:
+                status = status_resolver(SoftwareVersion, software_version_status)
+            obj = SoftwareVersion(
+                platform_id=spec["platform_id"], version=spec["version"], status=status
+            )
+        else:
+            obj = SoftwareVersion.objects.get(pk=spec["existing_id"])
+        if (
+            str(obj.platform_id) != str(spec["platform_id"])
+            or canonical_software_version(obj.version) != spec["version"]
+        ):
+            raise InventoryError("Stack member SoftwareVersion Platform changed after planning")
+        versions[spec["key"]] = obj
     members = {}
     for spec in plan["members"]:
         if spec["selected"]:
@@ -193,10 +243,26 @@ def stack_objects(plan, device):
             raise InventoryError("Stack member serial changed after planning")
         if obj.device_type.model != spec["model"]:
             raise InventoryError("Stack member model changed after planning")
+        if (str(obj.platform_id) if obj.platform_id else None) != spec.get("platform_id"):
+            raise InventoryError("Stack member Platform changed after planning")
+        software_key = spec.get("software_version_key")
+        if software_key:
+            if obj.software_version_id:
+                raise InventoryError("Stack discovery cannot overwrite populated member software")
+            version = versions[software_key]
+            if str(obj.platform_id) != str(version.platform_id):
+                raise InventoryError("Stack member software must match its own Platform")
+            obj.software_version = version
         for change in spec["changes"]:
             field = change["field"]
             if field == "virtual_chassis":
                 obj.virtual_chassis = chassis
+            elif field == "software_version":
+                if (
+                    not software_key
+                    or canonical_software_version(versions[software_key].version) != change["after"]
+                ):
+                    raise InventoryError("Stack member software assignment lacks its catalog row")
             elif field in {"serial", "name", "vc_position", "vc_priority"}:
                 if field == "name" and obj.name and obj.name.strip():
                     raise InventoryError("Stack discovery cannot rename a populated member name")
@@ -213,7 +279,13 @@ def stack_objects(plan, device):
         members[spec["position"]] = obj
     if chassis_spec["master_position"] not in members:
         raise InventoryError("The stack master must be an observed physical member")
-    return {"plan": plan, "chassis": chassis, "types": types, "members": members}
+    return {
+        "plan": plan,
+        "chassis": chassis,
+        "types": types,
+        "members": members,
+        "software_versions": versions,
+    }
 
 
 def validate_stack(objects):
@@ -224,6 +296,8 @@ def validate_stack(objects):
     chassis.full_clean()
     for obj in objects["types"].values():
         obj.full_clean()
+    for version in objects["software_versions"].values():
+        version.full_clean()
     positions = set()
     for obj in objects["members"].values():
         if obj.virtual_chassis_id != chassis.pk or obj.vc_position is None:
@@ -238,6 +312,11 @@ def validate_stack(objects):
             excluded.append("device_type")
         if chassis._state.adding:
             excluded.append("virtual_chassis")
+        if obj.software_version_id:
+            if str(obj.platform_id) != str(obj.software_version.platform_id):
+                raise InventoryError("Stack member software must match its own Platform")
+            if obj.software_version._state.adding:
+                excluded.append("software_version")
         obj.full_clean(exclude=excluded)
         if obj._state.adding:
             _suppression_context(obj.device_type)
@@ -253,6 +332,9 @@ def save_stack(objects):
     for obj in objects["types"].values():
         if obj._state.adding:
             obj.validated_save()
+    for version in objects["software_versions"].values():
+        if version._state.adding:
+            version.validated_save()
     for spec in objects["plan"]["members"]:
         obj = objects["members"][spec["position"]]
         if spec["create"]:

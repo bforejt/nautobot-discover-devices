@@ -40,3 +40,23 @@ administrative/operational modes, presence leaves, VLAN IDs/ranges and aggregate
 context are retained. The internal port's positive access observation must not
 become a third eligible positive mode or an inventory assignment. Excluded rows
 still require full schema and duplicate validation before evidence is retained.
+
+`iosxe_ipam_live_1718.json` preserves the shape of safe filtered native reads from
+IOS XE 17.18.4: interface keys, configured IP addressing/VRF forwarding, and
+named VRF definitions. It preserves 71 interface records, including known
+absent aliases and the internal AppGigabitEthernet interface. Vlan3 and Vlan4
+have synthetic RFC5737 hosts with the observed mask shape; Vlan2 uses DHCP; management belongs to
+Mgmt-vrf without a configured address. The legacy VRF subtree returned HTTP
+204 and is represented as an empty list for offline clients. No authentication,
+route tables, unrelated native configuration, or operational addresses are
+included. Actual lab addresses are replaced with documentation-only examples.
+Link state never substitutes for configured address evidence.
+
+`iosxe_ipam_configured.json` is a synthetic expansion covering primary and
+secondary IPv4, /31 and /32 masks, stack-member interface names, modern and
+legacy VRF forwarding, unused named VRFs, Port-channel subinterfaces, and IPv6
+observations. IPv6, DHCP, negotiated and unnumbered configuration remain
+observation-only in the static IPv4 implementation. The collectors validate
+known excluded interfaces before retaining them outside the writable list.
+The native schema references are the Cisco-published IOS XE 17.9.1 and 17.18.1
+`Cisco-IOS-XE-interfaces.yang` and `Cisco-IOS-XE-ip.yang` model sets in YangModels.

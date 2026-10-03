@@ -15,15 +15,17 @@ def load_discovery_job():
     """Import the job with temporary Nautobot stubs that cannot leak into other tests."""
     job_api = ModuleType("nautobot.apps.jobs")
     job_api.Job = type("Job", (), {})
-    for name in ("BooleanVar", "DryRunVar", "IntegerVar", "ObjectVar"):
+    for name in ("BooleanVar", "DryRunVar", "IntegerVar", "ObjectVar", "TextVar"):
         setattr(job_api, name, lambda **kwargs: SimpleNamespace(**kwargs))
     dcim = ModuleType("nautobot.dcim.models")
     dcim.Device = type("Device", (), {"objects": SimpleNamespace(get=Mock())})
+    dcim.Location = type("Location", (), {"objects": SimpleNamespace(get=Mock())})
     extras = ModuleType("nautobot.extras.models")
     extras.SecretsGroup = type("SecretsGroup", (), {})
     extras.Status = type("Status", (), {})
     ipam = ModuleType("nautobot.ipam.models")
     ipam.VLANGroup = type("VLANGroup", (), {})
+    ipam.Namespace = type("Namespace", (), {})
     inventory = ModuleType("jobs.nautobot_inventory")
     inventory.InventoryError = type("InventoryError", (RuntimeError,), {})
     for name in ("apply_discovery", "snapshot_inventory", "validate_plan"):
@@ -89,6 +91,14 @@ CHANGE_COUNTERS = {
     "vlans_created": (r"vlans?", r"creat|new|add"),
     "vlans_updated": (r"vlans?", r"updat|enrich"),
     "interface_vlan_assignments_updated": (r"interface vlan assignments?", r"updat"),
+    "prefixes_created": (r"(?:networks?|prefixes)", r"creat|new|add"),
+    "ip_addresses_created": (r"ip addresses?", r"creat|new|add"),
+    "ip_assignments_created": (r"ip address assignments?", r"creat|new|add|link"),
+    "vrfs_created": (r"vrfs?", r"creat|new|add"),
+    "vrf_device_assignments_created": (r"device vrf assignments?", r"creat|new|add|link"),
+    "vrf_device_assignments_updated": (r"device vrf assignments?", r"updat|enrich|fill"),
+    "interface_vrfs_updated": (r"interface vrf assignments?", r"updat|link"),
+    "prefix_vrf_associations_created": (r"prefix vrf assignments?", r"creat|new|add|link"),
 }
 
 
@@ -183,6 +193,102 @@ class DiscoveryJobTests(unittest.TestCase):
         for name in names:
             self.assertIs(sys.modules.get(name), before[name])
         self.assertIs(getattr(package, "discovery_job", None), before_attribute)
+
+    def test_ipam_policy_and_statuses_are_forwarded_to_preview_and_atomic_apply(self):
+        namespace = SimpleNamespace(pk="namespace-1", name="Global")
+        override = SimpleNamespace(pk="namespace-2", name="Corporate")
+        location = {"id": "location-1", "name": "lab"}
+        prefix_status = object()
+        address_status = object()
+        with patch.object(self.module, "_prefix_location", return_value=(location, None)):
+            self.job.run(
+                self.device,
+                dryrun=False,
+                ipam_namespace=namespace,
+                ipam_override_namespace=override,
+                ipam_override_networks="100.64.0.0/10",
+                ipam_group_user_vrfs=True,
+                ipam_local_vrf_names="Mgmt-vrf\nLOCAL",
+                ipam_prefix_status=prefix_status,
+                ipam_ip_address_status=address_status,
+            )
+        policy = self.assert_saved_report()["ipam_policy"]
+        self.assertEqual(policy["default_namespace"]["id"], namespace.pk)
+        self.assertEqual(policy["override_namespace"]["id"], override.pk)
+        self.assertEqual(policy["override_networks"], ["100.64.0.0/10"])
+        self.assertEqual(policy["local_vrf_names"], ["LOCAL", "Mgmt-vrf"])
+        self.assertEqual(policy["location"], location)
+        self.assertEqual(self.module.snapshot_inventory.call_args.kwargs["ipam_policy"], policy)
+        self.assertEqual(self.module.apply_discovery.call_args.kwargs["ipam_policy"], policy)
+        self.assertIs(
+            self.module.validate_plan.call_args.kwargs["ipam_prefix_status"], prefix_status
+        )
+        self.assertIs(
+            self.module.apply_discovery.call_args.kwargs["ipam_ip_address_status"], address_status
+        )
+
+    def test_invalid_ipam_policy_fails_before_credentials_or_requests(self):
+        with self.assertRaises(ValueError):
+            self.job.run(self.device, ipam_override_networks="not-a-network")
+        self.module.resolve_credentials.assert_not_called()
+        self.module.RestconfClient.assert_not_called()
+        self.assertIn("error", self.assert_saved_report())
+
+    def test_prefix_location_defaults_to_site_and_rejects_unrelated_locations(self):
+        def location(identifier, type_name, depth):
+            return SimpleNamespace(
+                pk=identifier,
+                name=identifier,
+                tree_depth=depth,
+                location_type=SimpleNamespace(
+                    name=type_name,
+                    content_types=SimpleNamespace(
+                        filter=lambda **_kwargs: SimpleNamespace(
+                            exists=lambda: True,
+                        )
+                    ),
+                ),
+            )
+
+        site = location("site-1", "Site", 0)
+        room = location("room-1", "Room", 1)
+        room.ancestors = lambda **_kwargs: [site, room]
+        self.device.location = room
+        self.assertEqual(
+            self.module._prefix_location(self.device, None),
+            ({"id": "site-1", "name": "site-1"}, None),
+        )
+        unrelated = location("elsewhere", "Site", 0)
+        self.module.Location.objects.get.return_value = unrelated
+        with self.assertRaises(ValueError):
+            self.module._prefix_location(self.device, unrelated)
+
+    def test_ineligible_prefix_location_preserves_reason_for_planner(self):
+        location = SimpleNamespace(pk="lab", name="lab")
+        location.ancestors = lambda **_kwargs: [location]
+        location.location_type = SimpleNamespace(
+            name="Lab",
+            content_types=SimpleNamespace(
+                filter=lambda **_kwargs: SimpleNamespace(
+                    exists=lambda: False,
+                )
+            ),
+        )
+        self.device.location = location
+        chosen, reason = self.module._prefix_location(self.device, None)
+        self.assertIsNone(chosen)
+        self.assertIn("does not permit Prefix", reason)
+
+    def test_unresolved_ipam_is_explained_without_an_error_or_raw_evidence(self):
+        self.preview_plan["summary"]["unresolved_ipam"] = 2
+        self.preview_plan["ipam"] = {
+            "unresolved": [{"reason": "private-ipam-sentinel"}, {"reason": "missing mask"}]
+        }
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "info"))
+        self.assertIn("2 IPAM observations", messages)
+        self.assertNotIn("private-ipam-sentinel", messages)
+        self.job.logger.error.assert_not_called()
 
     def test_preview_saves_complete_report_under_advanced_and_returns_none(self):
         self.preview_plan["summary"].update(interfaces_created=2, conflicts=1)
@@ -296,6 +402,9 @@ class DiscoveryJobTests(unittest.TestCase):
             module_status=None,
             vlan_group=None,
             vlan_status=None,
+            ipam_policy=None,
+            ipam_prefix_status=None,
+            ipam_ip_address_status=None,
         )
         self.module.validate_plan.assert_called_once()
         messages = "\n".join(rendered_logs(self.job.logger)).lower()

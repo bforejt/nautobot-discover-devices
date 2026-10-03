@@ -19,7 +19,7 @@ class FixtureClient:
     def get(self, path, **kwargs):
         self.requests.append(path)
         self.trace.append({"path": path, "status": 200, "tls_mode": "default", "error": None})
-        return deepcopy(self.payloads.get(path.split("?", 1)[0]))
+        return deepcopy(self.payloads.get(path, self.payloads.get(path.split("?", 1)[0])))
 
 
 def fixture_payloads():
@@ -30,6 +30,10 @@ def fixture_payloads():
         cisco.INSTALL_PATH: fixture("iosxe_install.json"),
         cisco.INTERFACES_PATH: fixture("iosxe_interfaces.json"),
         cisco.NATIVE_INTERFACES_PATH: fixture("iosxe_native_lag_memberships.json"),
+        cisco.cisco_ipam.INTERFACES_PATH + "?fields=" + cisco.cisco_ipam.INTERFACE_FIELDS: fixture(
+            "iosxe_ipam_live_1718.json"
+        )["interfaces"],
+        cisco.cisco_ipam.LEGACY_VRF_PATH: {"Cisco-IOS-XE-native:vrf": []},
         cisco.cisco_layer2.GLOBAL_PATH: {"Cisco-IOS-XE-native:vlan": {}},
         cisco.cisco_layer2.VLAN_PATH: fixture("iosxe_vlan_database.json"),
         cisco.cisco_components.PLATFORM_PATH: fixture("iosxe_platform_components.json"),
@@ -42,6 +46,19 @@ def fixture_payloads():
 
 
 class CiscoCollectionTests(unittest.TestCase):
+    def test_static_ipam_collects_configured_interface_addresses_and_vrfs(self):
+        payloads = fixture_payloads()
+        result = cisco.collect(FixtureClient(payloads))
+        facts = {row["name"]: row for row in result["ipam"]["interfaces"]}
+        self.assertEqual(facts["GigabitEthernet0/0"]["vrf"], "Mgmt-vrf")
+        self.assertEqual(facts["GigabitEthernet0/0"]["ipv4"], [])
+        self.assertEqual(facts["Vlan3"]["ipv4"][0]["address"], "192.0.2.2")
+        self.assertEqual(facts["Vlan4"]["ipv4"][0]["address"], "198.51.100.2")
+        self.assertEqual(facts["Vlan2"]["ipv4"], [])
+        self.assertEqual(result["ipam"]["vrfs"][0]["name"], "Mgmt-vrf")
+        self.assertEqual(result["ipam"]["sources"][-1]["status"], "available")
+        self.assertEqual(len(result["ipam"]["excluded"]), 13)
+
     def test_console_and_dedicated_management_are_reviewed_hardware_facts(self):
         for ntc_defaults in (False, True):
             with self.subTest(ntc_defaults=ntc_defaults):

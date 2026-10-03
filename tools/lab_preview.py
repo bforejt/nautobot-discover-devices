@@ -27,14 +27,24 @@ def _boolean(value):
 
 
 def run(
-    device_id=None, verify_tls=None, report_path=None, vlan_group_id=None, use_ntc_defaults=None
+    device_id=None,
+    verify_tls=None,
+    report_path=None,
+    vlan_group_id=None,
+    use_ntc_defaults=None,
+    ipam_namespace_id=None,
+    ipam_override_namespace_id=None,
+    ipam_override_rfc1918=True,
+    ipam_override_networks="",
+    ipam_group_user_vrfs=False,
+    ipam_local_vrf_names="Mgmt-vrf",
 ):
     """Collect live JSON and validate the Job preview without database mutation."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from django.db import connection, transaction
     from django.test.utils import CaptureQueriesContext
     from nautobot.dcim.models import Device
-    from nautobot.ipam.models import VLANGroup
+    from nautobot.ipam.models import Namespace, VLANGroup
 
     from jobs.discovery_job import DiscoverDevice
     from jobs.nautobot_inventory import snapshot_inventory
@@ -48,6 +58,11 @@ def run(
     device = Device.objects.get(pk=device_id)
     vlan_group_id = vlan_group_id or os.environ.get("NAUTOBOT_DISCOVERY_VLAN_GROUP_ID")
     vlan_group = VLANGroup.objects.get(pk=vlan_group_id) if vlan_group_id else None
+    ipam_namespace_id = ipam_namespace_id or os.environ.get("NAUTOBOT_DISCOVERY_IPAM_NAMESPACE_ID")
+    ipam_namespace = Namespace.objects.get(pk=ipam_namespace_id) if ipam_namespace_id else None
+    ipam_override_namespace = (
+        Namespace.objects.get(pk=ipam_override_namespace_id) if ipam_override_namespace_id else None
+    )
     baseline = snapshot_inventory(device, vlan_group=vlan_group)
     captured_files = []
 
@@ -70,6 +85,12 @@ def run(
                     verify_tls=verify_tls,
                     vlan_group=vlan_group,
                     use_ntc_defaults=use_ntc_defaults,
+                    ipam_namespace=ipam_namespace,
+                    ipam_override_namespace=ipam_override_namespace,
+                    ipam_override_rfc1918=ipam_override_rfc1918,
+                    ipam_override_networks=ipam_override_networks,
+                    ipam_group_user_vrfs=ipam_group_user_vrfs,
+                    ipam_local_vrf_names=ipam_local_vrf_names,
                 )
             assert result is None, "Detailed discovery data must not appear in the main result"
             report = job.request.meta["discovery_report"]
@@ -106,6 +127,9 @@ def run(
         "console_ports": report["discovery"].get("console_ports", {}),
         "console_port_plan": report["plan"].get("console_ports", {}),
         "management": report["discovery"].get("management", {}),
+        "ipam": report["discovery"].get("ipam", {}),
+        "ipam_policy": report.get("ipam_policy"),
+        "ipam_plan": report["plan"].get("ipam", {}),
         "layer2": report["discovery"].get("layer2", {}),
         "layer2_plan": report["plan"].get("layer2", {}),
         "required_identity_errors": report["plan"]["errors"],

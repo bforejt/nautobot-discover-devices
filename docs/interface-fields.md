@@ -12,7 +12,7 @@ The following table covers every forward native Interface field, including inher
 | `device` | Root Device containing the interface. | Baseline; the explicitly selected Device. |
 | `module` | Physical Module owning the port; its root must agree with `device`. | Baseline; reviewed serialized-part and slot evidence. |
 | `name` | Interface identifier. | Baseline; preserve an existing alias/name when it matches the canonical observed name. |
-| `type` | Interface kind and physical capability, such as copper Ethernet, SFP, virtual, or LAG. | Baseline; reviewed hardware capability or an existing template. Negotiated speed does not determine capability. |
+| `type` | Interface kind and physical capability, such as copper Ethernet, SFP, virtual, or LAG. | Baseline; the [documented Catalyst hardware library](catalyst-hardware-profiles.md) or an existing template. Exact PID/member/native region and compatible installed-module identity establish physical capability; negotiated speed does not determine it. |
 | `enabled` | Administrative enablement. | Baseline; structured administrative state, independent of link state. Existing `False` is populated. |
 | `description` | Descriptive text. | Baseline; structured interface description, filling empty text only. |
 | `mac_address` | MAC address of this interface. | Baseline; the interface's own structured MAC, excluding unavailable/sentinel values. |

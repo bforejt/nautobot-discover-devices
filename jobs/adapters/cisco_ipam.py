@@ -26,6 +26,7 @@ INTERFACE_FAMILIES = (
     "TenGigabitEthernet",
     "TwentyFiveGigE",
     "FortyGigabitEthernet",
+    "FiftyGigabitEthernet",
     "HundredGigE",
     "TwoHundredGigE",
     "FourHundredGigE",

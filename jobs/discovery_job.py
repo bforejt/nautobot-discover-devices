@@ -15,7 +15,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.15.0-dev"
+JOB_VERSION = "0.16.0-dev"
 
 
 def _host(device):

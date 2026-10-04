@@ -19,7 +19,10 @@ FAMILIES = (
     "TenGigabitEthernet",
     "TwentyFiveGigE",
     "FortyGigabitEthernet",
+    "FiftyGigabitEthernet",
     "HundredGigE",
+    "TwoHundredGigE",
+    "FourHundredGigE",
     "Port-channel",
 )
 # Request each complete switchport container so omitted leaves have a known

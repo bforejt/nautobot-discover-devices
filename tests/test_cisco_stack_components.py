@@ -74,6 +74,59 @@ def network_items(result):
 
 
 class StackComponentCollectionTests(unittest.TestCase):
+    def test_different_documented_modules_follow_their_own_physical_member(self):
+        payloads = stack_component_payloads()
+        next(row for row in inventory(payloads) if row.get("dev-name") == "Switch 2")[
+            "part-number"
+        ] = "C9300-24T"
+        next(row for row in platform(payloads) if row["cname"] == "Switch2")["state"]["part-no"] = (
+            "C9300-24T"
+        )
+        next(row for row in inventory(payloads) if row.get("serial-number") == "LABUPLINK002")[
+            "part-number"
+        ] = "C9300-NM-8X"
+        next(row for row in platform(payloads) if row["cname"] == "FRUUplinkModule2/1")[
+            "state"
+        ].update({"part-no": "C9300-NM-8X", "type": "comp-fru"})
+        next(row for row in inventory(payloads) if row.get("serial-number") == "LABOPTIC002")[
+            "dev-name"
+        ] = "Te2/1/1"
+        next(row for row in platform(payloads) if row["cname"] == "GigabitEthernet2/1/1")[
+            "cname"
+        ] = "TenGigabitEthernet2/1/1"
+        interfaces = payloads[cisco.INTERFACES_PATH]["Cisco-IOS-XE-interfaces-oper:interfaces"][
+            "interface"
+        ]
+        prototype = deepcopy(
+            next(row for row in interfaces if row["name"] == "GigabitEthernet2/1/1")
+        )
+        interfaces[:] = [
+            row for row in interfaces if not row["name"].startswith("GigabitEthernet2/1/")
+        ]
+        interfaces.extend(
+            {**deepcopy(prototype), "name": "TenGigabitEthernet2/1/%d" % port}
+            for port in range(1, 9)
+        )
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                if reverse:
+                    inventory(payloads).reverse()
+                    platform(payloads).reverse()
+                items = network_items(cisco.collect(FixtureClient(payloads)))
+                self.assertEqual(items["uplink:1/1"]["model"], "C3850-NM-4-1G")
+                self.assertEqual(items["uplink:2/1"]["model"], "C9300-NM-8X")
+                self.assertEqual(items["uplink:2/1"]["chassis_model"], "C9300-24T")
+                self.assertEqual(items["uplink:2/1"]["device_serial"], "LAB93000002")
+                self.assertEqual(
+                    items["uplink:2/1"]["interfaces"],
+                    ["TenGigabitEthernet2/1/%d" % port for port in range(1, 9)],
+                )
+                optic = items["transceiver:2/1/1"]
+                self.assertEqual(optic["parent_key"], "uplink:2/1")
+                self.assertEqual(optic["device_serial"], "LAB93000002")
+                self.assertEqual(optic["source"]["ownership"]["parent_serial"], "LABUPLINK002")
+                self.assertEqual(optic["source"]["ownership"]["physical_type"], "10gbase-x-sfpp")
+
     def test_each_module_and_sfp_belongs_to_its_serial_matched_physical_member(self):
         result = cisco.collect(FixtureClient(stack_component_payloads()))
         items = network_items(result)

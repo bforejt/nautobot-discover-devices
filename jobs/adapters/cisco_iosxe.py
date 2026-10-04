@@ -17,7 +17,7 @@ from . import (
     cisco_stack,
     cisco_switchport_oper,
 )
-from .cisco_hardware import interface_type
+from .cisco_hardware import interface_capability, interface_type
 
 HOSTNAME_PATH = "/data/Cisco-IOS-XE-native:native/hostname"
 HARDWARE_PATH = "/data/Cisco-IOS-XE-device-hardware-oper:device-hardware-data"
@@ -42,7 +42,10 @@ LAG_INTERFACE_FAMILIES = (
     "TenGigabitEthernet",
     "TwentyFiveGigE",
     "FortyGigabitEthernet",
+    "FiftyGigabitEthernet",
     "HundredGigE",
+    "TwoHundredGigE",
+    "FourHundredGigE",
 )
 # The augmentation's module qualifier is essential: the lab accepts a bare
 # channel-group filter with HTTP 200 but silently omits the membership leaves.
@@ -68,6 +71,9 @@ _PREFIXES = (
     ("AppGigabitEthernet", "Ap"),
     ("Bluetooth", "Bl"),
     ("FiveGigabitEthernet", "Fi"),
+    ("FiftyGigabitEthernet", "Fif"),
+    ("TwoHundredGigE", "TwoHundredGigE"),
+    ("FourHundredGigE", "Fou"),
     ("FortyGigabitEthernet", "Fo"),
     ("FastEthernet", "Fa"),
     ("GigabitEthernet", "Gi"),
@@ -84,6 +90,14 @@ _LONG_NAMES = {
     for long_name, short_name in _PREFIXES
     for spelling in (long_name, short_name)
 }
+# Cisco uses FiftyGigE in interface examples and FiftyGigabitEthernet in native YANG.
+_LONG_NAMES.update(
+    {
+        "fiftygige": "FiftyGigabitEthernet",
+        "twentyfivegigabitethernet": "TwentyFiveGigE",
+        "hundredgigabitethernet": "HundredGigE",
+    }
+)
 _VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)([A-Za-z][A-Za-z0-9]*)?(?:\.\d+)*$")
 _SPEEDS = {
     "speed-10mb": 10_000_000,
@@ -378,6 +392,9 @@ def _interfaces(payload, model, member, inventory, warnings, *, stack_members=No
                 "corroborated_operational_duplex": operational_duplex,
             },
         }
+        capability = interface_capability(name, type_model, type_member, type_inventory)
+        if capability is not None:
+            facts["hardware_profile"] = capability
         if owner is not None:
             facts["stack_member"] = owner["position"]
         interfaces.append(facts)

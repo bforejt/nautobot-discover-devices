@@ -127,6 +127,16 @@ fallback is present. Authentication values and raw response bodies are omitted
 from request diagnostics. The report contains inventory facts such as serials,
 MAC addresses, and descriptions.
 
+## Catalyst hardware library
+
+Documented exact chassis and uplink profiles cover Catalyst 9300/9300L/9300LM/
+9300X and 9500/9500X families. They classify only eligible observed interfaces
+using documented physical capability and compatible installed-module identity.
+The [hardware library reference](docs/catalyst-hardware-profiles.md) lists exact
+PIDs, regions, compatibility, source evidence and unresolved special cases.
+Serialized 9300 uplink modules and optics require corroborated platform placement;
+9500 component placement remains report-only pending verified structured data.
+
 ## Initial interpretation rules
 
 | Discovery fact | Nautobot behavior |
@@ -198,7 +208,8 @@ Unavailable membership data produces a warning and preserves existing links.
 
 Physical type comes from an explicit hardware capability mapping or an
 unambiguous existing DeviceType interface template, never negotiated link
-speed. The initial hardware map covers:
+speed. The expanded [hardware library](docs/catalyst-hardware-profiles.md) covers
+exact documented 9300 and 9500 PIDs; the original lab mappings remain:
 
 - `C9300-48UXM`: access ports 1–36 are 2.5G copper; ports 37–48 are 10G copper.
 - Its management `GigabitEthernet0/0`: 1G copper.
@@ -339,8 +350,13 @@ and [management-port guide](https://www.cisco.com/c/en/us/td/docs/switches/lan/c
 
 ## Serialized components
 
-Uplink and transceiver profiles cover the `C9300-48UXM` chassis with a
-`C3850-NM-4-1G` uplink module. PSU profiles cover exact reviewed C9300, C9300L,
+Uplink and transceiver profiles cover explicitly compatible documented 9300-family
+chassis and uplink modules, with independently corroborated slot-1 placement.
+The existing `C9300-48UXM` / `C3850-NM-4-1G` lab mapping is preserved.
+9500 port capabilities are documented; their serialized module/optic placement
+awaits verified structured evidence. See the
+[hardware library](docs/catalyst-hardware-profiles.md) for exact coverage.
+PSU profiles cover exact reviewed C9300, C9300L,
 C9300LM and C9300X chassis and compatible power supplies. Resolved parts use
 Nautobot's native `ModuleType`, `ModuleBay`, and `Module` models and
 appear in the normal module inventory GUI. The Device's module bays represent
@@ -386,17 +402,19 @@ and operational readings do not become configured input draw. See
 [power-supply-discovery.md](docs/power-supply-discovery.md) for coverage,
 stack-member placement and validation.
 
-SFPs installed in the reviewed C3850-NM-4-1G uplink ports are serialized native
-Modules in nested ModuleBays under the uplink Module, following
+Optics installed in corroborated, documented 9300 optical uplink ports are
+serialized native Modules in nested ModuleBays under the uplink Module, following
 [Nautobot's documented transceiver model](https://docs.nautobot.com/projects/core/en/stable/user-guide/core-data-model/dcim/modulebay/).
-The `c9300-48uxm-c3850-nm-4-1g-transceivers-v1` profile requires a physical,
+The existing `c9300-48uxm-c3850-nm-4-1g-transceivers-v1` lab profile and
+new documented uplink profiles require a physical,
 field-replaceable `hw-type-transceiver`, complete PID/serial, a unique matching
 platform identity, explicit nonempty presence, and agreement between the
 hardware interface name, platform component name, and an observed eligible
 uplink port. The parent uplink Module must itself pass discovery. Individual
-port placement comes from those matching names and the reviewed four-port
-hardware profile; numeric inventory indexes and the generic location string
-do not identify an individual SFP slot. Platform `comp-port` and
+port placement comes from those matching names and the resolved module port
+region; copper uplinks cannot establish optical cages. Exact documented
+interface aliases are normalized before the identity comparison; numeric inventory
+indexes and the generic location string do not identify an individual SFP slot. Platform `comp-port` and
 `removable=False` are retained as the observed lab representation; the explicit
 hardware transceiver classification establishes the serialized asset type.
 

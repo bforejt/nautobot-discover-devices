@@ -2,7 +2,9 @@
 
 Identity comes from device-hardware-oper; platform-oper corroborates identity
 and supplies placement. Numeric inventory indexes are evidence, never joins.
-The uplink/transceiver profile covers a C9300-48UXM and C3850-NM-4-1G.
+Documented Catalyst 9300 uplink profiles are eligible only when independently
+corroborated structured identity, chassis ownership and slot-1 placement agree.
+The original lab C3850-NM-4-1G placement quirk remains narrowly reviewed.
 Separate documented Catalyst 9300 PSU profiles establish chassis bays even
 when occupant identity is unavailable, and resolve serialized supplies to
 verified standalone or stack-member owners. The reviewed network module and its
@@ -18,6 +20,7 @@ from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 
 from ..transport_restconf import RestconfError
+from . import cisco_hardware_profiles as hardware_profiles
 from . import cisco_psu_profiles as psu_profiles
 
 HARDWARE_PATH = "/data/Cisco-IOS-XE-device-hardware-oper:device-hardware-data"
@@ -30,6 +33,13 @@ PLATFORM_FIELDS = (
 )
 PROFILE = "c9300-48uxm-serialized-components-v1"
 TRANSCEIVER_PROFILE = "c9300-48uxm-c3850-nm-4-1g-transceivers-v1"
+OPTICAL_PORT_TYPES = (
+    "1000base-x-sfp",
+    "10gbase-x-sfpp",
+    "25gbase-x-sfp28",
+    "40gbase-x-qsfpp",
+    "100gbase-x-qsfp28",
+)
 STACK_INTERFACE_DOCUMENT = (
     "https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/"
     "software/release/17-18/configuration_guide/int_hw/"
@@ -238,51 +248,94 @@ def _placement_source(fact, *, profile=PROFILE):
     }
 
 
-def _profile_placement(fact, member):
+def _network_module_profile(owner, fact):
+    """Return a documented module with the reviewed structured slot-1 convention."""
+    if owner is None:
+        return None
+    profile = hardware_profiles.module_profile(owner["model"], fact["model"])
+    if profile is None or profile.get("component_placement") != "c9300-slot-1":
+        return None
+    return profile
+
+
+def _serialized_profile(profile, *, transceiver=False):
+    """Keep the existing lab evidence identifiers while sharing new profile IDs."""
+    if profile["model"] == "C3850-NM-4-1G":
+        return TRANSCEIVER_PROFILE if transceiver else PROFILE
+    return profile["profile"]
+
+
+def _profile_placement(fact, member, profile):
     if fact["parent"] != "Switch%d" % member:
         return None, "Platform parent does not match the reviewed chassis component"
     if fact["empty"] is not False or fact["removable"] is not True:
         return None, "Serialized component presence/removability needs review"
-    if fact["model"] == "C3850-NM-4-1G":
-        expected_name = "FRUUplinkModule%d/1" % member
-        if fact["name"] != expected_name or fact["location"] != "%d/0/1/1" % member:
-            return None, "Uplink placement does not match the reviewed slot-1 profile"
-        # The lab reports comp-port for this module. Accept that specific
-        # reviewed quirk and the model's proper module/FRU classifications.
-        if fact["platform_type"] not in ("comp-port", "comp-module", "comp-fru"):
-            return None, "Uplink platform classification needs review"
-        return {
-            "key": "uplink:%d/1" % member,
-            "bay": {"name": "Uplink Module 1", "position": "1", "label": "Uplink Module 1"},
-        }, None
-    match = re.fullmatch(r"PowerSupply(\d+)/([AB])", fact["name"])
-    if match is None or int(match.group(1)) != member:
-        return None, "Power-supply name does not identify a reviewed chassis bay"
-    slot = match.group(2)
-    if fact["location"] != "%d/0/%s/0" % (member, slot):
-        return None, "Power-supply location does not match the reviewed bay profile"
-    if fact["platform_type"] != "comp-power-supply":
-        return None, "Power-supply platform classification needs review"
+    expected_name = "FRUUplinkModule%d/1" % member
+    if fact["name"] != expected_name or fact["location"] != "%d/0/1/1" % member:
+        return None, "Uplink placement does not match the reviewed slot-1 profile"
+    # Only the original, live-validated module may use the comp-port quirk.
+    allowed_types = ("comp-module", "comp-fru")
+    if profile["model"] == "C3850-NM-4-1G":
+        allowed_types += ("comp-port",)
+    if fact["platform_type"] not in allowed_types:
+        return None, "Uplink platform classification needs review"
     return {
-        "key": "psu:%d/%s" % (member, slot),
-        "bay": {
-            "name": "Power Supply %s" % slot,
-            "position": "PSU-%s" % slot,
-            "label": "Power Supply %s" % slot,
-        },
+        "key": "uplink:%d/1" % member,
+        "bay": {"name": "Uplink Module 1", "position": "1", "label": "Uplink Module 1"},
     }, None
 
 
 def _expected_platform_name(fact, member):
-    if (
-        fact["model"] == "C3850-NM-4-1G"
-        and fact["name"] == "Switch %d FRU Uplink Module 1" % member
-    ):
+    if fact["name"] == "Switch %d FRU Uplink Module 1" % member:
         return "FRUUplinkModule%d/1" % member
-    match = re.fullmatch(r"Switch (\d+) - Power Supply ([AB])", fact["name"] or "")
-    if fact["model"] == "PWR-C1-1100WAC-P" and match and int(match.group(1)) == member:
-        return "PowerSupply%d/%s" % (member, match.group(2))
     return None
+
+
+def _module_ports(result, interfaces, owner, profile, component_key):
+    """Associate only observed, documented physical ports, never synthesized aliases."""
+    member = owner["position"]
+    eligible = []
+    for interface in interfaces:
+        capability = hardware_profiles.port_capability(
+            interface["name"], owner["model"], member, module_pid=profile["model"]
+        )
+        if capability is None or capability["slot"] != 1:
+            continue
+        if (
+            interface.get("type") != capability["type"]
+            or interface.get("stack_member", member) != member
+        ):
+            result["unresolved"].append(
+                {
+                    "component_key": component_key,
+                    "interfaces": [interface["name"]],
+                    "reason": "Observed module port lacks agreeing physical capability or owner",
+                }
+            )
+            continue
+        eligible.append(interface["name"])
+    # Single native naming families can identify missing eligible observations.
+    # Multi-family aliases cannot establish a required name or create extra ports.
+    missing = []
+    observed = set(eligible)
+    for region in profile["ports"]:
+        if region["slot"] != 1 or len(region["families"]) != 1:
+            continue
+        family = region["families"][0]
+        missing.extend(
+            name
+            for port in range(region["first"], region["last"] + 1)
+            if (name := "%s%d/1/%d" % (family, member, port)) not in observed
+        )
+    if missing:
+        result["unresolved"].append(
+            {
+                "component_key": component_key,
+                "interfaces": missing,
+                "reason": "Expected module interfaces are absent from eligible observations",
+            }
+        )
+    return sorted(eligible)
 
 
 def _collect_transceivers(result, flat, platform, pairs, owners, *, interfaces):
@@ -303,15 +356,34 @@ def _collect_transceivers(result, flat, platform, pairs, owners, *, interfaces):
             continue
         unresolved = {**fact, "source": {"identity": _identity_source(fact)}}
         name = canonical_interface_name(fact["name"])
-        match = re.fullmatch(r"GigabitEthernet(\d+)/1/([1-4])", name or "")
+        match = re.fullmatch(r"[A-Za-z][A-Za-z-]*(\d+)/1/(\d+)", name or "")
         owner = owners.get(int(match.group(1))) if match else None
+        chassis_profile = hardware_profiles.chassis_profile(owner["model"]) if owner else None
         member = owner["position"] if owner else None
         parent_key = "uplink:%d/1" % member if owner else None
         parents = [item for item in result["items"] if item["key"] == parent_key]
+        parent = parents[0] if len(parents) == 1 else None
+        module_profile = _network_module_profile(owner, parent) if parent is not None else None
+        capability = (
+            hardware_profiles.port_capability(
+                name, owner["model"], member, module_pid=parent["model"]
+            )
+            if module_profile is not None
+            else None
+        )
+        profile_id = (
+            _serialized_profile(module_profile, transceiver=True)
+            if module_profile is not None
+            else TRANSCEIVER_PROFILE
+        )
         if not fact["model"] or not fact["serial"]:
             reason = "Serialized transceiver model or serial number is unavailable"
-        elif owner is None or owner["model"] != "C9300-48UXM":
+        elif owner is None or chassis_profile is None or chassis_profile["family"] != "c9300":
             reason = "Transceiver chassis or port has no reviewed nested placement profile"
+        elif module_profile is not None and capability is None:
+            reason = "Transceiver port has no reviewed physical uplink capability"
+        elif capability is not None and capability["type"] not in OPTICAL_PORT_TYPES:
+            reason = "Documented uplink port is copper and cannot establish an optical cage"
         elif fact["hardware_class"] is None or fact["field_replaceable"] is None:
             reason = "Transceiver physical or field-replaceable classification is unavailable"
         else:
@@ -336,7 +408,10 @@ def _collect_transceivers(result, flat, platform, pairs, owners, *, interfaces):
                     "Serialized transceiver identity matches multiple platform components"
                 )
             if not matches:
-                expected = next((part for part in platform if part["name"] == name), None)
+                expected = next(
+                    (part for part in platform if canonical_interface_name(part["name"]) == name),
+                    None,
+                )
                 if expected and expected["model"] and expected["serial"]:
                     raise ComponentDiscoveryError(
                         "Serialized transceiver inventory and platform identities "
@@ -347,10 +422,8 @@ def _collect_transceivers(result, flat, platform, pairs, owners, *, interfaces):
                 part = matches[0]
                 handled.add(part["name"])
                 unresolved["observations"] = part
-                unresolved["source"]["placement"] = _placement_source(
-                    part, profile=TRANSCEIVER_PROFILE
-                )
-                if part["name"] != name:
+                unresolved["source"]["placement"] = _placement_source(part, profile=profile_id)
+                if canonical_interface_name(part["name"]) != name:
                     raise ComponentDiscoveryError(
                         "Serialized transceiver identity names different "
                         "hardware and platform ports"
@@ -371,8 +444,10 @@ def _collect_transceivers(result, flat, platform, pairs, owners, *, interfaces):
                     reason = (
                         "Transceiver manufacturer is unavailable from structured platform state"
                     )
-                elif len(parents) != 1 or parents[0]["model"] != "C3850-NM-4-1G":
+                elif module_profile is None:
                     reason = "Transceiver parent uplink module is not uniquely established"
+                elif capability is None or capability["slot"] != 1:
+                    reason = "Transceiver port has no reviewed physical uplink capability"
                 elif name not in parents[0]["interfaces"]:
                     reason = (
                         "Transceiver port is not an eligible observed interface "
@@ -385,9 +460,7 @@ def _collect_transceivers(result, flat, platform, pairs, owners, *, interfaces):
                             "Transceiver port has ambiguous eligible interface observations"
                         )
                     if (
-                        observed[0].get("type") != "1000base-x-sfp"
-                        or observed[0].get("type_source")
-                        != "Installed C3850-NM-4-1G 4x1G SFP uplink module"
+                        observed[0].get("type") != capability["type"]
                         or observed[0].get("stack_member", member) != member
                     ):
                         reason = (
@@ -409,7 +482,13 @@ def _collect_transceivers(result, flat, platform, pairs, owners, *, interfaces):
                                 "chassis_model": owner["model"],
                                 "parent_key": parent_key,
                                 "bay": {
-                                    "name": "SFP %s" % name,
+                                    "name": "%s %s"
+                                    % (
+                                        "SFP"
+                                        if module_profile["model"] == "C3850-NM-4-1G"
+                                        else "Transceiver",
+                                        name,
+                                    ),
                                     "position": match.group(2),
                                     "label": name,
                                 },
@@ -422,23 +501,21 @@ def _collect_transceivers(result, flat, platform, pairs, owners, *, interfaces):
                                         "field_replaceable": fact["field_replaceable"],
                                         "interface_name": fact["name"],
                                     },
-                                    "placement": _placement_source(
-                                        part, profile=TRANSCEIVER_PROFILE
-                                    ),
+                                    "placement": _placement_source(part, profile=profile_id),
                                     "manufacturer": {
                                         "module": "Cisco-IOS-XE-platform-oper",
                                         "path": PLATFORM_PATH,
                                         "field": "state/mfg-name",
                                         "component": part["name"],
                                         "value": part["manufacturer"],
-                                        "profile": TRANSCEIVER_PROFILE,
+                                        "profile": profile_id,
                                     },
                                     "ownership": {
                                         "method": "reviewed-profile",
-                                        "profile": TRANSCEIVER_PROFILE,
+                                        "profile": profile_id,
                                         "rule": (
-                                            "C3850-NM-4-1G uplink slot 1 contains SFP bays "
-                                            "for GigabitEthernet<member>/1/1-4"
+                                            "Documented %s uplink slot 1 contains the "
+                                            "observed port %s" % (parent["model"], name)
                                         ),
                                         "parent_key": parent_key,
                                         "device_serial": owner["serial"],
@@ -450,6 +527,8 @@ def _collect_transceivers(result, flat, platform, pairs, owners, *, interfaces):
                                         "module": "Cisco-IOS-XE-interfaces-oper",
                                         "path": INTERFACES_PATH,
                                         "documentation": STACK_INTERFACE_DOCUMENT,
+                                        "hardware_documents": list(module_profile["documents"]),
+                                        "physical_type": capability["type"],
                                         "meaning": (
                                             "Matching structured hardware dev-name and platform "
                                             "cname associate the optic with a reviewed "
@@ -821,20 +900,23 @@ def collect(
         use_ntc_defaults=use_ntc_defaults,
     )
     for fact in flat:
-        if fact["hw_type"] == "hw-type-pem" or fact["model"] in psu_profiles.PSU_CONNECTORS:
-            continue
-        if fact["hw_type"] == "hw-type-transceiver":
-            continue
-        unresolved = {**fact, "source": {"identity": _identity_source(fact)}}
         named = re.fullmatch(r"Switch (\d+) FRU Uplink Module 1", fact["name"] or "")
         owner = owners.get(int(named.group(1))) if named else None
         member_position = owner["position"] if owner else None
+        module_profile = _network_module_profile(owner, fact)
+        if (
+            fact["hw_type"] in ("hw-type-pem", "hw-type-transceiver")
+            or fact["model"] in psu_profiles.PSU_CONNECTORS
+        ) and module_profile is None:
+            continue
+        unresolved = {**fact, "source": {"identity": _identity_source(fact)}}
         if not fact["model"] or not fact["serial"]:
             reason = "Serialized component model or serial number is unavailable"
-        elif owner is None or owner["model"] != "C9300-48UXM" or fact["model"] != "C3850-NM-4-1G":
+        elif module_profile is None:
             reason = "Serialized part or chassis has no reviewed component profile"
         else:
-            kind, expected_type = CATALOG[fact["model"]]
+            kind, expected_type = "network-module", "hw-type-pim"
+            profile_id = _serialized_profile(module_profile)
             if (
                 fact["hw_type"] != expected_type
                 or fact["hardware_class"] != "hw-class-physical"
@@ -872,24 +954,26 @@ def collect(
                 part = matches[0]
                 handled_platform_names.add(part["name"])
                 unresolved["observations"] = part
-                unresolved["source"]["placement"] = _placement_source(part)
+                unresolved["source"]["placement"] = _placement_source(part, profile=profile_id)
                 expected_name = _expected_platform_name(fact, member_position)
                 if part["name"] != expected_name:
                     raise ComponentDiscoveryError(
                         "Serialized network module identity names different "
                         "hardware and platform bays"
                     )
-                placement, reason = _profile_placement(part, member_position)
+                placement, reason = _profile_placement(part, member_position, module_profile)
                 if placement is not None:
                     ownership = {
                         "method": "reviewed-profile",
-                        "profile": PROFILE,
-                        "rule": "C3850-NM-4-1G in uplink slot 1 owns GigabitEthernet<member>/1/1-4"
-                        if kind == "network-module"
-                        else "Power supply has no network interfaces",
+                        "profile": profile_id,
+                        "rule": (
+                            "Documented %s uplink slot 1 owns only its eligible observed ports"
+                            % fact["model"]
+                        ),
                         "module": "Cisco-IOS-XE-interfaces-oper",
                         "path": INTERFACES_PATH,
                         "documentation": STACK_INTERFACE_DOCUMENT,
+                        "hardware_documents": list(module_profile["documents"]),
                         "device_serial": owner["serial"],
                         "member": member_position,
                         "chassis_model": owner["model"],
@@ -900,25 +984,9 @@ def collect(
                             "is preserved"
                         ),
                     }
-                    expected_ports = (
-                        ["GigabitEthernet%d/1/%d" % (member_position, port) for port in range(1, 5)]
-                        if kind == "network-module"
-                        else []
+                    owned_ports = _module_ports(
+                        result, interfaces, owner, module_profile, placement["key"]
                     )
-                    observed_names = {interface["name"] for interface in interfaces}
-                    owned_ports = [name for name in expected_ports if name in observed_names]
-                    missing_ports = [name for name in expected_ports if name not in observed_names]
-                    if missing_ports:
-                        result["unresolved"].append(
-                            {
-                                "component_key": placement["key"],
-                                "interfaces": missing_ports,
-                                "reason": (
-                                    "Expected module interfaces are absent "
-                                    "from eligible observations"
-                                ),
-                            }
-                        )
                     result["items"].append(
                         {
                             **placement,
@@ -937,7 +1005,7 @@ def collect(
                             "source": {
                                 **_owner_sources(owner),
                                 "identity": _identity_source(fact),
-                                "placement": _placement_source(part),
+                                "placement": _placement_source(part, profile=profile_id),
                                 "ownership": ownership,
                             },
                             "observations": part,

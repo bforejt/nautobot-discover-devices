@@ -15,7 +15,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.16.0-dev"
+JOB_VERSION = "0.17.0-dev"
 
 
 def _host(device):
@@ -540,6 +540,13 @@ class DiscoverDevice(Job):
                 "Left %s IPAM observations unresolved. The report explains missing evidence, "
                 "Namespace policy and routing conflicts; existing IPAM is preserved.",
                 len(ipam["unresolved"]),
+            )
+        if summary.get("unknown_interface_capabilities"):
+            self.logger.info(
+                "Physical capability remains unknown for %s observed Ethernet interfaces. "
+                "New interfaces use Other; populated types are preserved. Reported facts remain "
+                "eligible without inferring connector, duplex or maximum speed.",
+                summary["unknown_interface_capabilities"],
             )
         if plan["warnings"]:
             count = len(plan["warnings"])

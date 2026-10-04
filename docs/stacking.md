@@ -110,7 +110,9 @@ placement agrees. Eligible optics use nested ModuleBays under the confirmed
 network module.
 Hardware, platform and stack sources must agree on model, serial and member;
 an optic's parent identity and eligible physical interface must also agree.
-Unsupported profiles or ambiguous ownership remain unresolved in the report.
+The [reported hardware path](reported-hardware-discovery.md) can also use explicit
+parent references for unlisted parts and chassis. Unmapped capabilities remain
+unknown; ambiguous ownership remains unresolved in the report.
 
 Nautobot requires an Interface and its Module to share a root Device. Interfaces
 remain on the selected Device, so a network module on another physical member

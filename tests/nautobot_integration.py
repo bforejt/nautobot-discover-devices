@@ -389,6 +389,7 @@ def run(device_id=None):
     from tests.nautobot_components_integration import (
         run as verify_component_inventory,
     )
+    from tests.nautobot_generic_components_integration import run as verify_generic_components
     from tests.nautobot_hardware_profiles_integration import run as verify_hardware_profiles
     from tests.nautobot_ipam_integration import catalog_counts as ipam_catalog_counts
     from tests.nautobot_ipam_integration import run as verify_ipam_inventory
@@ -599,6 +600,7 @@ def run(device_id=None):
             verify_stack_inventory(device, interface_status, checks)
             verify_ipam_inventory(device, interface_status, checks)
             verify_hardware_profiles(device, interface_status, checks)
+            verify_generic_components(device, interface_status, checks)
             verify_ipv6_inventory(device, interface_status, checks)
             verify_route_target_inventory(device, interface_status, checks)
             verify_power_inventory(device, interface_status, checks)

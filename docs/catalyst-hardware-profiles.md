@@ -8,8 +8,14 @@ continues to populate operational speed independently when the link is ready.
 Profiles never create an interface merely because its chassis has a port, infer
 an installed module from a bundle/license SKU, normalize an unknown PID suffix,
 or equate an inactive alias with a separate physical cage. Existing inventory
-values and ownership remain preserved. Unknown PIDs and unsupported port names
-use the existing unresolved/template policy.
+values and ownership remain preserved. Unknown PIDs leave undocumented physical
+capabilities unresolved; existing templates and explicit interface classification
+can still support interface discovery.
+
+Profiles are optional enrichment. [Reported hardware discovery](reported-hardware-discovery.md)
+can retain known identities and explicit containment on unlisted chassis/PIDs.
+Ordinary explicitly classified Ethernet interfaces can use native `Other` when
+physical capability has no reviewed mapping.
 
 The library has 40 exact 9300-family chassis PIDs, 38 exact 9500-family PIDs
 (including documented bundle/license aliases), and 12 uplink module PIDs.
@@ -165,15 +171,16 @@ New modules require the model's module/FRU classification; the lab's `comp-port`
 quirk remains restricted to its existing C3850 profile. Only eligible observed
 interfaces with agreeing physical capability can be assigned to the Module.
 
-Optics require their own corroborated PID, serial, manufacturer, presence,
+Reviewed optic profiles require their own corroborated PID, serial, manufacturer, presence,
 physical-port identity, chassis placement and a uniquely resolved optical uplink
 parent. SFP/SFP+/SFP28/QSFP+/QSFP28 assets use native nested ModuleBays/Modules;
 copper 4M/8M ports cannot establish optical cages. Existing Interface device,
 module and cable relationships remain preserved.
 
-9500 module port capability is documented, but serialized module/optic placement
-remains report-only until structured platform data verifies the appropriate
-9500 placement convention. This library does not add StackWise Virtual ownership,
+9500 module port capability is documented, but specific serialized slot/optic
+placement conventions await verified structured evidence. Generic reported
+containment can proceed without decoding a 9500 slot convention when explicit
+parentage and classification establish it. This library does not add StackWise Virtual ownership,
 advanced breakout relationships, new PSU profiles, console profiles or software
 images.
 

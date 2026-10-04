@@ -47,6 +47,9 @@ LAG_INTERFACE_FAMILIES = (
     "TwoHundredGigE",
     "FourHundredGigE",
 )
+_PHYSICAL_ETHERNET_NAME = re.compile(
+    r"(?:" + "|".join(LAG_INTERFACE_FAMILIES) + r")\d+/\d+(?:/\d+)?"
+)
 # The augmentation's module qualifier is essential: the lab accepts a bare
 # channel-group filter with HTTP 200 but silently omits the membership leaves.
 LAG_FIELDS = ";".join(
@@ -392,6 +395,16 @@ def _interfaces(payload, model, member, inventory, warnings, *, stack_members=No
                 "corroborated_operational_duplex": operational_duplex,
             },
         }
+        if physical and _PHYSICAL_ETHERNET_NAME.fullmatch(name):
+            facts["physical_ethernet"] = True
+            facts["physical_ethernet_source"] = {
+                "module": "Cisco-IOS-XE-interfaces-oper",
+                "path": "interfaces/interface/interface-type",
+                "value": "iana-iftype-ethernet-csmacd",
+                "name": name,
+                "admin_status": admin,
+                "oper_status": oper,
+            }
         capability = interface_capability(name, type_model, type_member, type_inventory)
         if capability is not None:
             facts["hardware_profile"] = capability

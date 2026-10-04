@@ -3,6 +3,11 @@
 Discovery uses native Nautobot ModuleBays, Modules and PowerPorts. Collection
 uses RESTCONF GET requests and JSON only; no custom fields are created.
 
+The [reported hardware path](reported-hardware-discovery.md) can also identify
+unlisted PSU PIDs and attach them through verified reported parent references.
+Unknown connector, inlet, physical label and power specifications remain blank;
+generic discovery does not require a chassis/PSU compatibility matrix.
+
 ## Bays and serialized assets
 
 Exact reviewed chassis profiles cover 40 Catalyst C9300, C9300L, C9300LM and
@@ -12,8 +17,10 @@ identity, including when the optional platform response is unavailable.
 An unpopulated Nautobot bay means that no identified Module is recorded there;
 it does not prove that the physical bay is vacant.
 
-Automatic asset creation still requires a complete PID and serial, a unique
-hardware/platform identity match, and verified parent and location information.
+Automatic asset creation requires a complete PID and serial and a unique
+hardware/platform identity match. Reviewed PSU profiles verify parent and location
+information; generic placement instead requires explicit compatible classes,
+replaceability, presence and a parent reference to a verified chassis or Module.
 Numeric inventory indexes never join the two sources. Existing occupied bays,
 Module serials, locations and status values are preserved. An unidentified
 nonempty PSU remains an observation, and a manually recorded occupant remains
@@ -53,8 +60,8 @@ evidence and does not convert it.
 PSU bays, Modules and inlets belong to the physical Device whose chassis serial
 and member position are verified by the stack plan. This includes a newly
 created stack member. A missing or conflicting owner prevents placement.
-Other serialized component types on multi-member stacks retain their existing
-deferred behavior.
+Network modules, transceivers and other supported reported component classes can
+also be placed when their own identity and physical parent are verified.
 
 The job-selected Module Status describes the new asset's lifecycle. Operational
 power state does not change that Status. Platform presence, enabled state,

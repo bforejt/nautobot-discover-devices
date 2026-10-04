@@ -15,7 +15,7 @@ from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 
 name = "Device Discovery"
-JOB_VERSION = "0.14.0-dev"
+JOB_VERSION = "0.15.0-dev"
 
 
 def _host(device):
@@ -120,7 +120,7 @@ class DiscoverDevice(Job):
         required=False,
         label="Default IPAM namespace",
         description=(
-            "Select an existing Namespace to enable static IPv4 and named VRF discovery. "
+            "Select an existing Namespace to enable static IPv4/IPv6 and named VRF discovery. "
             "Unmatched addresses use this Namespace. Leave blank for report-only IPAM."
         ),
     )
@@ -135,14 +135,19 @@ class DiscoverDevice(Job):
         label="Use override for RFC1918",
         description=(
             "With an override Namespace selected, place 10.0.0.0/8, 172.16.0.0/12 "
-            "and 192.168.0.0/16 there. Additional networks are combined with these ranges."
+            "and 192.168.0.0/16 there. This applies only to IPv4; use manual IPv6 CIDRs "
+            "for IPv6 overrides, including ULA."
         ),
     )
     ipam_override_networks = TextVar(
         required=False,
         default="",
         label="Additional override networks",
-        description="IPv4 network CIDRs, one per line. Requires an override Namespace.",
+        description=(
+            "IPv4 or IPv6 network CIDRs, one per line, such as 100.64.0.0/10 or fd00::/8. "
+            "Requires an override Namespace. Both address families in one named VRF must "
+            "resolve to the same Namespace."
+        ),
     )
     ipam_create_missing_prefixes = BooleanVar(
         default=True,
@@ -197,7 +202,8 @@ class DiscoverDevice(Job):
         name = "Discover Device"
         description = (
             "Verify Cisco IOS XE identity and fill interfaces, console ports, VLANs, "
-            "serialized hardware, static IPv4 addressing and named VRFs."
+            "serialized hardware, static IPv4/IPv6 addressing and named VRFs with "
+            "supported import/export route targets."
         )
         dryrun_default = True
         read_only = False
@@ -473,6 +479,21 @@ class DiscoverDevice(Job):
                 "IP address assignments",
             ),
             ("vrfs_created", "add", "Added", "VRF", "VRFs"),
+            ("route_targets_created", "add", "Added", "route target", "route targets"),
+            (
+                "vrf_import_targets_added",
+                "link",
+                "Linked",
+                "VRF import route target",
+                "VRF import route targets",
+            ),
+            (
+                "vrf_export_targets_added",
+                "link",
+                "Linked",
+                "VRF export route target",
+                "VRF export route targets",
+            ),
             (
                 "vrf_device_assignments_created",
                 "add",

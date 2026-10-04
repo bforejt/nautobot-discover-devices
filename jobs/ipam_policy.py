@@ -1,4 +1,4 @@
-"""Explicit operator policy for IPv4 Namespace selection and VRF identity."""
+"""Explicit operator policy for IP Namespace selection and VRF identity."""
 
 import ipaddress
 import re
@@ -39,10 +39,10 @@ def normalize_ipam_policy(
         if "/" not in item:
             raise ValueError("Additional override networks require an explicit CIDR mask")
         try:
-            network = ipaddress.IPv4Network(item, strict=True)
+            network = ipaddress.ip_network(item, strict=True)
         except ValueError:
             raise ValueError(
-                "Additional override networks require valid IPv4 network CIDRs"
+                "Additional override networks require valid IPv4 or IPv6 network CIDRs"
             ) from None
         if str(network) not in networks:
             networks.append(str(network))

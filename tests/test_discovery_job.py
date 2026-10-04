@@ -98,6 +98,9 @@ CHANGE_COUNTERS = {
     "ip_addresses_created": (r"ip addresses?", r"creat|new|add"),
     "ip_assignments_created": (r"ip address assignments?", r"creat|new|add|link"),
     "vrfs_created": (r"vrfs?", r"creat|new|add"),
+    "route_targets_created": (r"route targets?", r"creat|new|add"),
+    "vrf_import_targets_added": (r"vrf import route targets?", r"link|add"),
+    "vrf_export_targets_added": (r"vrf export route targets?", r"link|add"),
     "vrf_device_assignments_created": (r"device vrf assignments?", r"creat|new|add|link"),
     "vrf_device_assignments_updated": (r"device vrf assignments?", r"updat|enrich|fill"),
     "interface_vrfs_updated": (r"interface vrf assignments?", r"updat|link"),
@@ -209,7 +212,7 @@ class DiscoveryJobTests(unittest.TestCase):
                 dryrun=False,
                 ipam_namespace=namespace,
                 ipam_override_namespace=override,
-                ipam_override_networks="100.64.0.0/10",
+                ipam_override_networks="100.64.0.0/10\nfd00::/8",
                 ipam_group_user_vrfs=True,
                 ipam_local_vrf_names="Mgmt-vrf\nLOCAL",
                 ipam_prefix_status=prefix_status,
@@ -218,7 +221,7 @@ class DiscoveryJobTests(unittest.TestCase):
         policy = self.assert_saved_report()["ipam_policy"]
         self.assertEqual(policy["default_namespace"]["id"], namespace.pk)
         self.assertEqual(policy["override_namespace"]["id"], override.pk)
-        self.assertEqual(policy["override_networks"], ["100.64.0.0/10"])
+        self.assertEqual(policy["override_networks"], ["100.64.0.0/10", "fd00::/8"])
         self.assertEqual(policy["local_vrf_names"], ["LOCAL", "Mgmt-vrf"])
         self.assertEqual(policy["location"], location)
         self.assertEqual(self.module.snapshot_inventory.call_args.kwargs["ipam_policy"], policy)

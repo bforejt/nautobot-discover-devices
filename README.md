@@ -3,7 +3,7 @@
 `Discover Device` verifies an existing Nautobot Device against structured facts
 from the device, then fills missing identity, interface, console connector,
 reviewed serialized hardware inventory, scoped 802.1Q assignments, configured
-static IPv4 addressing, and explicitly mapped named VRFs. The first adapter
+static IPv4/IPv6 addressing, and explicitly mapped named VRFs. The first adapter
 supports Cisco IOS XE switches on 17.9
 or later using RESTCONF JSON exclusively. The job defaults to a preview.
 
@@ -75,16 +75,16 @@ The job form contains these inputs:
 | VLAN Group | None | Explicit Layer-2 domain required for VLAN catalog and interface switching writes |
 | VLAN status | Applicable `Active` | Operator-selected status for newly created VLANs |
 | Use NTC defaults when guessing | Disabled | Apply the reviewed Network to Code Device Onboarding fallback for eligible down dynamic switchports and Nautobot's 0.95 power-factor default for new PSU inlets; mark inferred values in the report |
-| Default IPAM namespace | None | Select an existing Namespace to enable static IPv4/VRF reconciliation; blank keeps IPAM report-only |
+| Default IPAM namespace | None | Select an existing Namespace to enable static IPv4/IPv6 and VRF reconciliation; blank keeps IPAM report-only |
 | Override IPAM namespace | None | Optional Namespace for RFC1918 and manually entered override networks |
-| Use override for RFC1918 | Enabled | With an override selected, match the three exact RFC1918 ranges |
-| Additional override networks | Blank | IPv4 network CIDRs, one per line, combined with RFC1918 matches |
+| Use override for RFC1918 | Enabled | With an override selected, match the three exact IPv4 RFC1918 ranges |
+| Additional override networks | Blank | IPv4 or IPv6 network CIDRs, one per line, combined with RFC1918 matches |
 | Create missing networks | Enabled | Create exact connected Network Prefixes attached to the Prefix Location |
 | Group matching user VRF names across devices | Disabled | Explicitly group matching user VRF names within one Namespace |
 | Keep these VRF names device-local | `Mgmt-vrf` | Exact exceptions to grouping, one per line |
 | Prefix Location | Closest Site ancestor, otherwise Device Location | Optional Device ancestor override; Location Type must permit Prefixes |
 | New Prefix status | Applicable `Active` | Status for newly created connected Prefixes |
-| New IP Address status | Applicable `Active` | Status for newly created configured IPv4 hosts |
+| New IP Address status | Applicable `Active` | Status for newly created configured IPv4/IPv6 hosts |
 
 Start with Dry run enabled. The main job log shows progress, readable change
 counts, and brief notices for preserved differences and skipped observations.
@@ -145,7 +145,8 @@ MAC addresses, and descriptions.
 | Configured copper duplex | Fill blank `Interface.duplex` from explicit configuration or the narrowly reviewed configured default |
 | Reviewed dedicated management hardware | Mark the confirmed `Gi0/0` as management-only using the narrow purpose-correction policy below |
 | Reviewed physical console connectors | Create or adopt native ConsolePorts, preserving existing names, UUIDs and cables |
-| Configured static IPv4 and named VRFs | Reconcile connected Prefixes, hosts and explicit routing memberships after a default Namespace is selected; otherwise report-only |
+| Configured static IPv4/IPv6 and named VRFs | Reconcile connected Prefixes, hosts and explicit routing memberships after a default Namespace is selected; otherwise report-only |
+| Supported user VRF import/export targets | Fill empty native RouteTarget associations from complete literal policy; preserve populated sets and management isolation |
 | Negotiated and MAC duplex | Retain as observations; never substitute for the configured duplex setting |
 | Supported configured 802.1Q bundle | Fill blank mode and VLAN assignments in the selected VLAN Group |
 | Directly reported ordinary dynamic access/trunk mode | Use the actual mode with known configured VLAN policy to fill the existing 802.1Q fields |
@@ -180,8 +181,8 @@ not change lifecycle status. The supported fields are type, enabled, description
 MTU, MAC, operational speed, supported connector type, documented management-only
 purpose, and configured 802.1Q assignments, including directly reported
 access/trunk selection for ordinary dynamic ports when available.
-Configured static IPv4 and named VRFs are reconciled through the selected
-Namespace policy below. IPv6, dynamic addressing, shared/FHRP addressing,
+Configured static IPv4/IPv6 and named VRFs are reconciled through the selected
+Namespace policy below. Generated or link-local IPv6, dynamic addressing, shared/FHRP addressing,
 cables, unreviewed transceiver placements, and additional component profiles
 are future increments.
 
@@ -210,12 +211,13 @@ known blank fields. No generic physical type is invented.
 
 ## IPAM and named VRFs
 
-Select **Default IPAM namespace** to enable configured static IPv4 and named
+Select **Default IPAM namespace** to enable configured static IPv4/IPv6 and named
 VRF reconciliation. Leaving it blank keeps IPAM report-only even when other
 inventory changes are applied. To use the common split, choose **Internet** as
 the default, **Corporate** as **Override IPAM namespace**, and leave **Use override
 for RFC1918** checked. Add internally used public ranges or other exceptions to
-**Additional override networks**, one IPv4 network CIDR per line. Unchecking
+**Additional override networks**, one IPv4 or IPv6 network CIDR per line. Add
+`fd00::/8` explicitly if ULA should use the override. Unchecking
 RFC1918 makes only those manual networks match. The names are operator labels;
 all unmatched addresses use the default without an inferred public designation.
 
@@ -242,8 +244,16 @@ The preview lists rule matches, VRF identities, networks, hosts, assignments and
 hierarchy effects. More specific Prefixes can reparent existing inventory;
 changes to inherited VRF associations, incompatible masks, duplicate/shared
 hosts, exclusive ranges and conflicting site scope are deferred or blocked.
-DHCP, unnumbered and IPv6 remain observations. Device primary IPs are preserved.
+DHCP, unnumbered, generated and link-local IPv6 remain observations. Both address
+families within a named VRF must select one Namespace. Device primary IPs are preserved.
 No custom fields are created. Namespace policy is independent of NTC guessing.
+
+Ordinary user VRFs can also receive supported literal import/export RouteTargets.
+Each direction is filled only when empty; conflicting populated sets are preserved.
+Management `Mgmt-vrf` targets stay report-only. Address-family policies that cannot
+fit one native import/export pair, automatic targets and stitching stay unresolved.
+Equal targets do not establish a shared VRF identity. A shared VRF already assigned
+to another Device is not enriched from one Device's observations alone.
 
 See [IPAM discovery](docs/ipam-discovery.md) for the exact input fields,
 RESTCONF/YANG sources, preservation guards, report structure and test coverage.
@@ -315,9 +325,9 @@ collected separately under `discovery.management`. Operational address values
 remain observations: `0.0.0.0` is not assigned, and an IPv6 address without a
 prefix length does not establish a mask. DHCP, autoconfiguration, EUI-64 and
 anycast flags retain their explicit meaning. The broader `discovery.ipam`
-collector supplies static IPv4 and all named VRF facts independently of this
+collector supplies static IPv4/IPv6 and all named VRF facts independently of this
 hardware profile. Select the Namespace policy above to enable those writes;
-IPv6 and dynamic addressing stay observation-only. Existing primary IPs and
+Generated/link-local IPv6 and dynamic addressing stay observation-only. Existing primary IPs and
 populated assignments remain preserved.
 
 The lab exposes shutdown `Gi0/0` in `Mgmt-vrf` with no configured address;

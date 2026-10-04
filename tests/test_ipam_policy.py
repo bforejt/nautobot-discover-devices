@@ -45,7 +45,13 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(result["local_vrf_names"], ["Mgmt-vrf", "PRIVATE"])
 
     def test_invalid_inputs_fail_before_inventory_or_transport(self):
-        for networks in ("192.0.2.1/24", "192.0.2.0", "2001:db8::/64", "not-a-network"):
+        for networks in (
+            "192.0.2.1/24",
+            "192.0.2.0",
+            "2001:db8::1/64",
+            "2001:db8::",
+            "not-a-network",
+        ):
             with self.subTest(networks=networks), self.assertRaises(ValueError):
                 policy.normalize_ipam_policy(
                     self.default,
@@ -59,3 +65,14 @@ class PolicyTests(unittest.TestCase):
         for key in ("override_rfc1918", "create_missing_prefixes", "group_user_vrfs"):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 policy.normalize_ipam_policy(self.default, **{key: "true"})
+
+    def test_manual_override_accepts_both_families_without_implicit_ula_policy(self):
+        result = policy.normalize_ipam_policy(
+            self.default,
+            self.override,
+            override_networks="fd00::/8, 100.64.0.0/10\n2001:DB8::/32\n2001:db8::/32",
+        )
+        self.assertEqual(
+            result["override_networks"], ["100.64.0.0/10", "2001:db8::/32", "fd00::/8"]
+        )
+        self.assertTrue(result["override_rfc1918"])

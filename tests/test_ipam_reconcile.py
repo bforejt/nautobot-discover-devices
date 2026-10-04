@@ -20,8 +20,21 @@ def address(host="10.40.12.1", length=24, secondary=False):
     }
 
 
-def fact(name="Gi0/0", vrf=None, addresses=None):
-    return {"name": name, "vrf": vrf, "ipv4": addresses or [], "source": {"method": "restconf"}}
+def fact(name="Gi0/0", vrf=None, addresses=None, ipv6=None):
+    row = {"name": name, "vrf": vrf, "ipv4": addresses or [], "source": {"method": "restconf"}}
+    if ipv6 is not None:
+        row["ipv6"] = ipv6
+    return row
+
+
+def ipv6_address(value="2001:db8:40::1/64", **values):
+    return {
+        "configured_prefix": value,
+        "method": "configured",
+        "eui_64": False,
+        "anycast": False,
+        **values,
+    }
 
 
 def vrf(name="Mgmt-vrf", rd=None):
@@ -730,6 +743,110 @@ class IPAMReconciliationTests(unittest.TestCase):
         reported = planner.plan_ipam(discovery(vrfs=[vrf("CORP", rd="65000:2")]), before)
         self.assertEqual(reported["vrf_device_assignments"][0]["rd"], "65000:2")
 
+    def test_new_shared_vrf_with_populated_route_targets_requires_matching_evidence(self):
+        for status, imports, exports, accepted in (
+            ("available", ["65000:44"], ["65000:55"], True),
+            ("available", ["65000:99"], ["65000:55"], False),
+            ("available", ["65000:44"], [], False),
+            ("available", [], [], False),
+            ("unavailable", [], [], False),
+        ):
+            with self.subTest(status=status, imports=imports, exports=exports):
+                before = inventory()
+                catalog = before["ipam_inventory"]
+                catalog["policy"]["group_user_vrfs"] = True
+                catalog["vrfs"] = [
+                    existing_vrf("CORP", import_target_ids=["rt-in"], export_target_ids=["rt-out"])
+                ]
+                catalog["route_targets"] = [
+                    {"id": "rt-in", "name": "65000:44"},
+                    {"id": "rt-out", "name": "65000:55"},
+                ]
+                observed_vrf = vrf("CORP")
+                observed_vrf["route_targets"] = {
+                    "status": status,
+                    "import": imports,
+                    "export": exports,
+                    "source": {"complete": True},
+                }
+                observed = discovery(fact(vrf="CORP", addresses=[address()]), vrfs=[observed_vrf])
+                plan = planner.plan_ipam(observed, before)
+                self.assertFalse(plan["errors"])
+                if accepted:
+                    self.assertFalse(plan["unresolved"])
+                    self.assertFalse(plan["vrfs"][0]["create"])
+                    self.assertTrue(plan["vrf_device_assignments"][0]["create"])
+                    self.assertEqual(plan["summary"]["ip_addresses_created"], 1)
+                else:
+                    self.assertTrue(all(not plan[key] for key in planner.COLLECTIONS))
+                    self.assertIn("route targets", plan["unresolved"][0]["reason"])
+
+    def test_shared_vrf_route_target_adoption_requires_complete_direction_and_catalog(self):
+        for facts, targets in (
+            (None, [{"id": "rt-in", "name": "65000:44"}]),
+            (
+                {"status": "available", "import": ["65000:44"], "export": [], "source": {}},
+                [{"id": "rt-in", "name": "65000:44"}],
+            ),
+            (
+                {
+                    "status": "available",
+                    "import": ["65000:44"],
+                    "export": [],
+                    "source": {"complete": True},
+                },
+                None,
+            ),
+            (
+                {
+                    "status": "available",
+                    "import": ["65000:44"],
+                    "export": [],
+                    "source": {"complete": True},
+                },
+                [],
+            ),
+        ):
+            with self.subTest(facts=facts, targets=targets):
+                before = inventory()
+                catalog = before["ipam_inventory"]
+                catalog["policy"]["group_user_vrfs"] = True
+                catalog["vrfs"] = [
+                    existing_vrf("CORP", import_target_ids=["rt-in"], export_target_ids=[])
+                ]
+                catalog["route_targets"] = targets
+                observed_vrf = vrf("CORP")
+                if facts is not None:
+                    observed_vrf["route_targets"] = facts
+                plan = planner.plan_ipam(
+                    discovery(fact(vrf="CORP", addresses=[address()]), vrfs=[observed_vrf]), before
+                )
+                self.assertFalse(plan["errors"])
+                self.assertTrue(all(not plan[key] for key in planner.COLLECTIONS))
+
+    def test_existing_shared_vrf_assignment_remains_resolved_when_route_targets_differ(self):
+        before = inventory()
+        catalog = before["ipam_inventory"]
+        catalog["policy"]["group_user_vrfs"] = True
+        catalog["vrfs"] = [existing_vrf("CORP", import_target_ids=["rt-in"], export_target_ids=[])]
+        catalog["vrf_device_assignments"] = [device_vrf("CORP")]
+        catalog["route_targets"] = [{"id": "rt-in", "name": "65000:44"}]
+        before["interfaces"][0]["vrf_id"] = "vrf-1"
+        observed_vrf = vrf("CORP")
+        observed_vrf["route_targets"] = {
+            "status": "available",
+            "import": ["65000:99"],
+            "export": [],
+            "source": {"complete": True},
+        }
+        plan = planner.plan_ipam(
+            discovery(fact(vrf="CORP", addresses=[address()]), vrfs=[observed_vrf]), before
+        )
+        self.assertFalse(plan["errors"])
+        self.assertFalse(plan["unresolved"])
+        self.assertFalse(plan["vrf_device_assignments"][0]["create"])
+        self.assertEqual(plan["summary"]["ip_addresses_created"], 1)
+
     def test_new_network_cannot_overlap_exclusive_range_even_when_host_is_outside_it(self):
         for more_specific_parent in (False, True):
             with self.subTest(more_specific_parent=more_specific_parent):
@@ -754,6 +871,371 @@ class IPAMReconciliationTests(unittest.TestCase):
                 self.assertFalse(plan["prefixes"])
                 self.assertFalse(plan["ip_addresses"])
                 self.assertIn("exclusive IP range", plan["unresolved"][0]["reason"])
+
+
+class StaticIPv6ReconciliationTests(unittest.TestCase):
+    def test_inactive_modern_vrf_ipv6_family_preserves_ipv4_and_defers_ipv6(self):
+        before = inventory()
+        row = fact(vrf="CORP", addresses=[address()], ipv6=[ipv6_address()])
+        row["addressing"] = {
+            "ipv6_vrf_scope": "unresolved-inactive-vrf-family",
+            "ipv6_vrf_reason": "Complete named VRF definition does not enable IPv6",
+        }
+        row["ipv6_routing"] = {
+            "status": "unresolved",
+            "binding": "inactive-vrf-family",
+            "source": {"path": "/data/Cisco-IOS-XE-native:native/interface"},
+            "vrf_source": {"path": "/data/Cisco-IOS-XE-native:native/vrf", "complete": True},
+        }
+        plan = planner.plan_ipam(discovery(row, vrfs=[vrf("CORP")]), before)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["summary"]["vrfs_created"], 1)
+        self.assertEqual(plan["summary"]["ip_addresses_created"], 1)
+        self.assertEqual(plan["ip_addresses"][0]["host"], "10.40.12.1")
+        self.assertEqual(len(plan["unresolved"]), 1)
+        self.assertEqual(plan["unresolved"][0]["reason"], row["addressing"]["ipv6_vrf_reason"])
+        self.assertEqual(plan["unresolved"][0]["ipv6_routing"], row["ipv6_routing"])
+        self.assertFalse(any(":" in item["prefix"] for item in plan["prefixes"]))
+        after = apply_snapshot(plan, before)
+        repeat = planner.plan_ipam(discovery(row, vrfs=[vrf("CORP")]), after)
+        self.assertEqual(repeat["summary"]["ip_addresses_created"], 0)
+        self.assertEqual(len(repeat["unresolved"]), 1)
+
+    def test_legacy_single_protocol_vrf_preserves_ipv4_and_defers_ipv6_with_evidence(self):
+        before = inventory()
+        row = fact(vrf="CORP", addresses=[address()], ipv6=[ipv6_address()])
+        row["addressing"] = {
+            "ipv6_vrf_scope": "unresolved-legacy-vrf",
+            "ipv6_vrf_reason": "Reviewed legacy forwarding binds IPv4 only",
+        }
+        row["ipv6_routing"] = {
+            "status": "unresolved",
+            "binding": "legacy-vrf-forwarding",
+            "source": {"path": "/data/Cisco-IOS-XE-native:native/interface"},
+        }
+        plan = planner.plan_ipam(discovery(row, vrfs=[vrf("CORP")]), before)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["summary"]["vrfs_created"], 1)
+        self.assertEqual(plan["summary"]["ip_addresses_created"], 1)
+        self.assertEqual(plan["ip_addresses"][0]["host"], "10.40.12.1")
+        self.assertEqual(len(plan["unresolved"]), 1)
+        self.assertEqual(plan["unresolved"][0]["reason"], row["addressing"]["ipv6_vrf_reason"])
+        self.assertEqual(plan["unresolved"][0]["ipv6_routing"], row["ipv6_routing"])
+        self.assertFalse(any(":" in item["prefix"] for item in plan["prefixes"]))
+        after = apply_snapshot(plan, before)
+        repeat = planner.plan_ipam(discovery(row, vrfs=[vrf("CORP")]), after)
+        self.assertEqual(repeat["summary"]["ip_addresses_created"], 0)
+        self.assertEqual(len(repeat["unresolved"]), 1)
+
+    def test_literal_static_ipv6_is_pure_idempotent_and_attached_to_location(self):
+        before = inventory()
+        original = deepcopy(before)
+        observed = discovery(fact(ipv6=[ipv6_address("2001:DB8:40::1/64")]))
+        first = planner.plan_ipam(observed, before)
+        self.assertFalse(first["errors"])
+        self.assertFalse(first["unresolved"])
+        self.assertEqual(first["prefixes"][0]["prefix"], "2001:db8:40::/64")
+        self.assertEqual(first["prefixes"][0]["namespace_id"], "internet")
+        self.assertEqual(first["prefixes"][0]["location_id"], "site-1")
+        self.assertEqual(first["ip_addresses"][0]["address"], "2001:db8:40::1/64")
+        self.assertFalse(first["ip_assignments"][0]["is_secondary"])
+        self.assertEqual(before, original)
+        json.dumps(first)
+        repeat = planner.plan_ipam(observed, apply_snapshot(first, before))
+        self.assertFalse(repeat["errors"])
+        self.assertTrue(all(value == 0 for value in repeat["summary"].values()))
+
+    def test_rfc1918_checkbox_never_classifies_ipv6_or_ula(self):
+        for value in ("fd12:3456:40::1/64", "2001:db8:40::1/64"):
+            with self.subTest(value=value):
+                plan = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address(value)])), inventory())
+                self.assertEqual(plan["ip_addresses"][0]["namespace_id"], "internet")
+                self.assertEqual(plan["settings"][0]["matched_rule"], "default")
+
+    def test_mixed_family_manual_override_union_and_boundaries(self):
+        before = inventory()
+        policy = before["ipam_inventory"]["policy"]
+        policy["override_networks"] = ["100.64.0.0/10", "fd00::/8", "2001:db8:40::/65"]
+        plan = planner.plan_ipam(
+            discovery(fact(addresses=[address()], ipv6=[ipv6_address("fd12:3456:40::1/64")])),
+            before,
+        )
+        self.assertFalse(plan["errors"])
+        self.assertEqual({row["namespace_id"] for row in plan["ip_addresses"]}, {"corporate"})
+        partial = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertFalse(partial["prefixes"])
+        self.assertIn("boundaries", partial["unresolved"][0]["reason"])
+        policy["override_networks"].append("2001:db8:40:0:8000::/65")
+        complete = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertFalse(complete["errors"])
+        self.assertEqual(complete["ip_addresses"][0]["namespace_id"], "corporate")
+
+    def test_zero_dml_policy_defer_reports_static_ipv6(self):
+        before = inventory()
+        before["ipam_inventory"]["policy"] = None
+        plan = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertTrue(plan["settings"][0]["ipv6"])
+        self.assertTrue(plan["unresolved"])
+        self.assertTrue(all(not plan[key] for key in planner.COLLECTIONS))
+
+    def test_generated_anycast_named_and_link_local_forms_are_observations(self):
+        observations = [
+            ipv6_address(eui_64=True),
+            ipv6_address(anycast=True),
+            {"method": "configured-named-prefix", "prefix_name": "DELEGATED", "configuration": {}},
+            {"method": "configured-link-local", "address": "fe80::1"},
+            ipv6_address("fe80::1/64"),
+        ]
+        for item in observations:
+            with self.subTest(item=item):
+                plan = planner.plan_ipam(discovery(fact(ipv6=[item])), inventory())
+                self.assertFalse(plan["errors"])
+                self.assertFalse(plan["ip_addresses"])
+                self.assertFalse(plan["prefixes"])
+                self.assertEqual(len(plan["unresolved"]), 1)
+        observed = discovery(fact(addresses=[address()], ipv6=observations))
+        plan = planner.plan_ipam(observed, inventory())
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["summary"]["ip_addresses_created"], 1)
+        existing_notice = {
+            "name": "GigabitEthernet0/0",
+            "ipv6": observations[0],
+            "reason": "deferred",
+        }
+        observed["ipam"]["unresolved"] = [existing_notice]
+        deduplicated = planner.plan_ipam(observed, inventory())
+        self.assertEqual(len(deduplicated["unresolved"]), len(observations))
+
+    def test_malformed_literal_evidence_aborts_all_inventory_plans(self):
+        cases = [
+            ipv6_address("not-ipv6/64"),
+            ipv6_address("2001:db8::1"),
+            ipv6_address("2001:db8::1/129"),
+            ipv6_address("::/64"),
+            ipv6_address("ff02::1/128"),
+            ipv6_address("2001:db8::1%operator/64"),
+            ipv6_address(eui_64=None),
+            {"configured_prefix": "2001:db8::1/64", "method": "configured", "eui_64": False},
+            "2001:db8::1/64",
+        ]
+        for item in cases:
+            with self.subTest(item=item):
+                plan = planner.plan_ipam(
+                    discovery(fact(addresses=[address()], ipv6=[item])), inventory()
+                )
+                self.assertTrue(plan["errors"])
+                self.assertTrue(all(not plan[key] for key in planner.COLLECTIONS))
+        malformed = discovery(fact(ipv6=[]))
+        malformed["ipam"]["interfaces"][0]["ipv6"] = {}
+        self.assertTrue(planner.plan_ipam(malformed, inventory())["errors"])
+
+    def test_duplicate_normalized_ipv6_host_on_interface_is_error(self):
+        plan = planner.plan_ipam(
+            discovery(fact(ipv6=[ipv6_address(), ipv6_address("2001:DB8:40::1/128")])),
+            inventory(),
+        )
+        self.assertTrue(plan["errors"])
+
+    def test_point_to_point_and_host_routes_allow_ipv6_boundary_hosts(self):
+        for host in ("2001:db8::/127", "2001:db8::1/127", "2001:db8::1/128"):
+            with self.subTest(host=host):
+                plan = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address(host)])), inventory())
+                self.assertFalse(plan["errors"])
+                self.assertFalse(plan["unresolved"])
+                self.assertEqual(plan["ip_addresses"][0]["address"], host)
+
+    def test_named_vrf_across_families_requires_one_namespace(self):
+        observed = discovery(
+            fact(vrf="CORP", addresses=[address()], ipv6=[ipv6_address()]),
+            vrfs=[vrf("CORP")],
+        )
+        rejected = planner.plan_ipam(observed, inventory())
+        self.assertTrue(all(not rejected[key] for key in planner.COLLECTIONS))
+        self.assertIn("cannot span", rejected["unresolved"][0]["reason"])
+        before = inventory()
+        before["ipam_inventory"]["policy"]["override_networks"] = ["2001:db8::/32"]
+        accepted = planner.plan_ipam(observed, before)
+        self.assertFalse(accepted["errors"])
+        self.assertFalse(accepted["unresolved"])
+        self.assertEqual(accepted["summary"]["vrfs_created"], 1)
+        self.assertEqual(accepted["summary"]["ip_addresses_created"], 2)
+        self.assertEqual({row["namespace_id"] for row in accepted["prefixes"]}, {"corporate"})
+
+    def test_existing_vrf_namespace_and_populated_interface_vrf_are_preserved(self):
+        before = inventory()
+        catalog = before["ipam_inventory"]
+        catalog["vrfs"] = [existing_vrf()]
+        catalog["vrf_device_assignments"] = [device_vrf("CORP")]
+        observed = discovery(fact(vrf="CORP", ipv6=[ipv6_address()]), vrfs=[vrf("CORP")])
+        conflict = planner.plan_ipam(observed, before)
+        self.assertFalse(conflict["ip_addresses"])
+        self.assertEqual(conflict["conflicts"][0]["field"], "namespace_id")
+        before = inventory()
+        before["interfaces"][0]["vrf_id"] = "operator-vrf"
+        preserved = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertFalse(preserved["ip_addresses"])
+        self.assertEqual(preserved["conflicts"][0]["field"], "vrf_id")
+
+    def test_ipv6_duplicate_hosts_and_foreign_assignments_do_not_infer_sharing(self):
+        before = inventory()
+        before["interfaces"].append({"id": "int-2", "name": "Vlan10", "vrf_id": None})
+        repeated = planner.plan_ipam(
+            discovery(fact(ipv6=[ipv6_address()]), fact("Vlan10", ipv6=[ipv6_address()])), before
+        )
+        self.assertFalse(repeated["ip_addresses"])
+        before = inventory()
+        catalog = before["ipam_inventory"]
+        catalog["prefixes"] = [prefix("2001:db8:40::/64", namespace_id="internet")]
+        catalog["ip_addresses"] = [ip("2001:db8:40::1", mask_length=64, namespace_id="internet")]
+        catalog["ip_assignments"] = [assignment(interface_id="foreign-int")]
+        foreign = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertFalse(foreign["ip_addresses"])
+        self.assertIn("assigned elsewhere", foreign["unresolved"][-1]["reason"])
+
+    def test_existing_ipv6_masks_other_namespace_and_secondary_flag_are_preserved(self):
+        before = inventory()
+        catalog = before["ipam_inventory"]
+        catalog["prefixes"] = [prefix("2001:db8:40::/64", namespace_id="internet")]
+        catalog["ip_addresses"] = [ip("2001:db8:40::1", mask_length=128, namespace_id="internet")]
+        conflict = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertFalse(conflict["ip_addresses"])
+        self.assertEqual(conflict["conflicts"][0]["field"], "mask_length")
+        catalog["ip_addresses"][0]["mask_length"] = 64
+        catalog["ip_assignments"] = [assignment(is_secondary=True)]
+        secondary = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertFalse(secondary["conflicts"])
+        self.assertFalse(secondary["ip_assignments"])
+        catalog["ip_addresses"][0]["namespace_id"] = "corporate"
+        catalog["ip_addresses"][0]["host"] = "2001:DB8:0040:0:0:0:0:1"
+        namespace = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertFalse(namespace["ip_addresses"])
+        self.assertIn("namespaces", namespace["unresolved"][0]["reason"])
+
+    def test_ipv6_prefix_reparenting_preserves_ips_children_and_other_family(self):
+        before = inventory()
+        catalog = before["ipam_inventory"]
+        catalog["prefixes"] = [
+            prefix("2001:db8::/32", id="aggregate", namespace_id="internet", type="container"),
+            prefix("2001:db8:40::/65", id="child", namespace_id="internet", parent_id="aggregate"),
+            prefix("0.0.0.0/0", id="v4", namespace_id="internet"),
+        ]
+        catalog["ip_addresses"] = [
+            ip(
+                "2001:db8:40:0:8000::2",
+                namespace_id="internet",
+                parent_id="aggregate",
+                id="unrelated",
+            ),
+            ip("2001:db8:40::2", namespace_id="internet", parent_id="child", id="child-ip"),
+            ip("203.0.113.2", namespace_id="internet", parent_id="v4", id="ipv4"),
+        ]
+        catalog["ip_ranges"] = [
+            {
+                "id": "v4-range",
+                "namespace_id": "internet",
+                "start_address": "10.0.0.1",
+                "end_address": "10.0.0.20",
+                "parent_id": "v4",
+                "is_exclusive": True,
+            },
+        ]
+        plan = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertFalse(plan["errors"])
+        created = next(row for row in plan["prefixes"] if row["create"])
+        self.assertEqual(created["parent_id"], "aggregate")
+        self.assertEqual(created["affected_ip_ids"], ["unrelated"])
+        self.assertEqual(created["affected_prefix_ids"], ["child"])
+        self.assertFalse(created["affected_range_ids"])
+        self.assertEqual(plan["ip_addresses"][0]["parent_key"], "prefix-existing:child")
+
+    def test_nested_new_ipv6_and_ipv4_prefixes_never_become_cross_family_parents(self):
+        before = inventory()
+        before["interfaces"].append({"id": "int-2", "name": "Vlan10", "vrf_id": None})
+        observed = discovery(
+            fact(
+                addresses=[address("203.0.113.1")], ipv6=[ipv6_address("2001:db8:40:0:8000::1/64")]
+            ),
+            fact("Vlan10", ipv6=[ipv6_address("2001:db8:40::1/65")]),
+        )
+        plan = planner.plan_ipam(observed, before)
+        self.assertFalse(plan["errors"])
+        wider = next(row for row in plan["prefixes"] if row["prefix"] == "2001:db8:40::/64")
+        child = next(row for row in plan["prefixes"] if row["prefix"] == "2001:db8:40::/65")
+        ipv4 = next(row for row in plan["prefixes"] if ":" not in row["prefix"])
+        self.assertEqual(child["parent_key"], wider["key"])
+        self.assertIsNone(ipv4["parent_key"])
+
+    def test_ipv6_ranges_cannot_be_split_or_reparented_to_other_vrfs(self):
+        for end, routing in (("2001:db8:41::20", []), ("2001:db8:40::20", ["vrf-1"])):
+            before = inventory()
+            catalog = before["ipam_inventory"]
+            catalog["prefixes"] = [
+                prefix(
+                    "2001:db8::/32",
+                    id="aggregate",
+                    namespace_id="internet",
+                    type="container",
+                    vrf_ids=routing,
+                )
+            ]
+            catalog["ip_ranges"] = [
+                {
+                    "id": "range-6",
+                    "start_address": "2001:db8:40::10",
+                    "end_address": end,
+                    "namespace_id": "internet",
+                    "parent_id": "aggregate",
+                }
+            ]
+            plan = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+            self.assertFalse(plan["prefixes"])
+            self.assertTrue(plan["unresolved"])
+
+    def test_exclusive_ipv6_range_and_missing_prefix_setting_defer(self):
+        before = inventory()
+        catalog = before["ipam_inventory"]
+        catalog["prefixes"] = [prefix("2001:db8:40::/64", namespace_id="internet")]
+        catalog["ip_ranges"] = [
+            {
+                "id": "range-6",
+                "start_address": "2001:db8:40::1",
+                "end_address": "2001:db8:40::20",
+                "namespace_id": "internet",
+                "parent_id": "prefix-1",
+                "is_exclusive": True,
+            }
+        ]
+        plan = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertFalse(plan["ip_addresses"])
+        self.assertIn("exclusive", plan["unresolved"][-1]["reason"])
+        catalog["prefixes"] = []
+        catalog["ip_ranges"] = []
+        catalog["policy"]["create_missing_prefixes"] = False
+        disabled = planner.plan_ipam(discovery(fact(ipv6=[ipv6_address()])), before)
+        self.assertFalse(disabled["ip_addresses"])
+        self.assertIn("disabled", disabled["unresolved"][0]["reason"])
+
+    def test_exclusive_ranges_never_compare_integers_across_address_families(self):
+        for observed, start, end in (
+            (fact(ipv6=[ipv6_address("::a/120")]), "0.0.0.1", "0.0.0.20"),
+            (fact(addresses=[address("0.0.0.10")]), "::1", "::20"),
+        ):
+            with self.subTest(start=start):
+                before = inventory()
+                before["ipam_inventory"]["ip_ranges"] = [
+                    {
+                        "id": "foreign-family-range",
+                        "namespace_id": "internet",
+                        "start_address": start,
+                        "end_address": end,
+                        "parent_id": None,
+                        "is_exclusive": True,
+                    }
+                ]
+                plan = planner.plan_ipam(discovery(observed), before)
+                self.assertFalse(plan["errors"])
+                self.assertFalse(plan["unresolved"])
+                self.assertEqual(plan["summary"]["ip_addresses_created"], 1)
 
 
 if __name__ == "__main__":

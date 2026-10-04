@@ -1,9 +1,17 @@
 """Pure, namespace-scoped static addressing and routing-domain reconciliation."""
 
 from collections import defaultdict
-from ipaddress import IPv4Address, IPv4Network, collapse_addresses
+from ipaddress import (
+    IPv4Address,
+    IPv4Network,
+    IPv6Interface,
+    collapse_addresses,
+    ip_address,
+    ip_network,
+)
 
 from .adapters.cisco_iosxe import canonical_interface_name
+from .reconcile_route_targets import route_target_adoption_reason
 
 RFC1918 = tuple(IPv4Network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 COLLECTIONS = (
@@ -46,18 +54,26 @@ def _finish(plan):
 
 
 def _network(row):
-    return IPv4Network(row["prefix"], strict=True)
+    return ip_network(row["prefix"], strict=True)
 
 
 def _host(row):
-    return IPv4Address(str(row["host"]).split("/", 1)[0])
+    return ip_address(str(row["host"]).split("/", 1)[0])
 
 
 def _range(row):
     return (
-        int(IPv4Address(str(row["start_address"]).split("/", 1)[0])),
-        int(IPv4Address(str(row["end_address"]).split("/", 1)[0])),
+        int(ip_address(str(row["start_address"]).split("/", 1)[0])),
+        int(ip_address(str(row["end_address"]).split("/", 1)[0])),
     )
+
+
+def _range_version(row):
+    return ip_address(str(row["start_address"]).split("/", 1)[0]).version
+
+
+def _subnet_of(network, parent):
+    return network.version == parent.version and network.subnet_of(parent)
 
 
 def _overlap(start, end, network):
@@ -70,17 +86,89 @@ def _namespace(network, policy, overrides):
     override = policy.get("override_namespace")
     if override is None or _id(default["id"]) == _id(override["id"]):
         return default, "default", None
-    intersections = [value for value in overrides if value.overlaps(network)]
+    intersections = [
+        value for value in overrides if value.version == network.version and value.overlaps(network)
+    ]
     if not intersections:
         return default, "default", None
     if not any(network.subnet_of(value) for value in intersections):
         return None, None, "Connected prefix crosses incompatible namespace policy boundaries"
     matched = (
         "RFC1918"
-        if policy.get("override_rfc1918") and any(network.subnet_of(value) for value in RFC1918)
+        if policy.get("override_rfc1918") and any(_subnet_of(network, value) for value in RFC1918)
         else "additional override network"
     )
     return override, matched, None
+
+
+def _parse_ipv6(row, name, plan):
+    """Resolve literal configured hosts only; generated and scoped addresses stay observations."""
+    addresses, seen = [], set()
+    addressing = row.get("addressing", {})
+    for address in row.get("ipv6", []):
+        try:
+            if not isinstance(address, dict) or not _text(address.get("method")):
+                raise ValueError("Missing structured IPv6 addressing method")
+            reason = None
+            scope = addressing.get("ipv6_vrf_scope")
+            if scope in ("unresolved-legacy-vrf", "unresolved-inactive-vrf-family"):
+                reason = _text(addressing.get("ipv6_vrf_reason")) or (
+                    "Legacy single-protocol VRF forwarding does not establish "
+                    "a compatible native IPv6 routing context"
+                    if scope == "unresolved-legacy-vrf"
+                    else "Complete named VRF definition does not enable the IPv6 address family"
+                )
+            elif address["method"] != "configured":
+                reason = "Generated, named-prefix or link-local IPv6 is observation-only"
+            elif any(type(address.get(flag)) is not bool for flag in ("eui_64", "anycast")):
+                raise ValueError("Configured IPv6 address flags must be explicit booleans")
+            elif address["eui_64"] or address["anycast"]:
+                reason = (
+                    "Generated or anycast IPv6 requires additional identity or sharing evidence"
+                )
+            else:
+                value = address.get("configured_prefix")
+                if not isinstance(value, str) or "/" not in value or "%" in value:
+                    raise ValueError("Missing literal IPv6 host and prefix length")
+                configured = IPv6Interface(value)
+                host = configured.ip
+                if host.is_unspecified or host.is_multicast:
+                    raise ValueError("Configured IPv6 address must be an ordinary unicast host")
+                if host.is_link_local:
+                    reason = "Link-local IPv6 requires interface-scoped identity"
+                else:
+                    if host in seen:
+                        raise ValueError("Duplicate interface address")
+                    seen.add(host)
+                    addresses.append(
+                        {
+                            **address,
+                            "host": str(host),
+                            "prefix": str(configured.network),
+                            "prefix_length": configured.network.prefixlen,
+                            "secondary": False,
+                            "secondary_known": False,
+                        }
+                    )
+            if reason and not any(
+                observation.get("name") == name and observation.get("ipv6") == address
+                for observation in plan["unresolved"]
+            ):
+                plan["unresolved"].append(
+                    {
+                        "scope": "interface",
+                        "name": name,
+                        "reason": reason,
+                        "ipv6": dict(address),
+                        "source": row.get("source", {}),
+                        **(
+                            {"ipv6_routing": row["ipv6_routing"]} if row.get("ipv6_routing") else {}
+                        ),
+                    }
+                )
+        except (ValueError, TypeError) as exc:
+            plan["errors"].append("Interface %s has invalid static IPv6 evidence: %s" % (name, exc))
+    return addresses
 
 
 def _parse_source(source, plan):
@@ -125,6 +213,9 @@ def _parse_source(source, plan):
             or row.get("vrf") is not None
             and not _text(row["vrf"])
             or not isinstance(row.get("ipv4"), list)
+            or not isinstance(row.get("ipv6", []), list)
+            or not isinstance(row.get("addressing", {}), dict)
+            or not isinstance(row.get("ipv6_routing", {}), dict)
             or not isinstance(row.get("source", {}), dict)
         ):
             plan["errors"].append("IPAM interface observations require structured configuration")
@@ -162,7 +253,13 @@ def _parse_source(source, plan):
                 plan["errors"].append(
                     "Interface %s has invalid static IPv4 evidence: %s" % (name, exc)
                 )
-        facts[name] = {**row, "name": name, "vrf": local_vrf, "ipv4": addresses}
+        facts[name] = {
+            **row,
+            "name": name,
+            "vrf": local_vrf,
+            "ipv4": addresses,
+            "ipv6": _parse_ipv6(row, name, plan),
+        }
     return facts, vrfs
 
 
@@ -216,8 +313,10 @@ def plan_ipam(discovery, existing, interface_plan=None):
             else "IPAM inventory is unavailable"
         )
         for name, row in facts.items():
-            plan["settings"].append({"name": name, "vrf": row["vrf"], "ipv4": row["ipv4"]})
-            if row["ipv4"] or row["vrf"]:
+            plan["settings"].append(
+                {"name": name, "vrf": row["vrf"], "ipv4": row["ipv4"], "ipv6": row["ipv6"]}
+            )
+            if row["ipv4"] or row["ipv6"] or row["vrf"]:
                 unresolved("interface", name, reason)
         for name in observed_vrfs:
             unresolved("vrf", name, reason)
@@ -241,14 +340,18 @@ def plan_ipam(discovery, existing, interface_plan=None):
             raise ValueError("Override networks and local VRF names must be lists")
         if any(not _text(value) for value in policy.get("local_vrf_names", [])):
             raise ValueError("Device-local VRF exceptions require nonblank names")
-        networks = [
-            IPv4Network(value, strict=True) for value in policy.get("override_networks", [])
-        ]
+        networks = [ip_network(value, strict=True) for value in policy.get("override_networks", [])]
         if override is not None and policy.get("override_rfc1918"):
             networks.extend(RFC1918)
         if override is None and networks:
             raise ValueError("An override namespace is required when override matches are enabled")
-        overrides = list(collapse_addresses(networks))
+        # collapse_addresses rejects mixed families; organizational overrides
+        # form separate, explicit IPv4 and IPv6 policy unions.
+        overrides = [
+            value
+            for version in (4, 6)
+            for value in collapse_addresses(item for item in networks if item.version == version)
+        ]
         device = inventory["device"]
         if not device.get("id") or not _text(device.get("name")):
             raise ValueError("The existing Device requires an explicit identity")
@@ -266,11 +369,9 @@ def plan_ipam(discovery, existing, interface_plan=None):
         plan["errors"].append("Invalid IPAM policy or snapshot: %s" % exc)
         return _finish(plan)
 
-    # IPv6 remains observation-only. Its inventory can never be reparented by
-    # an IPv4 prefix, but it still matters to a named interface VRF's namespace.
-    prefixes = [row for row in inventory["prefixes"] if ":" not in str(row["prefix"])]
-    ip_addresses = [row for row in inventory["ip_addresses"] if ":" not in str(row["host"])]
-    ip_ranges = [row for row in inventory["ip_ranges"] if ":" not in str(row["start_address"])]
+    prefixes = inventory["prefixes"]
+    ip_addresses = inventory["ip_addresses"]
+    ip_ranges = inventory["ip_ranges"]
 
     interfaces = defaultdict(list)
     for row in existing.get("interfaces", []):
@@ -293,8 +394,8 @@ def plan_ipam(discovery, existing, interface_plan=None):
     classified, namespace_by_vrf, blocked_vrfs = {}, {}, set()
     for name, fact in sorted(facts.items()):
         classified[name] = []
-        for address in fact["ipv4"]:
-            namespace, match, reason = _namespace(IPv4Network(address["prefix"]), policy, overrides)
+        for address in fact["ipv4"] + fact["ipv6"]:
+            namespace, match, reason = _namespace(ip_network(address["prefix"]), policy, overrides)
             setting = {
                 "name": name,
                 "vrf": fact["vrf"],
@@ -371,6 +472,13 @@ def plan_ipam(discovery, existing, interface_plan=None):
                 continue
             vrf = matches[0] if matches else None
         canonical_name = vrf["name"] if vrf else canonical_name
+        if assignment is None and vrf:
+            adoption_reason = route_target_adoption_reason(
+                observation, vrf, inventory.get("route_targets")
+            )
+            if adoption_reason:
+                unresolved("vrf", local_name, adoption_reason)
+                continue
         if assignment is None and vrf and vrf.get("rd") and not observation.get("rd"):
             unresolved(
                 "vrf",
@@ -467,7 +575,7 @@ def plan_ipam(discovery, existing, interface_plan=None):
                 wrong_namespace |= _id(current_ip["namespace_id"]) not in allowed_ns
             else:
                 wrong_namespace |= any(
-                    str(current_ip["host"]).split("/", 1)[0] == address["host"]
+                    str(_host(current_ip)) == address["host"]
                     and _id(current_ip["namespace_id"]) != _id(address["namespace"]["id"])
                     for address in classified[name]
                 )
@@ -540,7 +648,7 @@ def plan_ipam(discovery, existing, interface_plan=None):
 
     prefix_catalog = {}
     for key, request in sorted(prefix_requests.items()):
-        network = IPv4Network(request["prefix"])
+        network = ip_network(request["prefix"])
         namespace_id = request["namespace_id"]
         if request["global_context"] and request["vrf_keys"]:
             unresolved(
@@ -565,6 +673,7 @@ def plan_ipam(discovery, existing, interface_plan=None):
         if row is None and any(
             _id(value["namespace_id"]) == namespace_id
             and value.get("is_exclusive", False)
+            and _range_version(value) == network.version
             and _overlap(*_range(value), network)
             for value in ip_ranges
         ):
@@ -622,7 +731,7 @@ def plan_ipam(discovery, existing, interface_plan=None):
             for value in prefixes
             if _id(value["namespace_id"]) == namespace_id
             and network != _network(value)
-            and network.subnet_of(_network(value))
+            and _subnet_of(network, _network(value))
         ]
         parent = max(parent_candidates, key=lambda value: _network(value).prefixlen, default=None)
         affected_ips, affected_prefixes, affected_ranges, reason = [], [], [], None
@@ -646,7 +755,11 @@ def plan_ipam(discovery, existing, interface_plan=None):
                 if row is None:
                     affected_ips.append(_id(ip["id"]))
             for ip_range in ip_ranges:
-                if reason or _id(ip_range["namespace_id"]) != namespace_id:
+                if (
+                    reason
+                    or _id(ip_range["namespace_id"]) != namespace_id
+                    or _range_version(ip_range) != network.version
+                ):
                     continue
                 start, end = _range(ip_range)
                 if not _overlap(start, end, network):
@@ -671,8 +784,8 @@ def plan_ipam(discovery, existing, interface_plan=None):
                     affected_ranges.append(_id(ip_range["id"]))
             if row is None:
                 for child in prefixes:
-                    if _id(child["namespace_id"]) != namespace_id or not _network(child).subnet_of(
-                        network
+                    if _id(child["namespace_id"]) != namespace_id or not _subnet_of(
+                        _network(child), network
                     ):
                         continue
                     old_parent = prefix_by_id.get(_id(child.get("parent_id")))
@@ -700,16 +813,16 @@ def plan_ipam(discovery, existing, interface_plan=None):
         }
     # Account for unsaved nested connected prefixes as well as database parents.
     for key, spec in prefix_catalog.items():
-        network = IPv4Network(spec["prefix"])
+        network = ip_network(spec["prefix"])
         candidates = [
             value
             for other, value in prefix_catalog.items()
             if other != key
             and value["namespace_id"] == spec["namespace_id"]
-            and network.subnet_of(IPv4Network(value["prefix"]))
+            and _subnet_of(network, ip_network(value["prefix"]))
         ]
         parent = max(
-            candidates, key=lambda value: IPv4Network(value["prefix"]).prefixlen, default=None
+            candidates, key=lambda value: ip_network(value["prefix"]).prefixlen, default=None
         )
         actual_parent = prefix_by_id.get(spec["parent_id"])
         spec["parent_key"] = (
@@ -717,13 +830,13 @@ def plan_ipam(discovery, existing, interface_plan=None):
             if parent
             and (
                 actual_parent is None
-                or IPv4Network(parent["prefix"]).prefixlen > _network(actual_parent).prefixlen
+                or ip_network(parent["prefix"]).prefixlen > _network(actual_parent).prefixlen
             )
             else None
         )
     plan["prefixes"] = sorted(
         prefix_catalog.values(),
-        key=lambda row: (row["namespace_id"], IPv4Network(row["prefix"]).prefixlen, row["prefix"]),
+        key=lambda row: (row["namespace_id"], ip_network(row["prefix"]).prefixlen, row["prefix"]),
     )
     ip_catalog = {}
     for request in address_requests:
@@ -792,6 +905,7 @@ def plan_ipam(discovery, existing, interface_plan=None):
             continue
         if (
             assignments
+            and request.get("secondary_known", True)
             and type(assignments[0].get("is_secondary")) is bool
             and (assignments[0]["is_secondary"] != request["secondary"])
         ):
@@ -808,7 +922,8 @@ def plan_ipam(discovery, existing, interface_plan=None):
             for row in ip_ranges
             if _id(row["namespace_id"]) == namespace_id
             and row.get("is_exclusive", False)
-            and _range(row)[0] <= int(IPv4Address(host)) <= _range(row)[1]
+            and _range_version(row) == ip_address(host).version
+            and _range(row)[0] <= int(ip_address(host)) <= _range(row)[1]
         ]
         if exclusive:
             unresolved(
@@ -819,16 +934,15 @@ def plan_ipam(discovery, existing, interface_plan=None):
         parents = [
             row
             for row in prefixes
-            if _id(row["namespace_id"]) == namespace_id and IPv4Address(host) in _network(row)
+            if _id(row["namespace_id"]) == namespace_id and ip_address(host) in _network(row)
         ]
         staged = [
             row
             for row in prefix_catalog.values()
-            if row["namespace_id"] == namespace_id
-            and IPv4Address(host) in IPv4Network(row["prefix"])
+            if row["namespace_id"] == namespace_id and ip_address(host) in ip_network(row["prefix"])
         ]
         closest = max(
-            [(IPv4Network(row["prefix"]).prefixlen, "key", row) for row in staged]
+            [(ip_network(row["prefix"]).prefixlen, "key", row) for row in staged]
             + [(_network(row).prefixlen, "id", row) for row in parents],
             key=lambda value: value[0],
         )
@@ -907,6 +1021,6 @@ def plan_ipam(discovery, existing, interface_plan=None):
     plan["ip_addresses"] = list(ip_catalog.values())
     plan["prefixes"] = sorted(
         prefix_catalog.values(),
-        key=lambda row: (row["namespace_id"], IPv4Network(row["prefix"]).prefixlen, row["prefix"]),
+        key=lambda row: (row["namespace_id"], ip_network(row["prefix"]).prefixlen, row["prefix"]),
     )
     return _finish(plan)

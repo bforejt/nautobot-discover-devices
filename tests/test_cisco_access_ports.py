@@ -282,16 +282,73 @@ class AccessPortCollectionTests(unittest.TestCase):
         self.assertEqual(management["interfaces"], [])
         self.assertTrue(management["unresolved"])
 
-    def test_present_null_and_unresolved_named_prefixes_do_not_claim_missing_configuration(self):
+    def test_present_null_does_not_claim_missing_configuration(self):
         for field, value in (
             ("vrf", None),
             ("ip", {"address": None}),
             ("ipv6", {"address": {"prefix-list": None}}),
-            ("ipv6", {"address": {"prefix-name": [{"name": "EXAMPLE"}]}}),
         ):
             with self.subTest(field=field, value=value):
                 row = native_row()
                 row[field] = value
+                _, management = collect(
+                    FakeClient(
+                        {access.MANAGEMENT_PATH: {"Cisco-IOS-XE-native:GigabitEthernet": [row]}}
+                    )
+                )
+                self.assertEqual(management["interfaces"], [])
+                self.assertTrue(management["unresolved"])
+
+    def test_named_ipv6_prefix_does_not_discard_known_literal_or_ipv4_configuration(self):
+        row = native_row()
+        row["ip"] = {"address": {"primary": {"address": "192.0.2.2", "mask": "255.255.255.0"}}}
+        row["ipv6"] = {
+            "address": {
+                "prefix-list": [{"prefix": "2001:0DB8::2/64"}],
+                "prefix-name": [{"name": "EXAMPLE", "ipv6-prefix": ["::2/64"]}],
+            }
+        }
+        _, management = collect(
+            FakeClient({access.MANAGEMENT_PATH: {"Cisco-IOS-XE-native:GigabitEthernet": [row]}})
+        )
+        facts = management["interfaces"][0]
+        self.assertEqual(facts["ipv4"][0]["address"], "192.0.2.2")
+        self.assertEqual(facts["ipv6"][0]["configured_prefix"], "2001:db8::2/64")
+        self.assertEqual(facts["ipv6"][1]["method"], "configured-named-prefix")
+        self.assertEqual(facts["ipv6"][1]["prefix_name"], "EXAMPLE")
+        self.assertNotIn("configured_prefix", facts["ipv6"][1])
+
+    def test_1718_linklocal_container_retains_scope_without_inventing_mask(self):
+        row = native_row()
+        row["ipv6"] = {
+            "address": {
+                "link-local-address-container": {"address": "fe80::2", "link-local": [None]}
+            }
+        }
+        _, management = collect(
+            FakeClient({access.MANAGEMENT_PATH: {"Cisco-IOS-XE-native:GigabitEthernet": [row]}})
+        )
+        self.assertEqual(
+            management["interfaces"][0]["ipv6"],
+            [{"address": "fe80::2", "method": "configured-link-local"}],
+        )
+
+    def test_malformed_ipv6_addresses_duplicates_and_linklocal_scope_cannot_drive_writes(self):
+        values = (
+            {"prefix-list": [{"prefix": "ff02::1/64"}]},
+            {"prefix-list": [{"prefix": "2001:db8::1%eth0/64"}]},
+            {"prefix-list": [{"prefix": "2001:db8::1/64"}] * 2},
+            {"link-local-address-container": {"address": "2001:db8::2", "link-local": [None]}},
+            {"link-local-address-container": {"address": "fe80::2"}},
+            {
+                "link-local-address": [{"address": "fe80::2", "link-local": [None]}],
+                "link-local-address-container": {"address": "fe80::2", "link-local": [None]},
+            },
+        )
+        for value in values:
+            with self.subTest(value=value):
+                row = native_row()
+                row["ipv6"] = {"address": value}
                 _, management = collect(
                     FakeClient(
                         {access.MANAGEMENT_PATH: {"Cisco-IOS-XE-native:GigabitEthernet": [row]}}

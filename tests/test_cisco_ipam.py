@@ -44,6 +44,10 @@ class FixtureClient:
             ipam.VRF_PATH: "vrfs",
             ipam.LEGACY_VRF_PATH: "legacy_vrfs",
         }[path.split("?", 1)[0]]
+        if path.endswith("?fields=" + ipam.ROUTE_TARGET_FIELDS):
+            key = "route_targets" if "route_targets" in self.payloads else key
+        elif path.endswith("?fields=" + ipam.LEGACY_ROUTE_TARGET_FIELDS):
+            key = "legacy_route_targets" if "legacy_route_targets" in self.payloads else key
         value = self.payloads[key]
         self.trace.append(
             {"path": path, "status": value.status_code if isinstance(value, RestconfError) else 200}
@@ -156,7 +160,7 @@ class IpamCollectionTests(unittest.TestCase):
         )
         self.assertTrue(all(row["reason"] for row in result["excluded"]))
 
-    def test_dynamic_and_ipv6_are_observations_with_no_fabricated_addresses(self):
+    def test_dynamic_observed_and_literal_ipv6_is_eligible_without_fabricated_addresses(self):
         result = collect()
         facts = {row["name"]: row for row in result["interfaces"]}
         self.assertEqual(facts["Vlan2"]["ipv4"], [])
@@ -173,7 +177,7 @@ class IpamCollectionTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual({row["name"] for row in result["unresolved"]}, {"Vlan2", "Vlan4"})
+        self.assertEqual({row["name"] for row in result["unresolved"]}, {"Vlan2"})
 
     def test_unnumbered_and_negotiated_cannot_become_static_addresses(self):
         for method in ("unnumbered", "negotiated"):
@@ -189,6 +193,322 @@ class IpamCollectionTests(unittest.TestCase):
                 self.assertEqual(fact["ipv4"], [])
                 self.assertEqual(fact["addressing"]["ipv4_method"], method)
 
+    def test_static_ipv6_and_named_generated_forms_keep_independent_ipv4_evidence(self):
+        values = fixture("iosxe_ipam_configured.json")
+        row = rows(values)["Vlan"][1]
+        row["ipv6"] = {
+            "address": {
+                "prefix-list": [
+                    {"prefix": "2001:0DB8:3::2/64"},
+                    {"prefix": "fd00:3::2/127"},
+                    {"prefix": "2001:db8:4::/64", "eui-64": [None]},
+                    {"prefix": "2001:db8:5::2/64", "anycast": [None]},
+                ],
+                "prefix-name": [{"name": "DELEGATED", "ipv6-prefix": ["::2/64"]}],
+                "link-local-address-container": {"address": "fe80::2", "link-local": [None]},
+                "dhcp": {},
+                "autoconfig": {},
+            }
+        }
+        result = collect(values)
+        fact = next(row for row in result["interfaces"] if row["name"] == "Vlan3")
+        self.assertEqual(fact["ipv4"][0]["address"], "192.0.2.2")
+        self.assertEqual(fact["ipv6"][0]["configured_prefix"], "2001:db8:3::2/64")
+        self.assertEqual(fact["ipv6"][1]["configured_prefix"], "fd00:3::2/127")
+        self.assertTrue(fact["ipv6"][2]["eui_64"])
+        self.assertTrue(fact["ipv6"][3]["anycast"])
+        self.assertEqual(fact["ipv6"][4]["method"], "configured-link-local")
+        self.assertEqual(fact["ipv6"][5]["method"], "configured-named-prefix")
+        self.assertEqual(fact["addressing"]["ipv6_methods"], {"dhcp": True, "autoconfig": True})
+        notices = [row for row in result["unresolved"] if row.get("name") == "Vlan3"]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["reason"], "DHCP/SLAAC IPv6 is observation-only")
+        self.assertTrue(result["sources"][-1]["complete"])
+
+    def test_complete_empty_route_target_policy_is_distinct_from_unavailable(self):
+        result = collect()
+        for row in result["vrfs"]:
+            facts = row["route_targets"]
+            self.assertEqual(facts["status"], "available")
+            self.assertEqual(facts["import"], [])
+            self.assertEqual(facts["export"], [])
+            self.assertTrue(facts["source"]["complete"])
+            self.assertEqual(facts["source"]["requested_fields"], ipam.ROUTE_TARGET_FIELDS)
+
+    def test_modern_literal_targets_canonicalize_asn_ip_and_both_explicit_directions(self):
+        values = fixture("iosxe_ipam_configured.json")
+        definition = values["vrfs"]["Cisco-IOS-XE-native:vrf"]["definition"][1]
+        definition["route-target"] = {
+            "import": [
+                {"asn-ip": "65000:20"},
+                {"asn-ip": "1.10:23"},
+                {"asn-ip": "192.0.2.1:77"},
+            ],
+            "export": [{"asn-ip": "65000:20"}, {"asn-ip": "65546:24"}],
+        }
+        result = collect(values)
+        targets = next(row for row in result["vrfs"] if row["name"] == "CORP")["route_targets"]
+        self.assertEqual(targets["status"], "available")
+        self.assertEqual(targets["import"], ["192.0.2.1:77", "65000:20", "65546:23"])
+        self.assertEqual(targets["export"], ["65000:20", "65546:24"])
+        self.assertEqual(
+            targets["address_family_policies"]["ipv4"], targets["address_family_policies"]["ipv6"]
+        )
+
+    def test_legacy_both_targets_preserve_import_and_export_direction(self):
+        values = fixture("iosxe_ipam_configured.json")
+        values["legacy_vrfs"] = {
+            "Cisco-IOS-XE-native:vrf": [
+                {
+                    "name": "LEGACY",
+                    "rd": "65000:99",
+                    "route-target": [
+                        {"direction": "both", "target": "65000:99"},
+                        {"direction": "import", "target": "192.0.2.1:22"},
+                        {"direction": "export", "target": "65000:100"},
+                    ],
+                }
+            ]
+        }
+        targets = next(row for row in collect(values)["vrfs"] if row["name"] == "LEGACY")[
+            "route_targets"
+        ]
+        self.assertEqual(targets["status"], "available")
+        self.assertEqual(targets["import"], ["192.0.2.1:22", "65000:99"])
+        self.assertEqual(targets["export"], ["65000:100", "65000:99"])
+        self.assertEqual(targets["source"]["requested_fields"], ipam.LEGACY_ROUTE_TARGET_FIELDS)
+
+    def test_identical_address_family_targets_use_reviewed_without_stitching_lists(self):
+        values = fixture("iosxe_ipam_configured.json")
+        definition = values["vrfs"]["Cisco-IOS-XE-native:vrf"]["definition"][1]
+        for family in ("ipv4", "ipv6"):
+            definition["address-family"][family]["route-target"] = {
+                "import-route-target": {"without-stitching": [{"asn-ip": "65000:20"}]},
+                "export-route-target": {"without-stitching": [{"asn-ip": "65000:21"}]},
+            }
+        targets = next(row for row in collect(values)["vrfs"] if row["name"] == "CORP")[
+            "route_targets"
+        ]
+        self.assertEqual(targets["status"], "available")
+        self.assertEqual(targets["import"], ["65000:20"])
+        self.assertEqual(targets["export"], ["65000:21"])
+
+    def test_family_differences_and_mixed_policy_cannot_be_flattened(self):
+        for mutation in ("different-target", "missing-family-target", "mixed-common-target"):
+            with self.subTest(mutation=mutation):
+                values = fixture("iosxe_ipam_configured.json")
+                definition = values["vrfs"]["Cisco-IOS-XE-native:vrf"]["definition"][1]
+                definition["address-family"]["ipv4"]["route-target"] = {
+                    "import-route-target": {"without-stitching": [{"asn-ip": "65000:20"}]}
+                }
+                if mutation == "different-target":
+                    definition["address-family"]["ipv6"]["route-target"] = {
+                        "import-route-target": {"without-stitching": [{"asn-ip": "65000:21"}]}
+                    }
+                elif mutation == "mixed-common-target":
+                    definition["route-target"] = {"import": [{"asn-ip": "65000:22"}]}
+                result = collect(values)
+                targets = next(row for row in result["vrfs"] if row["name"] == "CORP")[
+                    "route_targets"
+                ]
+                self.assertEqual(targets["status"], "unresolved")
+                self.assertEqual(targets["import"], [])
+                self.assertEqual(targets["export"], [])
+                self.assertTrue(result["interfaces"])
+
+    def test_parallel_obsolete_and_current_af_representations_require_same_canonical_targets(self):
+        for direction in ("import", "export"):
+            for match in (True, False):
+                with self.subTest(direction=direction, match=match):
+                    values = fixture("iosxe_ipam_configured.json")
+                    definition = values["vrfs"]["Cisco-IOS-XE-native:vrf"]["definition"][1]
+                    for family in ("ipv4", "ipv6"):
+                        definition["address-family"][family]["route-target"] = {
+                            direction: [{"asn-ip": "65000:20"}],
+                            direction + "-route-target": {
+                                "without-stitching": [
+                                    {"asn-ip": "065000:020" if match else "65000:21"}
+                                ]
+                            },
+                        }
+                    result = collect(values)
+                    targets = next(row for row in result["vrfs"] if row["name"] == "CORP")[
+                        "route_targets"
+                    ]
+                    if match:
+                        self.assertEqual(targets["status"], "available")
+                        self.assertEqual(targets[direction], ["65000:20"])
+                    else:
+                        self.assertEqual(targets["status"], "unresolved")
+                        self.assertIn("representations differ", targets["reason"])
+                        self.assertEqual(targets["import"], [])
+                        self.assertEqual(targets["export"], [])
+                        evidence = targets["configuration"]["address-family"]["ipv4"][
+                            "route-target"
+                        ]
+                        self.assertEqual(evidence[direction][0]["asn-ip"], "65000:20")
+                        self.assertEqual(
+                            evidence[direction + "-route-target"]["without-stitching"][0]["asn-ip"],
+                            "65000:21",
+                        )
+                    self.assertEqual(len(result["interfaces"]), len(ELIGIBLE_NAMES))
+
+    def test_stitching_auto_unknown_and_invalid_encoded_targets_are_unresolved(self):
+        for policy in (
+            {"import": [{"asn-ip": "65000:20", "stitching": [None]}]},
+            {"import": [{"asn-ip": "auto"}]},
+            {"import": [{"asn-ip": "65000:4294967296"}]},
+            {"import": [{"asn-ip": "65536:65536"}]},
+            {"import": [{"asn-ip": "192.0.2.1:65536"}]},
+            {"import": [{"asn-ip": "0.65000:20"}]},
+            {"import": [{"asn-ip": "65000:20"}, {"asn-ip": "065000:020"}]},
+            {"both": [{"asn-ip": "65000:20"}]},
+        ):
+            with self.subTest(policy=policy):
+                values = fixture("iosxe_ipam_configured.json")
+                values["vrfs"]["Cisco-IOS-XE-native:vrf"]["definition"][1]["route-target"] = policy
+                result = collect(values)
+                targets = next(row for row in result["vrfs"] if row["name"] == "CORP")[
+                    "route_targets"
+                ]
+                self.assertEqual(targets["status"], "unresolved")
+                self.assertEqual(targets["import"], [])
+                self.assertEqual(targets["export"], [])
+                self.assertEqual(len(result["interfaces"]), len(ELIGIBLE_NAMES))
+
+    def test_af_stitching_and_vnid_do_not_create_plain_targets(self):
+        for mutation in ("stitching", "vnid"):
+            with self.subTest(mutation=mutation):
+                values = fixture("iosxe_ipam_configured.json")
+                definition = values["vrfs"]["Cisco-IOS-XE-native:vrf"]["definition"][1]
+                if mutation == "stitching":
+                    definition["address-family"]["ipv4"]["route-target"] = {
+                        "import-route-target": {
+                            "with-stitching": [{"asn-ip": "65000:20", "stitching": [None]}]
+                        }
+                    }
+                else:
+                    definition["vnid"] = [{"vnid-value": 12345}]
+                result = collect(values)
+                self.assertEqual(
+                    next(row for row in result["vrfs"] if row["name"] == "CORP")["route_targets"][
+                        "status"
+                    ],
+                    "unresolved",
+                )
+                self.assertTrue(result["interfaces"])
+
+    def test_incomplete_route_target_identity_or_family_projection_keeps_ipam_facts(self):
+        for mutation in ("missing-vrf", "duplicate-vrf", "missing-family", "empty"):
+            with self.subTest(mutation=mutation):
+                values = fixture("iosxe_ipam_configured.json")
+                values["route_targets"] = deepcopy(values["vrfs"])
+                definitions = values["route_targets"]["Cisco-IOS-XE-native:vrf"]["definition"]
+                if mutation == "missing-vrf":
+                    definitions.pop()
+                elif mutation == "duplicate-vrf":
+                    definitions.append(deepcopy(definitions[0]))
+                elif mutation == "missing-family":
+                    definitions[1]["address-family"].pop("ipv6")
+                else:
+                    values["route_targets"] = {"Cisco-IOS-XE-native:vrf": {}}
+                result = collect(values)
+                self.assertEqual(len(result["vrfs"]), 3)
+                self.assertEqual(len(result["interfaces"]), len(ELIGIBLE_NAMES))
+                targets = next(row for row in result["vrfs"] if row["name"] == "CORP")[
+                    "route_targets"
+                ]
+                self.assertEqual(targets["status"], "unresolved")
+
+    def test_optional_route_target_filter_failure_does_not_retry_or_erase_known_ips_vrfs(self):
+        for status in (400, 404, 503):
+            with self.subTest(status=status):
+                values = fixture("iosxe_ipam_configured.json")
+                values["route_targets"] = RestconfError("secret omitted", status_code=status)
+                client = FixtureClient(values)
+                result = ipam.collect(
+                    client,
+                    [{"name": name} for name in ELIGIBLE_NAMES],
+                    canonical_name=cisco.canonical_interface_name,
+                    excluded_interfaces=EXCLUDED,
+                )
+                self.assertEqual(len(result["vrfs"]), 3)
+                self.assertEqual(len(result["interfaces"]), len(ELIGIBLE_NAMES))
+                self.assertTrue(
+                    all(row["route_targets"]["status"] == "unavailable" for row in result["vrfs"])
+                )
+                self.assertEqual(len(client.requests), 5)
+                self.assertTrue(all("?fields=" in path for path, _kwargs in client.requests))
+                self.assertNotIn("secret", str(result))
+
+    def test_malformed_optional_target_values_defer_without_recursive_evidence_parse_failure(self):
+        for mutation in ("null-target", "null-family", "null-families", "invalid-container"):
+            with self.subTest(mutation=mutation):
+                values = fixture("iosxe_ipam_configured.json")
+                values["route_targets"] = deepcopy(values["vrfs"])
+                definition = values["route_targets"]["Cisco-IOS-XE-native:vrf"]["definition"][1]
+                if mutation == "null-target":
+                    definition["route-target"] = None
+                elif mutation == "null-family":
+                    definition["address-family"]["ipv4"] = None
+                elif mutation == "null-families":
+                    definition["address-family"] = None
+                else:
+                    definition["address-family"]["ipv4"] = "invalid"
+                result = collect(values)
+                self.assertEqual(len(result["vrfs"]), 3)
+                self.assertEqual(len(result["interfaces"]), len(ELIGIBLE_NAMES))
+                targets = next(row for row in result["vrfs"] if row["name"] == "CORP")[
+                    "route_targets"
+                ]
+                self.assertEqual(targets["status"], "unresolved")
+                self.assertEqual(targets["import"], [])
+                self.assertEqual(targets["export"], [])
+
+    def test_exact_reviewed_1791_native_schema_omits_known_absent_optional_vrf_fields(self):
+        class Reviewed1791Client(FixtureClient):
+            def get(self, path, **kwargs):
+                if "rd-auto" in path or "vnid" in path:
+                    raise RestconfError("Requested field is not in this schema", status_code=400)
+                return super().get(path, **kwargs)
+
+        values = fixture("iosxe_ipam_configured.json")
+        values["vrfs"]["Cisco-IOS-XE-native:vrf"]["definition"][1]["route-target"] = {
+            "import": [{"asn-ip": "65000:20"}]
+        }
+        client = Reviewed1791Client(values)
+        result = ipam.collect(
+            client,
+            [{"name": name} for name in ELIGIBLE_NAMES],
+            canonical_name=cisco.canonical_interface_name,
+            excluded_interfaces=EXCLUDED,
+            revisions={ipam.MODULE: "2022-07-01"},
+        )
+        self.assertEqual(len(result["vrfs"]), 3)
+        self.assertEqual(len(result["interfaces"]), len(ELIGIBLE_NAMES))
+        targets = next(row for row in result["vrfs"] if row["name"] == "CORP")["route_targets"]
+        self.assertEqual(targets["status"], "available")
+        self.assertEqual(targets["import"], ["65000:20"])
+        self.assertEqual(targets["source"]["schema_profile"], "iosxe-1791-native-vrf-2022-07-01")
+        self.assertIn("definition/vnid", targets["source"]["known_absent_fields"])
+        self.assertEqual(len(client.requests), 5)
+        self.assertFalse(any("rd-auto" in path or "vnid" in path for path, _kw in client.requests))
+
+    def test_unknown_schema_revisions_do_not_inherit_known_absent_vrf_field_profile(self):
+        for revision in (None, "2022-11-01", "2025-07-01"):
+            with self.subTest(revision=revision):
+                client = FixtureClient()
+                result = ipam.collect(
+                    client,
+                    [{"name": name} for name in ELIGIBLE_NAMES],
+                    canonical_name=cisco.canonical_interface_name,
+                    excluded_interfaces=EXCLUDED,
+                    revisions={ipam.MODULE: revision} if revision else None,
+                )
+                self.assertTrue(any("rd-auto" in path for path, _kw in client.requests))
+                self.assertTrue(any("vnid" in path for path, _kw in client.requests))
+                self.assertTrue(all("schema_profile" not in row for row in result["sources"]))
+
     def test_legacy_vrf_definition_and_structured_forwarding_word_are_supported(self):
         values = fixture("iosxe_ipam_configured.json")
         values["legacy_vrfs"] = {"Cisco-IOS-XE-native:vrf": [{"name": "LEGACY", "rd": "65000:99"}]}
@@ -200,6 +520,68 @@ class IpamCollectionTests(unittest.TestCase):
         self.assertEqual(
             next(row for row in result["vrfs"] if row["name"] == "LEGACY")["rd"], "65000:99"
         )
+
+    def test_legacy_ipv4_forwarding_or_definition_cannot_establish_native_ipv6_vrf(self):
+        for binding in ("legacy-forwarding", "legacy-ip-vrf", "legacy-definition"):
+            with self.subTest(binding=binding):
+                values = fixture("iosxe_ipam_configured.json")
+                row = rows(values)["Vlan"][1]
+                row["ipv6"] = {"address": {"prefix-list": [{"prefix": "2001:db8:3::2/64"}]}}
+                if binding == "legacy-forwarding":
+                    row["ip"]["vrf"] = {"forwarding": {"word": "CORP"}}
+                elif binding == "legacy-ip-vrf":
+                    row["ip-vrf"] = {"ip": {"vrf": {"forwarding": "CORP"}}}
+                else:
+                    values["legacy_vrfs"] = {
+                        "Cisco-IOS-XE-native:vrf": [{"name": "LEGACY", "rd": "65000:99"}]
+                    }
+                    row["vrf"] = {"forwarding": "LEGACY"}
+                result = collect(values)
+                fact = next(row for row in result["interfaces"] if row["name"] == "Vlan3")
+                self.assertEqual(fact["ipv4"][0]["address"], "192.0.2.2")
+                self.assertEqual(fact["ipv6"][0]["configured_prefix"], "2001:db8:3::2/64")
+                self.assertEqual(fact["addressing"]["ipv6_vrf_scope"], "unresolved-legacy-vrf")
+                self.assertEqual(fact["ipv6_routing"]["status"], "unresolved")
+                self.assertTrue(fact["ipv6_routing"]["source"]["complete"])
+                self.assertTrue(fact["ipv6_routing"]["vrf_source"]["complete"])
+                self.assertEqual(
+                    fact["vrf"], "LEGACY" if binding == "legacy-definition" else "CORP"
+                )
+
+    def test_modern_vrf_binding_and_default_table_do_not_inherit_legacy_ipv6_deferral(self):
+        result = collect()
+        for name in ("Vlan4", "Vlan3"):
+            fact = next(row for row in result["interfaces"] if row["name"] == name)
+            self.assertNotIn("ipv6_vrf_scope", fact["addressing"])
+            self.assertNotIn("ipv6_routing", fact)
+
+    def test_complete_modern_vrf_without_ipv6_family_preserves_core_ipv4_and_ipv6_observation(self):
+        values = fixture("iosxe_ipam_configured.json")
+        definition = values["vrfs"]["Cisco-IOS-XE-native:vrf"]["definition"][1]
+        definition["address-family"].pop("ipv6")
+        rows(values)["Vlan"][2]["ip"] = {
+            "address": {"primary": {"address": "10.40.0.2", "mask": "255.255.255.0"}}
+        }
+        result = collect(values)
+        self.assertEqual(len(result["interfaces"]), len(ELIGIBLE_NAMES))
+        fact = next(row for row in result["interfaces"] if row["name"] == "Vlan4")
+        self.assertEqual(fact["ipv4"][0]["address"], "10.40.0.2")
+        self.assertEqual(fact["ipv6"][0]["configured_prefix"], "2001:db8:4::2/64")
+        self.assertEqual(fact["vrf"], "CORP")
+        self.assertEqual(fact["addressing"]["ipv6_vrf_scope"], "unresolved-inactive-vrf-family")
+        self.assertEqual(fact["ipv6_routing"]["binding"], "inactive-modern-vrf-family")
+        self.assertTrue(fact["ipv6_routing"]["source"]["complete"])
+        self.assertTrue(fact["ipv6_routing"]["vrf_source"]["complete"])
+        self.assertEqual(result["sources"][-1]["status"], "available")
+
+    def test_absent_modern_ipv6_family_does_not_claim_unresolved_ipv6_when_not_configured(self):
+        values = fixture("iosxe_ipam_configured.json")
+        values["vrfs"]["Cisco-IOS-XE-native:vrf"]["definition"][1]["address-family"].pop("ipv6")
+        result = collect(values)
+        fact = next(row for row in result["interfaces"] if row["name"] == "GigabitEthernet2/0/1")
+        self.assertTrue(fact["ipv4"])
+        self.assertEqual(fact["ipv6"], [])
+        self.assertNotIn("ipv6_vrf_scope", fact["addressing"])
 
     def test_unknown_names_duplicates_and_vrf_joins_invalidate_the_whole_interface_source(self):
         for mutation in (
@@ -326,7 +708,7 @@ class IpamCollectionTests(unittest.TestCase):
                 )
                 self.assertEqual(result["interfaces"], [])
                 self.assertEqual(result["sources"][-1]["status"], expected)
-                self.assertEqual(len(client.requests), 3)
+                self.assertEqual(len(client.requests), 5)
                 self.assertTrue(all("?fields=" in path for path, _kwargs in client.requests))
                 self.assertTrue(
                     all(
@@ -403,8 +785,8 @@ class IpamCollectionTests(unittest.TestCase):
                         source for source in result["sources"] if source["path"] == empty_path
                     )
                     self.assertEqual(source["http_status"], 204)
-                    self.assertEqual(len(client.trace), 3)
-                    self.assertEqual(get.call_count, 3)
+                    self.assertEqual(len(client.trace), 5)
+                    self.assertEqual(get.call_count, 5)
                     self.assertTrue(all("?fields=" in call.args[0] for call in get.call_args_list))
                     if empty_path == ipam.INTERFACES_PATH:
                         self.assertFalse(source["complete"])

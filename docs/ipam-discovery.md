@@ -1,4 +1,4 @@
-# Static IPv4 and VRF discovery
+# Static IPv4/IPv6 and VRF discovery
 
 IPAM discovery uses configured RESTCONF JSON addressing and routing contexts.
 Selecting **Default IPAM namespace** enables inventory reconciliation. Leaving
@@ -13,8 +13,8 @@ No custom fields or automatically created Namespaces are used.
 | --- | --- | --- |
 | Default IPAM namespace | Blank | Existing Namespace for addresses that do not match the override; blank keeps IPAM report-only |
 | Override IPAM namespace | Blank | Optional existing Namespace for the RFC1918/manual override matches |
-| Use override for RFC1918 | Checked | With an override selected, matches exactly `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` |
-| Additional override networks | Blank | IPv4 network CIDRs, one per line, combined with the selected RFC1918 ranges |
+| Use override for RFC1918 | Checked | IPv4 only: with an override selected, matches exactly `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` |
+| Additional override networks | Blank | IPv4 or IPv6 network CIDRs, one per line, combined with the selected RFC1918 ranges |
 | Create missing networks | Checked | Create exact connected Network Prefixes; unchecked defers addresses whose connected Prefix is missing |
 | Group matching user VRF names across devices | Unchecked | Explicitly treat matching names within a Namespace as one shared domain |
 | Keep these VRF names device-local | `Mgmt-vrf` | Exact, case-sensitive exceptions to grouping, one per line |
@@ -24,7 +24,8 @@ No custom fields or automatically created Namespaces are used.
 
 For a common deployment, select **Internet** as the default, **Corporate** as
 the override and leave RFC1918 checked. Add any internally used public ranges
-or shared address space such as `100.64.0.0/10` to the manual list. Unchecking
+or shared address space such as `100.64.0.0/10` to the manual list. Add `fd00::/8`
+explicitly to send ULA to the override; IPv6 has no RFC1918 match. Unchecking
 RFC1918 makes only the manual ranges match. Selecting a default alone places
 all eligible addressing there. Both selectors may also point to the same
 Namespace.
@@ -36,8 +37,9 @@ in the manual override. Only the three RFC1918 blocks are matched by the checkbo
 a library's broader `is_private` classification is not used.
 
 Manual entries must include a mask and the actual network boundary:
-`198.51.100.0/24` is accepted, while `198.51.100.1/24`, a bare host, and IPv6
-CIDRs are rejected before device requests. Manual entries require an override
+`198.51.100.0/24` and `fd00::/8` are accepted, while host-bit CIDRs such as
+`198.51.100.1/24` or `fd00::1/64` and bare hosts are rejected before device requests.
+Manual entries require an override
 Namespace. Duplicate and overlapping entries describe the same union rather
 than introducing rule priority.
 
@@ -79,10 +81,10 @@ RDs and route targets are not used as automatic shared-domain identifiers.
 A new shared assignment cannot silently inherit a canonical RD that the device
 did not report; such an ambiguous inherited value is deferred.
 
-All classified configured IPv4 Prefixes within a named VRF must select one
+All classified configured IPv4 and IPv6 Prefixes within a named VRF must select one
 Namespace, because a Nautobot VRF belongs to one Namespace. A named VRF crossing
 the two selected Namespace policies is deferred with its affected interfaces.
-A new named VRF with no eligible static IPv4 addressing uses the selected
+A new named VRF with no eligible static addressing uses the selected
 default Namespace, including a management VRF with an unaddressed management
 port; its name does not establish an RFC1918 match. Without new address evidence,
 an existing Device Assignment retains its established Namespace.
@@ -96,8 +98,9 @@ create separate IP identities within one Namespace.
 
 ## Supported configuration and sources
 
-The initial writable increment covers configured static IPv4 primary and
-secondary addresses, including shutdown interfaces. The safe native filter
+Writable addressing includes configured static IPv4 primary/secondary addresses
+and literal configured IPv6 addresses with explicit prefix lengths, including
+shutdown interfaces. The safe native filter
 covers FastEthernet, GigabitEthernet, TwoGigabitEthernet, FiveGigabitEthernet,
 TenGigabitEthernet, TwentyFiveGigE, FortyGigabitEthernet, HundredGigE,
 TwoHundredGigE, FourHundredGigE, Loopback, Port-channel, Port-channel
@@ -110,6 +113,7 @@ physical stack-member interface names.
 | Interface addressing and membership | `/data/Cisco-IOS-XE-native:native/interface`, filtered by interface family to keys, VRF forwarding, `ip/address`, `ip/unnumbered` and `ipv6/address` |
 | Modern named VRFs | `/data/Cisco-IOS-XE-native:native/vrf`, filtered to definition name, RD/automatic-RD flag and address families |
 | Legacy named VRFs | `/data/Cisco-IOS-XE-native:native/ip/vrf`, filtered to name and RD |
+| Modern/legacy route-target policy | Separate scoped GETs on the VRF endpoints, limited to names, direct targets, IPv4/IPv6 target policies and automatic-target evidence |
 
 Both modern `vrf/forwarding` and documented legacy native forwarding forms are
 read. Ambiguous multiple forms and unresolved symbolic forwarding forms cannot
@@ -118,6 +122,20 @@ host and contiguous dotted mask; secondary rows require their YANG empty flag.
 An absent mask, sentinel host, duplicate address or inconsistent structure
 cannot drive a write.
 
+IPv6 uses explicit `ipv6/address/prefix-list` values and the reported prefix
+length. EUI-64, anycast, DHCP, SLAAC, named-prefix derivation and link-local
+addresses stay observations; no host, mask or interface scope is invented.
+The parser accepts the legacy link-local list and the 17.18 replacement
+`link-local-address-container`. Ordinary IPv6 static facts do not inherit IPv4
+network/broadcast address restrictions; `/127` and `/128` remain eligible.
+Legacy single-protocol `ip vrf forwarding` places IPv4 in a VRF while IPv6 stays
+in the global routing table. Nautobot has one VRF field per Interface, so this
+split cannot be represented faithfully. IPv4 remains eligible; IPv6 on a legacy
+forwarding or legacy-only VRF definition stays unresolved with source evidence.
+A complete modern VRF definition that omits the IPv6 address family also
+defers IPv6 while preserving known IPv4 and routing identity.
+See [Cisco's single-protocol and multiprotocol VRF documentation](https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/mp_l3_vpns/configuration/xe-16/mp-l3-vpns-xe-16-book/mpls-vpn-vrf-cli-for-ipv4-and-ipv6-vpns.html).
+
 The module is `Cisco-IOS-XE-native`; its included interfaces/IP submodules
 supply the schema. Source records include the exact safe request, relevant
 module revision when available, completeness, HTTP status and model references.
@@ -125,6 +143,11 @@ The published models are
 [Cisco IOS XE 17.9.1 interfaces](https://raw.githubusercontent.com/YangModels/yang/main/vendor/cisco/xe/1791/Cisco-IOS-XE-interfaces.yang),
 [Cisco IOS XE 17.18.1 interfaces](https://raw.githubusercontent.com/YangModels/yang/main/vendor/cisco/xe/17181/Cisco-IOS-XE-interfaces.yang)
 and [Cisco IOS XE 17.18.1 IP](https://raw.githubusercontent.com/YangModels/yang/main/vendor/cisco/xe/17181/Cisco-IOS-XE-ip.yang).
+
+The reviewed native revision `2022-07-01` uses the published 17.9.1 field
+profile, omitting unsupported `rd-auto` and `vnid` leaves and recording that
+schema evidence. Other revisions request the complete scoped projection and
+retain unavailable-source results rather than infer defaults.
 
 Reads are optional, use a 15-second timeout and never retry without field
 filters. An HTTP 400 is an unavailable source, not permission to obtain full
@@ -141,11 +164,38 @@ interface list. Missing eligible interfaces are not fabricated from names or
 incomplete configuration.
 
 DHCP, negotiated and unnumbered IPv4 remain observation-only: no current host,
-lease, borrowed mask or guessed connected Prefix is created. Configured IPv6
-and dynamic IPv6 method flags are retained for a later increment. Operational
+lease, borrowed mask or guessed connected Prefix is created. Unsupported IPv6
+forms and dynamic IPv6 method flags are retained as observations. Operational
 addresses do not replace static configuration. Device primary IP selection,
-FHRP/shared addressing, route-table import and route-target reconciliation are
+FHRP/shared addressing and route-table import are
 outside this increment.
+
+## User VRF route targets
+
+The existing local/shared VRF identity policy applies to ordinary user VRFs.
+Literal import/export targets are stored in native RouteTarget records and the
+resolved VRF's import/export relationships. Route targets never identify or merge
+a VRF. `Mgmt-vrf` remains device-local by default and its targets are report-only;
+other device-local names remain eligible for supported user routing policy.
+
+Route-target projections are independent of the identity/addressing reads. A
+failed or unsupported projection defers only targets and does not erase a known
+VRF or prevent static addressing. Proven absence produces empty target sets.
+Direct and address-family policies must have one accurate native import/export
+representation. Distinct IPv4/IPv6 policies, automatic targets, stitching and
+unsupported wire forms remain unresolved rather than being flattened. Numeric
+ASN, nonzero-high ASDOT and IPv4 administrator literals follow the encoded widths
+in [RFC 4360](https://www.rfc-editor.org/rfc/rfc4360.html) and
+[RFC 5668](https://datatracker.ietf.org/doc/html/rfc5668).
+
+Each native direction is filled only when its existing set is empty. Matching
+sets issue no writes; populated differences are conflicts and remain unchanged.
+No targets or bindings are removed. A shared VRF already assigned to other
+Devices is not enriched from one Device's observations alone. Catalog rows are
+created only for accepted bindings and reuse unique exact identities. Before a
+new Device adopts an existing VRF with populated targets, discovery must confirm
+that its complete observed policy matches those sets; otherwise the entire new
+VRF adoption and associated addressing are deferred.
 
 ## Native records and preservation
 
@@ -154,6 +204,11 @@ selected Namespace, an IP Address with actual host **10.40.12.1** and mask
 length **24**, and its interface assignment. New Prefixes are type **Network**
 and attach to the selected Prefix Location. No aggregate, parent container,
 role, VLAN relation or public/private designation is guessed.
+
+Likewise, `2001:db8:12::1/64` proposes network **2001:db8:12::/64**, host
+**2001:db8:12::1** with mask length **64**, and its interface assignment. IPv6
+has no configured primary/secondary distinction; new relationships use the
+native ordinary assignment default without selecting a Device primary IPv6.
 
 Missing connected networks can be created only when **Create missing networks**
 is enabled and the selected Location permits Prefix records. Existing Prefix
@@ -193,7 +248,8 @@ The full report is under **Advanced → Worker → Meta → discovery_report** a
 in the attached JSON download. `discovery.ipam` holds configured facts, sources,
 known exclusions and unresolved observations; `plan.ipam` holds namespace rule
 matches, VRFs, Device Assignments, interface memberships, connected Prefixes,
-IP Addresses, assignments, hierarchy effects and conflicts. The main job log
+IP Addresses, assignments, RouteTargets, import/export bindings, hierarchy effects
+and conflicts. The main job log
 summarizes proposed or saved counts and unresolved observations.
 
 Inspect the namespace and matched rule for each configured address, the new
@@ -221,6 +277,11 @@ and adds no inventory changes when the discovered configuration is unchanged.
 - `tests/nautobot_ipam_integration.py`: native Nautobot ORM preview, relationship
   creation, scoped snapshots, shared/local VRFs, inherited routing checks,
   repeat behavior and transaction rollback.
+- `tests/nautobot_ipv6_integration.py`: real dual-stack hierarchy, IPv6 namespaces,
+  assignment preservation, zero-write preview/repeat and late-failure rollback.
+- `tests/test_route_targets_reconcile.py` and
+  `tests/nautobot_route_targets_integration.py`: direction/identity preservation,
+  management exclusions, scoped native catalogs and transactional bindings.
 
 Nautobot's model documentation describes
 [Namespaces](https://github.com/nautobot/nautobot/blob/v3.2.5/nautobot/docs/user-guide/core-data-model/ipam/namespace.md),
@@ -267,3 +328,20 @@ artifacts. Published fixtures replace configured hosts with RFC5737 example
 addresses. An earlier queue-startup attempt was revoked, and a diagnostic
 enqueue with malformed Device serialization failed before discovery; the final
 registered worker preview, apply and repeat succeeded.
+
+## IPv6 and RouteTarget validation, 2026-10-04
+
+The increment passed 580 offline tests, Ruff lint/format and compilation.
+The full Nautobot 3.2.5 integration harness passed 135 checks with all temporary
+changes rolled back. Coverage includes native IPv6 `/127` and `/128` records,
+dual-stack namespaces, ULA overrides, equivalent dotted-tail IPv6 identities,
+legacy/inactive-family deferrals, assignment preservation, route-target
+relationships, shared-VRF policy adoption, and late-failure atomic rollback.
+
+A strict live RESTCONF preview on IOS XE 17.18.4 accepted the scoped modern
+route-target filter; the absent legacy subtree returned HTTP 204. The preview
+issued zero inventory DML and proposed zero inventory changes. The lab has no
+configured static IPv6 or non-management route-target policies; those creation
+paths use synthetic structured fixtures and actual Nautobot models. DHCP on
+Vlan2 remains a deliberate unresolved observation. Ignored local reports are
+in `artifacts/ipv6-vrf/`.

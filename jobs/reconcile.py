@@ -6,6 +6,7 @@ from .adapters.cisco_iosxe import canonical_interface_name, canonical_software_v
 from .reconcile_components import plan_components
 from .reconcile_console import plan_console_ports, reviewed_profile
 from .reconcile_ipam import plan_ipam
+from .reconcile_route_targets import plan_route_targets
 from .reconcile_stack import plan_stack
 from .reconcile_vlans import plan_vlans
 
@@ -314,6 +315,13 @@ def build_plan(discovery, existing):
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["console_ports"][key])
     plan["ipam"] = plan_ipam(discovery, existing, interface_plan=plan)
+    route_targets = plan_route_targets(discovery, existing, plan["ipam"])
+    for key in ("route_targets", "vrf_route_targets"):
+        plan["ipam"][key] = route_targets[key]
+    for key in ("unresolved", "conflicts", "errors", "warnings"):
+        plan["ipam"][key].extend(route_targets[key])
+    plan["ipam"]["summary"].update(route_targets["summary"])
+    plan["ipam"]["summary"]["unresolved_ipam"] = len(plan["ipam"]["unresolved"])
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["ipam"][key])
     changed_interfaces = {row["id"] for row in plan["interface_updates"]}

@@ -55,8 +55,9 @@ Link state never substitutes for configured address evidence.
 `iosxe_ipam_configured.json` is a synthetic expansion covering primary and
 secondary IPv4, /31 and /32 masks, stack-member interface names, modern and
 legacy VRF forwarding, unused named VRFs, Port-channel subinterfaces, and IPv6
-observations. IPv6, DHCP, negotiated and unnumbered configuration remain
-observation-only in the static IPv4 implementation. The collectors validate
+configuration. Literal static IPv6 is writable in the IPv6 increment; generated,
+link-local and dynamic IPv6, DHCP, negotiated and unnumbered configuration remain
+observations. The collectors validate
 known excluded interfaces before retaining them outside the writable list.
 The native schema references are the Cisco-published IOS XE 17.9.1 and 17.18.1
 `Cisco-IOS-XE-interfaces.yang` and `Cisco-IOS-XE-ip.yang` model sets in YangModels.

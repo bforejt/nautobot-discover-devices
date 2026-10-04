@@ -967,5 +967,169 @@ class PsuStructureReconciliationTests(unittest.TestCase):
         self.assertIn("template rendering", templated["unresolved"][0]["reason"])
 
 
+class StackNetworkComponentOwnershipTests(unittest.TestCase):
+    def fixtures(self):
+        before = psu_inventory()
+        before["interfaces"] = [
+            {
+                "id": "interface-" + str(position),
+                "device_id": "device-1",
+                "name": "Gi%d/1/1" % position,
+                "type": "1000base-x-sfp",
+                "module_id": None,
+            }
+            for position in (1, 2)
+        ]
+        stack = {
+            "errors": [],
+            "members": [
+                {
+                    "position": 1,
+                    "serial": "LABCHASSIS001",
+                    "model": "C9300-48UXM",
+                    "existing_id": "device-1",
+                    "create": False,
+                },
+                {
+                    "position": 2,
+                    "serial": "LABCHASSIS002",
+                    "model": "C9300-48UXM",
+                    "existing_id": None,
+                    "create": True,
+                },
+            ],
+        }
+        components = []
+        for position in (1, 2):
+            parent = item(
+                key="uplink:%d/1" % position,
+                kind="network-module",
+                serial="LABUPLINK00" + str(position),
+                device_serial="LABCHASSIS00" + str(position),
+                member=position,
+                chassis_model="C9300-48UXM",
+                interfaces=["Gi%d/1/1" % position],
+                source={
+                    "ownership": {
+                        "device_serial": "LABCHASSIS00" + str(position),
+                        "member": position,
+                        "chassis_model": "C9300-48UXM",
+                    }
+                },
+            )
+            child = item(
+                key="transceiver:%d/1/1" % position,
+                kind="transceiver",
+                model="GLC-SX-MMD",
+                part_number="GLC-SX-MMD",
+                serial="LABOPTIC00" + str(position),
+                device_serial=parent["device_serial"],
+                member=position,
+                chassis_model=parent["chassis_model"],
+                parent_key=parent["key"],
+                bay={
+                    "name": "SFP Gi%d/1/1" % position,
+                    "position": "1",
+                    "label": "Gi%d/1/1" % position,
+                },
+                interfaces=[],
+                source={
+                    "ownership": {
+                        "parent_key": parent["key"],
+                        "parent_model": parent["model"],
+                        "parent_serial": parent["serial"],
+                        "interface": "Gi%d/1/1" % position,
+                        "device_serial": parent["device_serial"],
+                        "member": position,
+                        "chassis_model": parent["chassis_model"],
+                    }
+                },
+            )
+            components.extend((child, parent))
+        return discovery(*components), before, stack
+
+    def test_per_member_assets_and_nested_optics_preserve_selected_interface_owners(self):
+        observed, before, stack = self.fixtures()
+        untouched = deepcopy(before)
+        plan = planner.plan_components(observed, before, stack_plan=stack)
+        self.assertFalse(plan["errors"])
+        self.assertFalse(plan["warnings"])
+        self.assertEqual(plan["summary"]["modules_created"], 4)
+        self.assertEqual(plan["summary"]["interface_modules_updated"], 1)
+        self.assertEqual(plan["summary"]["deferred_interface_ownership"], 1)
+        self.assertEqual(plan["interface_assignments"][0]["name"], "Gi1/1/1")
+        self.assertEqual(plan["interface_ownership_deferred"][0]["name"], "Gi2/1/1")
+        self.assertEqual(before, untouched)
+        for module in plan["modules"]:
+            expected = (
+                "LABCHASSIS001"
+                if module["key"].startswith(("uplink:1", "transceiver:1"))
+                else "LABCHASSIS002"
+            )
+            self.assertEqual(module["device_serial"], expected)
+        saved_stack = deepcopy(stack)
+        saved_stack["members"][1].update(existing_id="created-device-LABCHASSIS002", create=False)
+        second = planner.plan_components(
+            observed, apply_to_snapshot(plan, before), stack_plan=saved_stack
+        )
+        self.assertFalse(second["errors"])
+        self.assertEqual(second["summary"]["modules_created"], 0)
+        self.assertEqual(second["summary"]["module_bays_created"], 0)
+        self.assertEqual(second["summary"]["interface_modules_updated"], 0)
+        self.assertEqual(second["summary"]["deferred_interface_ownership"], 1)
+
+    def test_child_parent_identity_chassis_member_and_port_claims_must_agree(self):
+        for scope, field, value in (
+            ("item", "device_serial", "LABCHASSIS002"),
+            ("item", "member", 2),
+            ("item", "chassis_model", "OTHER-CHASSIS"),
+            ("ownership", "parent_key", "uplink:2/1"),
+            ("ownership", "parent_model", "OTHER-UPLINK"),
+            ("ownership", "parent_serial", "OTHER-SERIAL"),
+            ("ownership", "device_serial", "LABCHASSIS002"),
+            ("ownership", "member", 2),
+            ("ownership", "member", True),
+            ("ownership", "chassis_model", "OTHER-CHASSIS"),
+            ("ownership", "interface", "Gi1/1/4"),
+        ):
+            with self.subTest(scope=scope, field=field):
+                observed, before, stack = self.fixtures()
+                child = next(
+                    row
+                    for row in observed["components"]["items"]
+                    if row["key"] == "transceiver:1/1/1"
+                )
+                if scope == "item":
+                    child[field] = value
+                else:
+                    child["source"]["ownership"][field] = value
+                plan = planner.plan_components(observed, before, stack_plan=stack)
+                self.assertTrue(plan["errors"])
+                self.assertNotIn(child["key"], {row["key"] for row in plan["modules"]})
+
+    def test_foreign_device_interfaces_never_get_selected_root_assignment(self):
+        observed, before, stack = self.fixtures()
+        stack["members"][1].update(existing_id="device-2", create=False)
+        before["interfaces"][1]["device_id"] = "device-2"
+        plan = planner.plan_components(observed, before, stack_plan=stack)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(len(plan["interface_assignments"]), 1)
+        self.assertEqual(plan["interface_ownership_deferred"][0]["interface_device_id"], "device-2")
+        before["interfaces"][0]["device_id"] = "device-2"
+        conflict_plan = planner.plan_components(observed, before, stack_plan=stack)
+        self.assertFalse(conflict_plan["interface_assignments"])
+        self.assertEqual(len(conflict_plan["interface_ownership_deferred"]), 2)
+        self.assertTrue(conflict_plan["warnings"])
+
+    def test_populated_network_module_ownership_remains_operator_controlled(self):
+        observed, before, stack = self.fixtures()
+        before["interfaces"][0]["module_id"] = "operator-module"
+        plan = planner.plan_components(observed, before, stack_plan=stack)
+        self.assertFalse(plan["errors"])
+        self.assertFalse(plan["interface_assignments"])
+        self.assertEqual(plan["conflicts"][0]["field"], "module")
+        self.assertEqual(plan["summary"]["modules_created"], 4)
+
+
 if __name__ == "__main__":
     unittest.main()

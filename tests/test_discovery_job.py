@@ -74,6 +74,7 @@ def discovery():
 
 
 CHANGE_COUNTERS = {
+    "stack_member_software_assigned": (r"stack member software versions?", r"assign"),
     "interfaces_created": (r"interfaces?", r"creat|new|add"),
     "interfaces_updated": (r"interfaces?", r"updat|enrich"),
     "console_ports_created": (r"console ports?", r"creat|new|add"),
@@ -644,6 +645,14 @@ class DiscoveryJobTests(unittest.TestCase):
         self.assertIn("VRF/IP assignments are deferred", messages)
         self.assertNotIn("private-vrf-sentinel", messages)
         self.assertEqual(self.assert_saved_report()["discovery"], self.observed)
+
+    def test_foreign_member_interface_links_are_expected_deferrals(self):
+        self.preview_plan["summary"]["deferred_interface_ownership"] = 4
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger, "info"))
+        self.assertIn("Deferred 4 interface-to-module links across stack member Devices", messages)
+        self.assertIn("existing network interface ownership is preserved", messages)
+        self.assertEqual(self.job.logger.warning.call_count, 0)
 
     def test_ambiguous_console_inventory_has_readable_warning_without_raw_evidence(self):
         self.preview_plan["summary"]["unresolved_console_ports"] = 1

@@ -190,6 +190,8 @@ def build_plan(discovery, existing):
         if len(versions) > 1:
             plan["errors"].append("Several SoftwareVersion records represent release %s" % version)
         plan["software_version"] = {
+            "key": "%s:%s" % (device.get("platform_id"), version),
+            "platform_id": device.get("platform_id"),
             "version": version,
             "existing_id": str(versions[0]["id"]) if len(versions) == 1 else None,
             "create": not versions,
@@ -308,7 +310,7 @@ def build_plan(discovery, existing):
     plan["components"] = plan_components(discovery, existing, interface_plan=plan, stack_plan=stack)
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["components"][key])
-    plan["console_ports"] = plan_console_ports(discovery, existing)
+    plan["console_ports"] = plan_console_ports(discovery, existing, stack_plan=stack)
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["console_ports"][key])
     plan["ipam"] = plan_ipam(discovery, existing, interface_plan=plan)

@@ -393,9 +393,12 @@ def run(device_id=None):
     from tests.nautobot_ipam_integration import run as verify_ipam_inventory
     from tests.nautobot_power_integration import catalog_counts as power_catalog_counts
     from tests.nautobot_power_integration import run as verify_power_inventory
+    from tests.nautobot_stack_components_integration import run as verify_stack_components_inventory
+    from tests.nautobot_stack_console_integration import run as verify_stack_console_inventory
     from tests.nautobot_stack_integration import catalog_counts as stack_catalog_counts
     from tests.nautobot_stack_integration import run as verify_stack_inventory
     from tests.nautobot_stack_power_integration import run as verify_stack_power_inventory
+    from tests.nautobot_stack_software_integration import run as verify_stack_software_inventory
     from tests.nautobot_transceiver_integration import run as verify_transceiver_inventory
     from tests.nautobot_vlan_integration import catalog_counts as vlan_catalog_counts
     from tests.nautobot_vlan_integration import run as verify_vlan_inventory
@@ -590,6 +593,9 @@ def run(device_id=None):
             verify_ipam_inventory(device, interface_status, checks)
             verify_power_inventory(device, interface_status, checks)
             verify_stack_power_inventory(device, interface_status, checks)
+            verify_stack_software_inventory(device, interface_status, checks)
+            verify_stack_components_inventory(device, interface_status, checks)
+            verify_stack_console_inventory(device, interface_status, checks)
         finally:
             transaction.set_rollback(True)
 

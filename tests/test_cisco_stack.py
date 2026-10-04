@@ -63,6 +63,16 @@ class StackCollectionTests(unittest.TestCase):
         self.assertEqual(
             result["stack"]["active_identity"]["sources"]["identity"]["inventory_index"], 8
         )
+        for member in result["stack"]["members"]:
+            self.assertEqual(member["software_version"], result["identity"]["software_version"])
+            source = member["sources"]["software_version"]
+            self.assertEqual(source["module"], "Cisco-IOS-XE-install-oper")
+            self.assertEqual(source["path"], cisco.INSTALL_PATH)
+            self.assertEqual(source["chassis"], member["position"])
+            self.assertTrue(source["install_rows"])
+            self.assertTrue(
+                all(row["chassis"] == member["position"] for row in source["install_rows"])
+            )
         expected = stack.collect(
             FixtureClient(payloads), inventory(payloads), hostname="switch", warnings=[]
         )["members"]
@@ -104,14 +114,20 @@ class StackCollectionTests(unittest.TestCase):
         self.assertTrue(result["components"]["items"])
         self.assertEqual(len(result["console_ports"]["items"]), 2)
 
-    def test_stack_unreviewed_components_console_and_management_writes_are_deferred(self):
+    def test_stack_reviewed_modules_and_consoles_resolve_with_management_deferred(self):
         client = FixtureClient(stack_payloads())
         result = cisco.collect(client)
-        self.assertTrue(
-            all(item["kind"] == "power-supply" for item in result["components"]["items"])
+        uplink = next(
+            item for item in result["components"]["items"] if item["kind"] == "network-module"
         )
+        self.assertEqual(uplink["key"], "uplink:1/1")
+        self.assertEqual(uplink["device_serial"], "LAB93000001")
         self.assertTrue(result["components"]["unresolved"])
-        self.assertEqual(result["console_ports"]["items"], [])
+        self.assertEqual(len(result["console_ports"]["items"]), 4)
+        self.assertEqual(
+            {(item["device_serial"], item["member"]) for item in result["console_ports"]["items"]},
+            {("LAB93000001", 1), ("LAB93000002", 2)},
+        )
         self.assertEqual(result["management"]["interfaces"], [])
         self.assertTrue(result["evidence"]["inventory"])
         self.assertIn(

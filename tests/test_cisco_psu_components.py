@@ -207,10 +207,19 @@ class PsuComponentTests(unittest.TestCase):
             ["psu:1/A", "psu:1/B", "psu:2/A", "psu:2/B"],
         )
         self.assertEqual(
-            {item["key"]: item["device_serial"] for item in result["items"]},
+            {
+                item["key"]: item["device_serial"]
+                for item in result["items"]
+                if item["kind"] == "power-supply"
+            },
             {"psu:1/B": "LAB93000001", "psu:2/A": "LAB93000002"},
         )
-        self.assertTrue(any(row.get("serial") == "LABUPLINK001" for row in result["unresolved"]))
+        self.assertTrue(
+            any(
+                row.get("serial") == "LABUPLINK001" and row.get("device_serial") == "LAB93000001"
+                for row in result["items"]
+            )
+        )
 
     def test_missing_member_platform_root_defers_asset_but_preserves_documented_bays(self):
         payloads = fixture_payloads()
@@ -218,7 +227,10 @@ class PsuComponentTests(unittest.TestCase):
         platform(payloads)[:] = [part for part in platform(payloads) if part["cname"] != "Switch2"]
         result = collect(payloads, stack=stack)
         self.assertEqual(len(result["physical_bays"]), 4)
-        self.assertEqual([item["key"] for item in result["items"]], ["psu:1/B"])
+        self.assertEqual(
+            [item["key"] for item in result["items"] if item["kind"] == "power-supply"],
+            ["psu:1/B"],
+        )
         self.assertTrue(any(row.get("serial") == "LABPSU2A" for row in result["unresolved"]))
 
     def test_contradictory_stack_owner_identity_and_position_block_collection(self):

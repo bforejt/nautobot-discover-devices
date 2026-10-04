@@ -19,8 +19,8 @@ HARDWARE_PATH = "/data/Cisco-IOS-XE-device-hardware-oper:device-hardware-data"
 ABSENT_STATES = frozenset(("state-provisioned", "state-removed", "state-unprovisioned"))
 ROLES = frozenset(("role-active", "role-standby", "role-member"))
 DEFERRED_PLACEMENT = (
-    "Physical member ownership for serialized components, console connectors, and dedicated "
-    "management ports requires a reviewed stack placement profile; existing records are preserved"
+    "Dedicated management-port ownership requires a reviewed stack placement profile; "
+    "existing records are preserved"
 )
 
 

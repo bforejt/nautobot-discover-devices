@@ -19,6 +19,19 @@ def _blank(value):
     return value is None or (isinstance(value, str) and not value.strip())
 
 
+def _reported_manufacturer(item):
+    """Accept a reported manufacturer, without interpreting a PID or family."""
+    evidence = item.get("source", {}).get("manufacturer")
+    return (
+        isinstance(evidence, dict)
+        and evidence.get("module") == "Cisco-IOS-XE-platform-oper"
+        and evidence.get("path") == "/data/Cisco-IOS-XE-platform-oper:components"
+        and evidence.get("field") == "state/mfg-name"
+        and _text(evidence.get("value")) == item["manufacturer"]
+        and _text(evidence.get("component")) is not None
+    )
+
+
 def _finish(plan):
     plan["summary"] = {
         "manufacturers_created": len(plan["manufacturers"]),
@@ -83,7 +96,7 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
     if "items" not in source:
         plan["errors"].append("Component items must be provided as a structured list")
         return _finish(plan)
-    for field in ("items", "physical_bays", "unresolved", "excluded"):
+    for field in ("items", "identities", "physical_bays", "unresolved", "excluded"):
         if not isinstance(source.get(field, []), list):
             plan["errors"].append("Component %s must be a structured list" % field)
     if plan["errors"]:
@@ -94,19 +107,22 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
         if (
             not _text(source["writes_deferred_reason"])
             or source["items"]
+            or source.get("identities")
             or source.get("physical_bays")
         ):
-            plan["errors"].append("Deferred component placement cannot include resolved items")
+            plan["errors"].append("Deferred component writes cannot include resolved evidence")
         # No placement inventory was collected. Do not claim that existing
         # modules disappeared merely because their ownership remains unresolved.
         return _finish(plan)
     catalog = existing.get("components", {})
     if not catalog.get("supported", False):
-        if source.get("items") or source.get("physical_bays"):
+        if source.get("items") or source.get("identities") or source.get("physical_bays"):
             plan["warnings"].append("This Nautobot inventory does not support module discovery")
             plan["unresolved"].extend(
                 {"key": item.get("key"), "reason": "Module inventory is unavailable"}
-                for item in source["items"] + source.get("physical_bays", [])
+                for item in source["items"]
+                + source.get("identities", [])
+                + source.get("physical_bays", [])
                 if isinstance(item, dict)
             )
         return _finish(plan)
@@ -247,8 +263,6 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
     asset_claims = defaultdict(list)
     bay_claims = defaultdict(list)
     interface_claims = defaultdict(list)
-    type_claims = defaultdict(list)
-    pid_claims = defaultdict(list)
 
     def valid_power_port(raw):
         if not isinstance(raw, dict) or _text(raw.get("name")) is None:
@@ -327,8 +341,6 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
         items[key] = item
         asset_key = (item["manufacturer"].casefold(), item["part_number"], item["serial"])
         asset_claims[asset_key].append(key)
-        type_claims[(item["manufacturer"].casefold(), item["model"])].append(key)
-        pid_claims[(item["manufacturer"].casefold(), item["part_number"])].append(key)
         for name in item["interfaces"]:
             interface_claims[name].append(key)
 
@@ -342,14 +354,87 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
                     "Several discovered components claim the same %s: %s" % (label, ", ".join(keys))
                 )
                 invalid_keys.update(keys)
-    for keys in type_claims.values():
-        if len({items[key]["part_number"] for key in keys}) > 1:
-            error("Discovered components disagree on one ModuleType's PID: %s" % ", ".join(keys))
-            invalid_keys.update(keys)
-    for keys in pid_claims.values():
-        if len({items[key]["model"] for key in keys}) > 1:
-            error("Discovered PID claims several ModuleType models: %s" % ", ".join(keys))
-            invalid_keys.update(keys)
+
+    # Catalog identity can be trustworthy even when a native physical owner or
+    # bay cannot be established. It never implies an installed serialized asset.
+    reported_identities = {}
+    identity_assets = defaultdict(list)
+    for raw in source.get("identities", []):
+        if not isinstance(raw, dict):
+            error("Component identities must be structured objects")
+            continue
+        key = _text(raw.get("key"))
+        provenance = raw.get("source")
+        if (
+            not isinstance(provenance, dict)
+            or any(
+                field in provenance and not isinstance(provenance[field], dict)
+                for field in ("manufacturer", "identity", "placement")
+            )
+            or not isinstance(raw.get("observations", {}), dict)
+        ):
+            error("Component identity has invalid structured source evidence")
+            continue
+        required = ("kind", "manufacturer", "model", "part_number", "serial")
+        if key is None or any(_text(raw.get(field)) is None for field in required):
+            plan["unresolved"].append(
+                {"key": key, "reason": "Incomplete serialized component identity; catalog deferred"}
+            )
+            continue
+        identity = {**raw, **{field: _text(raw[field]) for field in required}, "key": key}
+        if not _reported_manufacturer(identity):
+            if "manufacturer" in provenance:
+                error("Component identity %s has contradictory manufacturer provenance" % key)
+            else:
+                unresolved(identity, "Reported manufacturer provenance is unavailable")
+            continue
+        if key in reported_identities:
+            error("Several discovered component identities use key %s" % key)
+            continue
+        asset_key = (
+            identity["manufacturer"].casefold(),
+            identity["part_number"],
+            identity["serial"],
+        )
+        identity_assets[asset_key].append(key)
+        reported_identities[key] = identity
+        for item_key in asset_claims.get(asset_key, []):
+            item = items[item_key]
+            if any(identity[field] != item[field] for field in ("kind", "model", "part_number")):
+                error("Component identity %s contradicts placed component %s" % (key, item_key))
+                invalid_keys.add(item_key)
+        if key in items and any(
+            identity[field].casefold() != items[key][field].casefold()
+            if field == "manufacturer"
+            else identity[field] != items[key][field]
+            for field in required
+        ):
+            error("Component identity %s contradicts the placed component with its key" % key)
+            invalid_keys.add(key)
+    for keys in identity_assets.values():
+        if len(keys) > 1:
+            error(
+                "Several discovered components claim the same serialized identity: %s"
+                % ", ".join(keys)
+            )
+
+    # Compare all model/PID claims before any catalog or placement is planned.
+    catalog_entries = [(key, item) for key, item in items.items()] + list(
+        reported_identities.items()
+    )
+    type_claims, pid_claims = defaultdict(list), defaultdict(list)
+    for key, item in catalog_entries:
+        type_claims[(item["manufacturer"].casefold(), item["model"])].append((key, item))
+        pid_claims[(item["manufacturer"].casefold(), item["part_number"])].append((key, item))
+    for claims, field, message in (
+        (type_claims, "part_number", "Discovered components disagree on one ModuleType's PID"),
+        (pid_claims, "model", "Discovered PID claims several ModuleType models"),
+    ):
+        for rows in claims.values():
+            if len({item[field] for _, item in rows}) > 1:
+                keys = [key for key, _ in rows]
+                error("%s: %s" % (message, ", ".join(keys)))
+                invalid_keys.update(keys)
     for key, item in items.items():
         parent, visited = item["parent_key"], {key}
         while parent is not None:
@@ -611,15 +696,7 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
         manufacturer_id = _id(matches[0]["id"]) if matches else None
         manufacturer_key = manufacturer_id or "reported:" + item["manufacturer"].casefold()
         if not matches:
-            evidence = item.get("source", {}).get("manufacturer")
-            if not (
-                isinstance(evidence, dict)
-                and evidence.get("module") == "Cisco-IOS-XE-platform-oper"
-                and evidence.get("path") == "/data/Cisco-IOS-XE-platform-oper:components"
-                and evidence.get("field") == "state/mfg-name"
-                and _text(evidence.get("value")) == item["manufacturer"]
-                and _text(evidence.get("component")) is not None
-            ):
+            if not _reported_manufacturer(item):
                 error(
                     "Component %s requires one existing Manufacturer %s or reviewed source evidence"
                     % (item["key"], item["manufacturer"])
@@ -669,6 +746,29 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
             "create": selected is None,
             "changes": changes,
         }
+
+    def record_type(item, module_type):
+        if module_type["key"] not in planned_types:
+            planned_types[module_type["key"]] = module_type
+            plan["module_types"].append(module_type)
+        if module_type["manufacturer_id"] is None:
+            manufacturer_key = module_type["manufacturer_key"]
+            if manufacturer_key not in planned_manufacturers:
+                manufacturer = {
+                    "key": manufacturer_key,
+                    "name": item["manufacturer"],
+                    "source": item["source"]["manufacturer"],
+                }
+                planned_manufacturers[manufacturer_key] = manufacturer
+                plan["manufacturers"].append(manufacturer)
+
+    if not plan["errors"]:
+        for identity in reported_identities.values():
+            module_type = resolve_type(identity)
+            if module_type is None:
+                unresolved(identity, "ModuleType identity could not be reconciled")
+            else:
+                record_type(identity, module_type)
 
     def plan_power_ports(item, module, module_type):
         observed_ports = item["power_ports"]
@@ -900,19 +1000,7 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
                 )
             if module["id"] is not None:
                 seen_module_ids.add(module["id"])
-            if module_type["key"] not in planned_types:
-                planned_types[module_type["key"]] = module_type
-                plan["module_types"].append(module_type)
-            if module_type["manufacturer_id"] is None:
-                manufacturer_key = module_type["manufacturer_key"]
-                if manufacturer_key not in planned_manufacturers:
-                    manufacturer = {
-                        "key": manufacturer_key,
-                        "name": item["manufacturer"],
-                        "source": item["source"]["manufacturer"],
-                    }
-                    planned_manufacturers[manufacturer_key] = manufacturer
-                    plan["manufacturers"].append(manufacturer)
+            record_type(item, module_type)
             bay_identity = (
                 item["owner"]["device_serial"] or item["owner"]["device_id"],
                 parent_key,
@@ -1025,7 +1113,8 @@ def plan_components(discovery, existing, interface_plan=None, stack_plan=None):
             ),
         }
         for row in sorted(modules, key=lambda row: _id(row["id"]))
-        if _id(row["id"]) not in seen_module_ids
+        if (source["items"] or source.get("physical_bays") or not source.get("identities"))
+        and _id(row["id"]) not in seen_module_ids
         and (
             _id(row.get("device_id")) in target_device_ids
             or _id(row.get("parent_module_bay_id")) in target_bay_ids

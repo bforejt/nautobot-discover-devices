@@ -2,7 +2,7 @@
 
 `Discover Device` verifies an existing Nautobot Device against structured facts
 from the device, then fills missing identity, interface, console connector,
-reviewed serialized hardware inventory, scoped 802.1Q assignments, configured
+reported serialized hardware inventory, scoped 802.1Q assignments, configured
 static IPv4/IPv6 addressing, and explicitly mapped named VRFs. The first adapter
 supports Cisco IOS XE switches on 17.9
 or later using RESTCONF JSON exclusively. The job defaults to a preview.
@@ -134,8 +134,12 @@ Documented exact chassis and uplink profiles cover Catalyst 9300/9300L/9300LM/
 using documented physical capability and compatible installed-module identity.
 The [hardware library reference](docs/catalyst-hardware-profiles.md) lists exact
 PIDs, regions, compatibility, source evidence and unresolved special cases.
-Serialized 9300 uplink modules and optics require corroborated platform placement;
-9500 component placement remains report-only pending verified structured data.
+These profiles enrich physical capability and reviewed placement. Unlisted
+chassis and parts can use [reported hardware discovery](docs/reported-hardware-discovery.md)
+without a product matrix: explicit Ethernet ports use `Other` when capability
+is unknown, and reported component identities/parent references remain eligible.
+9500-specific serialized placement conventions remain deferred; generic
+containment can proceed when the returned data meets the same evidence rules.
 
 ## Initial interpretation rules
 
@@ -148,7 +152,9 @@ Serialized 9300 uplink modules and optics require corroborated platform placemen
 | Provisioned install release | Fill blank native software field using a matching platform SoftwareVersion, creating one if needed |
 | Present interface | Match canonical name within the Device; create missing or enrich blank fields |
 | Configured channel-group | Fill blank member `Interface.lag` with its discovered port-channel |
-| Reviewed serialized component | Match or create native ModuleType, ModuleBay, and Module inventory |
+| Explicit Ethernet with unknown capability | Create with native `Other`; retain known facts and flag unresolved capability |
+| Complete reported component identity | Match or create native Manufacturer and ModuleType independently of placement |
+| Verified reported or reviewed component placement | Match or create native ModuleBay and Module inventory |
 | Reviewed module interface ownership | Fill blank `Interface.module` using the existing interface record |
 | Ready physical interface speed | Fill blank `Interface.speed` in Kbps from the structured operational value |
 | Explicit operational RJ45 media | Fill blank `Interface.port_type` with `8p8c` |
@@ -216,9 +222,11 @@ exact documented 9300 and 9500 PIDs; the original lab mappings remain:
 - Installed `C3850-NM-4-1G`: four 1G SFP uplink ports for the identified member.
 - SVIs and loopbacks: virtual; port-channels: LAG.
 
-An unsupported physical type or unknown administrative state skips creation
+An explicitly reported ordinary Ethernet port with known administrative state
+can be created with native `Other` when its physical capability is unknown.
+Unclassified ports or ports with unknown administrative state skip creation
 with an explicit warning. Existing interfaces can still receive independently
-known blank fields. No generic physical type is invented.
+known blank fields; populated types are preserved.
 
 ## IPAM and named VRFs
 
@@ -353,8 +361,11 @@ and [management-port guide](https://www.cisco.com/c/en/us/td/docs/switches/lan/c
 Uplink and transceiver profiles cover explicitly compatible documented 9300-family
 chassis and uplink modules, with independently corroborated slot-1 placement.
 The existing `C9300-48UXM` / `C3850-NM-4-1G` lab mapping is preserved.
-9500 port capabilities are documented; their serialized module/optic placement
-awaits verified structured evidence. See the
+Generic classification and explicit parent references also support unlisted
+chassis and parts. Unknown capability, connector and physical label remain blank;
+unknown containment permits catalog identity without an installed Module. See
+[reported hardware discovery](docs/reported-hardware-discovery.md). Specific
+9500 slot conventions await verified structured evidence. See the
 [hardware library](docs/catalyst-hardware-profiles.md) for exact coverage.
 PSU profiles cover exact reviewed C9300, C9300L,
 C9300LM and C9300X chassis and compatible power supplies. Resolved parts use
@@ -389,8 +400,9 @@ PSU A and three fans in the lab have no structured PID or serial and remain
 unresolved assets. Both documented PSU bays can be created independently of
 asset identity. A disabled PSU reporting `no-input` does not establish that its
 bay is vacant; no recorded Module means that no identified asset is recorded.
-Unknown serialized parts and unreviewed placement also
-remain unresolved, with evidence for the next interpretation increment. Exact
+Unlisted serialized parts can retain their reported catalog identity, and
+explicit parent relationships can establish placement. Missing or ambiguous
+identity and placement remain unresolved with their source evidence. Exact
 reviewed stack aggregate aliases are excluded; matching a chassis serial alone
 does not exclude another component.
 
@@ -426,8 +438,10 @@ Cisco-compatible PID. A missing Manufacturer can be created only from this
 reviewed source evidence, with its exact reported name; ambiguous matches block
 apply. New manufacturer and ModuleType catalog entries validate before saving
 and participate in the same atomic transaction as the asset. Catalog records
-are not created for a blocked occupied slot. Missing manufacturer, identity,
-parent, or placement evidence remains unresolved.
+from reviewed asset-only sources are not created for a blocked occupied slot.
+The generic reported-identity path can resolve catalogs independently of placement.
+Missing manufacturer or identity prevents catalog creation; missing parent or
+placement evidence keeps installation unresolved.
 
 The lab SFP reports `GLC-SX-MM`, serial `ZZ306221998`, revision `V03`, and
 manufacturer `CISCO-EQUIV` on `GigabitEthernet1/1/1`. Its nested bay identifies

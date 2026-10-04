@@ -1,4 +1,4 @@
-"""Reviewed serialized Cisco components, collected only from RESTCONF JSON.
+"""Reported serialized Cisco components, collected only from RESTCONF JSON.
 
 Identity comes from device-hardware-oper; platform-oper corroborates identity
 and supplies placement. Numeric inventory indexes are evidence, never joins.
@@ -8,7 +8,9 @@ The original lab C3850-NM-4-1G placement quirk remains narrowly reviewed.
 Separate documented Catalyst 9300 PSU profiles establish chassis bays even
 when occupant identity is unavailable, and resolve serialized supplies to
 verified standalone or stack-member owners. The reviewed network module and its
-nested transceivers use those same physical owners. Unknown parts remain observations.
+nested transceivers use those same physical owners. Unlisted parts can use
+explicit reported classification and parent relationships. Unknown capabilities
+and unresolved containment remain observations, independent of known identity.
 
 Platform fields are documented in Cisco's published YANG model:
 https://raw.githubusercontent.com/YangModels/yang/main/vendor/cisco/xe/17111/Cisco-IOS-XE-platform-oper.yang
@@ -20,6 +22,7 @@ from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 
 from ..transport_restconf import RestconfError
+from . import cisco_generic_components as generic_components
 from . import cisco_hardware_profiles as hardware_profiles
 from . import cisco_psu_profiles as psu_profiles
 
@@ -806,10 +809,11 @@ def collect(
     stack=None,
     use_ntc_defaults=False,
 ):
-    """Return reviewed items and visible unresolved/excluded observations."""
+    """Collect reported identities, verified placements and optional profile enrichment."""
     result = {
         "schema_version": 1,
         "items": [],
+        "identities": [],
         "physical_bays": [],
         "unresolved": [],
         "excluded": [],
@@ -1023,6 +1027,24 @@ def collect(
             interfaces=interfaces,
         )
     )
+    generic = generic_components.collect(
+        flat,
+        platform,
+        owners,
+        interfaces=interfaces,
+        existing_items=result["items"],
+        existing_unresolved=result["unresolved"],
+    )
+    result["identities"] = generic["identities"]
+    result["items"].extend(generic["items"])
+    result["unresolved"] = [
+        row
+        for row in result["unresolved"]
+        if row.get("property") is not None
+        or (row.get("name"), row.get("model"), row.get("serial")) not in generic["handled_hardware"]
+    ]
+    result["unresolved"].extend(generic["unresolved"])
+    handled_platform_names.update(generic["handled_platform_names"])
     flat_pairs = {
         (fact["model"], fact["serial"]) for fact in flat if fact["model"] and fact["serial"]
     }
@@ -1084,7 +1106,7 @@ def collect(
 
 def add_revisions(components, modules):
     """Annotate provenance after the shared YANG-library evidence read."""
-    for collection in ("items", "physical_bays", "unresolved", "excluded"):
+    for collection in ("items", "identities", "physical_bays", "unresolved", "excluded"):
         for item in components.get(collection, []):
             for source in item.get("source", {}).values():
                 if isinstance(source, dict) and source.get("module"):

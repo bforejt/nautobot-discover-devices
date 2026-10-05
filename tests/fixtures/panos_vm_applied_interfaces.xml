@@ -1,0 +1,18 @@
+<response status="success"><result><interface>
+  <ethernet>
+    <entry name="ethernet1/1">
+      <link-state>up</link-state>
+      <layer3>
+        <mtu>1400</mtu>
+      </layer3>
+      <comment>PANOS discovery enabled lab port</comment>
+    </entry>
+    <entry name="ethernet1/2">
+      <link-state>down</link-state>
+      <layer3>
+        <mtu>1500</mtu>
+      </layer3>
+      <comment>PANOS discovery disabled lab port</comment>
+    </entry>
+  </ethernet>
+</interface></result></response>

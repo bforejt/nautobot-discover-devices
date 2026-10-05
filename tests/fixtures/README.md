@@ -72,6 +72,22 @@ synthetic PA-5250 / 11.1.4-h7 identity and three hardware rows, including down,
 unaddressed `ethernet1/7`, plus logical observations. They are parser evidence,
 not a live compatibility claim. `panos_applied_interfaces.xml` is newly created
 synthetic applied configuration with explicit link-state and selected MTU/comment
-leaves. These fixtures contain no credentials. The live unlicensed PA-VM 11.2.8
+leaves. These fixtures contain no credentials. The first-pass unlicensed PA-VM 11.2.8
 had empty hardware/logical/applied Ethernet containers and no usable serial;
 its report is retained separately in ignored artifacts.
+
+
+`panos_vm_system_info.xml`, `panos_vm_guest_interfaces.xml`,
+`panos_vm_empty_interfaces.xml`, `panos_vm_configured_interfaces.xml` and
+`panos_vm_applied_interfaces.xml` preserve XML captured from the dedicated
+PA-VM / PAN-OS 11.2.8 KVM lab on 2026-10-05. Hostname, management addressing,
+VM UUID, CPU ID and MAC values are sanitized. Commands are respectively
+`show system info`, `debug show vm-series interfaces all`, `show interface all`
+(before configuration and after configuration), and
+`show config effective-running xpath devices/entry/network/interface`.
+The guest enumeration recognizes three adapters; the normal hardware view
+includes only the two configured adapters. The third remains unconfigured.
+Explicit applied up/down and MTU 1400/1500 are retained. PCI identities and
+base-OS port/name relationships preserve the observed schema; they do not
+classify native type, native MAC or administrative state. These payloads
+contain no credentials, license keys or unrelated configuration.

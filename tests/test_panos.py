@@ -15,6 +15,31 @@ def output(name):
     return (FIXTURES / name).read_text()
 
 
+def vm_payloads():
+    return {
+        transport.SYSTEM_INFO: output("panos_vm_system_info.xml"),
+        transport.INTERFACES: output("panos_vm_empty_interfaces.xml"),
+        transport.RUNNING_INTERFACES: (
+            '<response status="success"><result><interface><ethernet>'
+            '<entry name="ethernet1/1"><link-state>up</link-state><comment>VM up port</comment>'
+            "<layer3><mtu>1400</mtu></layer3></entry>"
+            '<entry name="ethernet1/2"><link-state>down</link-state><comment>VM down port</comment>'
+            "<layer3><mtu>1500</mtu></layer3></entry>"
+            "</ethernet></interface></result></response>"
+        ),
+        transport.VM_INTERFACES: output("panos_vm_guest_interfaces.xml"),
+    }
+
+
+def vm_post_commit_payloads():
+    return {
+        transport.SYSTEM_INFO: output("panos_vm_system_info.xml"),
+        transport.INTERFACES: output("panos_vm_configured_interfaces.xml"),
+        transport.RUNNING_INTERFACES: output("panos_vm_applied_interfaces.xml"),
+        transport.VM_INTERFACES: output("panos_vm_guest_interfaces.xml"),
+    }
+
+
 class PanosParserTests(unittest.TestCase):
     def setUp(self):
         self.system = output("panos_system_info.txt")
@@ -191,6 +216,201 @@ class PanosParserTests(unittest.TestCase):
         self.assertEqual(panos.parse_system_info(raw)[0]["model"], "PA-5250")
         with self.assertRaises(panos.DiscoveryError):
             panos.parse_system_info(raw + "\nServer error")
+
+    def test_vm_diagnostic_fixture_has_exact_names_and_guest_identity(self):
+        rows = panos.parse_vm_interfaces(output("panos_vm_guest_interfaces.xml"))
+        self.assertEqual(
+            [row["name"] for row in rows], ["ethernet1/1", "ethernet1/2", "ethernet1/3"]
+        )
+        self.assertEqual(rows[0]["raw_name"], "Ethernet1/1")
+        self.assertEqual(rows[0]["base_os_port"], "eth1")
+        self.assertEqual(rows[0]["base_os_bus"], "0000:00:13.0")
+        self.assertEqual(rows[0]["base_os_mac"], "02:00:00:00:00:01")
+        self.assertNotIn("type", rows[0])
+
+    def test_vm_collection_enumerates_unconfigured_guest_port_without_native_defaults(self):
+        payloads = vm_payloads()
+        client = Mock(run=Mock(side_effect=payloads.__getitem__))
+        result = panos.collect(client)
+        self.assertEqual([call.args[0] for call in client.run.call_args_list], list(payloads))
+        self.assertEqual(
+            [row["name"] for row in result["interfaces"]],
+            ["ethernet1/1", "ethernet1/2", "ethernet1/3"],
+        )
+        self.assertIs(result["interfaces"][0]["enabled"], True)
+        self.assertIs(result["interfaces"][1]["enabled"], False)
+        self.assertIsNone(result["interfaces"][2]["enabled"])
+        self.assertEqual(result["interfaces"][0]["mtu"], 1400)
+        self.assertEqual(result["interfaces"][1]["description"], "VM down port")
+        self.assertEqual(result["interfaces"][0]["source"]["contract"], "panos-vm-interface-v1")
+        self.assertEqual(
+            result["sources"]["vm_interfaces"],
+            {"command": transport.VM_INTERFACES, "path": "result/entry"},
+        )
+        self.assertEqual(len(result["observations"]["vm_interfaces"]), 3)
+        for fact in result["interfaces"]:
+            for field in ("type", "mac_address", "speed", "duplex", "port_type", "mgmt_only"):
+                self.assertIsNone(fact[field])
+            self.assertIs(fact["physical_ethernet"], False)
+        self.assertEqual(result, panos.collect(client, use_ntc_defaults=True))
+
+    def test_post_commit_vm_fixtures_keep_configured_and_unconfigured_ports(self):
+        payloads = vm_post_commit_payloads()
+        result = panos.collect(Mock(run=Mock(side_effect=payloads.__getitem__)))
+        facts = result["interfaces"]
+        self.assertEqual(
+            [row["name"] for row in facts], ["ethernet1/1", "ethernet1/2", "ethernet1/3"]
+        )
+        self.assertEqual([row["enabled"] for row in facts], [True, False, None])
+        self.assertEqual([row["mtu"] for row in facts], [1400, 1500, None])
+        self.assertEqual(
+            [row["source"]["contract"] for row in facts],
+            ["panos-interface-v1", "panos-interface-v1", "panos-vm-interface-v1"],
+        )
+        self.assertEqual(facts[2]["source"]["raw_name"], "Ethernet1/3")
+        self.assertEqual(len(result["observations"]["vm_interfaces"]), 3)
+        self.assertEqual(len(result["observations"]["interfaces"][0]["hardware"]), 1)
+        self.assertEqual(result["observations"]["interfaces"][2]["hardware"], [])
+        self.assertTrue(all(row["mac_address"] is None for row in facts))
+        self.assertTrue(all(row["type"] is None for row in facts))
+
+    def test_vm_enumeration_requires_the_exact_reviewed_system_context(self):
+        for field, before, after in (
+            ("model", "PA-VM", "PA-440"),
+            ("family", "vm", "hardware"),
+            ("vm-mode", "KVM", "ESXi"),
+        ):
+            with self.subTest(field=field):
+                payloads = vm_payloads()
+                payloads[transport.SYSTEM_INFO] = payloads[transport.SYSTEM_INFO].replace(
+                    "<%s>%s</%s>" % (field, before, field),
+                    "<%s>%s</%s>" % (field, after, field),
+                )
+                client = Mock(run=Mock(side_effect=payloads.__getitem__))
+                result = panos.collect(client)
+                self.assertEqual(len(client.run.call_args_list), 3)
+                self.assertNotIn("vm_interfaces", result["sources"])
+                self.assertNotIn("vm_interfaces", result["observations"])
+
+    def test_vm_inventory_empty_is_successful_but_failed_shapes_are_not_empty(self):
+        self.assertEqual(
+            panos.parse_vm_interfaces('<response status="success"><result/></response>'), []
+        )
+        valid = output("panos_vm_guest_interfaces.xml")
+        for raw in (
+            '<response status="error"><result/></response>',
+            '<response status="success"/>',
+            "<response><result/></response>",
+            '<response status="success"><result>display table</result></response>',
+            '<response status="success"><result><interfaces/></result></response>',
+            valid[: valid.rfind("</response>")],
+            "Interface_name Base-OS_port Base-OS_MAC Base-OS_BUS",
+        ):
+            with self.subTest(raw=raw[:40]):
+                with self.assertRaises(panos.DiscoveryError):
+                    panos.parse_vm_interfaces(raw)
+
+    def test_vm_inventory_missing_nested_and_duplicate_scalars_fail(self):
+        valid = output("panos_vm_guest_interfaces.xml")
+        for raw in (
+            valid.replace("<Interface_name>Ethernet1/1</Interface_name>", "", 1),
+            valid.replace("<Base-OS_port>eth1</Base-OS_port>", "<Base-OS_port/>", 1),
+            valid.replace("<Base-OS_BUS>0000:00:13.0</Base-OS_BUS>", "", 1),
+            valid.replace(
+                "<Base-OS_BUS>0000:00:13.0</Base-OS_BUS>", "<Base-OS_BUS>PCI 13</Base-OS_BUS>", 1
+            ),
+            valid.replace(
+                "<Base-OS_port>eth1</Base-OS_port>", "<Base-OS_port><nested/></Base-OS_port>", 1
+            ),
+            valid.replace(
+                "<Base-OS_port>eth1</Base-OS_port>",
+                "<Base-OS_port>eth1</Base-OS_port><Base-OS_port>eth9</Base-OS_port>",
+                1,
+            ),
+            valid.replace("<entry>", '<entry name="ignored-identity">', 1),
+        ):
+            with self.subTest(raw=raw[:80]):
+                with self.assertRaises(panos.DiscoveryError):
+                    panos.parse_vm_interfaces(raw)
+
+    def test_vm_inventory_duplicate_canonical_names_ports_and_buses_fail(self):
+        valid = output("panos_vm_guest_interfaces.xml")
+        for before, after in (
+            ("Ethernet1/2", "ethernet1/1"),
+            ("<Base-OS_port>eth2</Base-OS_port>", "<Base-OS_port>eth1</Base-OS_port>"),
+            ("0000:00:14.0", "0000:00:13.0"),
+        ):
+            with self.subTest(before=before):
+                with self.assertRaises(panos.DiscoveryError):
+                    panos.parse_vm_interfaces(valid.replace(before, after))
+
+    def test_vm_inventory_mac_is_optional_and_never_a_guest_identity_key(self):
+        valid = output("panos_vm_guest_interfaces.xml")
+        duplicate_mac = valid.replace("02:00:00:00:00:02", "02:00:00:00:00:01")
+        self.assertEqual(len(panos.parse_vm_interfaces(duplicate_mac)), 3)
+        omitted_mac = valid.replace("<Base-OS_MAC>02:00:00:00:00:01</Base-OS_MAC>", "")
+        self.assertIsNone(panos.parse_vm_interfaces(omitted_mac)[0]["base_os_mac"])
+
+    def test_vm_management_and_unknown_kinds_remain_report_only(self):
+        payloads = vm_payloads()
+        extra = (
+            "<entry><Interface_name>mgt</Interface_name><Base-OS_port>eth0</Base-OS_port>"
+            "<Base-OS_BUS>0000:00:12.0</Base-OS_BUS></entry>"
+            "<entry><Interface_name>future-kind</Interface_name><Base-OS_port>eth4</Base-OS_port>"
+            "<Base-OS_BUS>0000:00:16.0</Base-OS_BUS><Future_scalar>value</Future_scalar></entry>"
+        )
+        payloads[transport.VM_INTERFACES] = payloads[transport.VM_INTERFACES].replace(
+            "</result>", extra + "</result>"
+        )
+        result = panos.collect(Mock(run=Mock(side_effect=payloads.__getitem__)))
+        self.assertEqual(len(result["interfaces"]), 3)
+        self.assertEqual(len(result["observations"]["vm_interfaces"]), 5)
+        self.assertEqual(
+            {row["name"] for row in result["excluded_interfaces"]}, {"mgt", "future-kind"}
+        )
+
+    def test_vm_enumeration_read_failure_blocks_collection_instead_of_partial_facts(self):
+        payloads = vm_payloads()
+        payloads[transport.VM_INTERFACES] = '<response status="error"><result/></response>'
+        with self.assertRaises(panos.DiscoveryError):
+            panos.collect(Mock(run=Mock(side_effect=payloads.__getitem__)))
+
+    def test_operational_guest_name_absent_from_complete_vm_inventory_fails(self):
+        payloads = vm_payloads()
+        payloads[transport.INTERFACES] = self.ports
+        with self.assertRaisesRegex(panos.DiscoveryError, "disagree"):
+            panos.collect(Mock(run=Mock(side_effect=payloads.__getitem__)))
+
+    def test_vm_guest_proof_never_repairs_ambiguous_hardware_logical_join(self):
+        payloads = vm_payloads()
+        payloads[transport.INTERFACES] = self.ports.replace(
+            "<id>16</id><addr/>", "<id>900</id><addr/>"
+        )
+        payloads[transport.VM_INTERFACES] = payloads[transport.VM_INTERFACES].replace(
+            "Ethernet1/3", "Ethernet1/7"
+        )
+        result = panos.collect(Mock(run=Mock(side_effect=payloads.__getitem__)))
+        self.assertNotIn("ethernet1/1", [row["name"] for row in result["interfaces"]])
+        excluded = next(
+            row for row in result["excluded_interfaces"] if row["name"] == "ethernet1/1"
+        )
+        self.assertEqual(excluded["reason"], "ambiguous hardware/logical identity join")
+        self.assertTrue(
+            all(row["source"]["contract"] == "panos-interface-v1" for row in result["interfaces"])
+        )
+
+    def test_normal_hardware_subset_keeps_existing_source_and_adds_only_absent_guest_rows(self):
+        payloads = vm_payloads()
+        payloads[transport.INTERFACES] = (
+            '<response status="success"><result><hw>'
+            "<entry><name>ethernet1/1</name><id>16</id></entry>"
+            "</hw><ifnet/></result></response>"
+        )
+        result = panos.collect(Mock(run=Mock(side_effect=payloads.__getitem__)))
+        self.assertEqual(len(result["interfaces"]), 3)
+        self.assertEqual(result["interfaces"][0]["source"]["contract"], "panos-interface-v1")
+        self.assertEqual(result["interfaces"][1]["source"]["contract"], "panos-vm-interface-v1")
+        self.assertEqual(result["interfaces"][2]["source"]["contract"], "panos-vm-interface-v1")
 
     def test_collection_has_fixed_reads_and_guessing_does_not_change_facts(self):
         payloads = {

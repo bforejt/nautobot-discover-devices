@@ -36,6 +36,25 @@ class SshTransportTests(unittest.TestCase):
         self.assertIs(self.connect.call_args.kwargs["system_host_keys"], True)
         self.conn.disconnect.assert_called_once()
 
+    def test_only_exact_vm_diagnostic_read_is_allowed_and_xml_session_is_prepared(self):
+        self.assertEqual(ssh.VM_INTERFACES, "debug show vm-series interfaces all")
+        self.assertEqual(
+            ssh.READ_COMMANDS,
+            frozenset((ssh.SYSTEM_INFO, ssh.INTERFACES, ssh.RUNNING_INTERFACES, ssh.VM_INTERFACES)),
+        )
+        with self.client() as client:
+            output = client.run(ssh.VM_INTERFACES)
+            read = client.trace[-1]
+        self.assertEqual(output, self.conn.send_command.return_value)
+        self.assertEqual(
+            [call.args[0] for call in self.conn.send_command.call_args_list],
+            list(ssh.SESSION_PREP) + [ssh.VM_INTERFACES],
+        )
+        self.assertEqual(read["command"], ssh.VM_INTERFACES)
+        self.assertIs(read["presentation"], False)
+        self.assertIsNone(read["error"])
+        self.conn.disconnect.assert_called_once()
+
     def test_commands_are_refused_before_opening_a_connection(self):
         for command in (
             "configure",
@@ -45,6 +64,14 @@ class SshTransportTests(unittest.TestCase):
             "show config running",
             "request restart system",
             "set cli op-command-xml-output off",
+            "debug show vm-series interfaces",
+            "debug show vm-series interfaces all ",
+            " debug show vm-series interfaces all",
+            "Debug show vm-series interfaces all",
+            "debug show vm-series interfaces all; request restart system",
+            "debug show vm-series interfaces all\nconfigure",
+            "debug show vm-series interfaces all | match eth1",
+            "debug dataplane packet-diag set capture on",
         ):
             with self.subTest(command=command), self.assertRaises(ValueError):
                 self.client().run(command)

@@ -8,8 +8,9 @@ scoped applied configuration, and conservative native inventory semantics.
 
 import re
 import xml.etree.ElementTree as ET
+from uuid import UUID
 
-from ..transport_ssh import INTERFACES, RUNNING_INTERFACES, SYSTEM_INFO
+from ..transport_ssh import INTERFACES, RUNNING_INTERFACES, SYSTEM_INFO, VM_INTERFACES
 
 MAX_XML_BYTES = 16 * 1024 * 1024
 _NAME = re.compile(r"ethernet\d+/\d+(?:/\d+)?")
@@ -30,6 +31,17 @@ def canonical_software_version(value):
         return None
     value = value.strip()
     return value if _RELEASE.fullmatch(value) else None
+
+
+def canonical_vm_uuid(value):
+    """Accept explicit UUID notation, excluding nil and all-ones sentinels."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value) is None:
+        return None
+    identifier = UUID(value)
+    return str(identifier) if identifier.int not in (0, (1 << 128) - 1) else None
 
 
 def _result(output, command):
@@ -125,6 +137,9 @@ def parse_system_info(output):
             "operational-mode",
             "advanced-routing",
             "sw-version",
+            "vm-uuid",
+            "vm-cpuid",
+            "serial",
         )
     }
     return identity, observations
@@ -148,6 +163,73 @@ def parse_running_interfaces(output):
             _one(entry, field)
         entries[name] = entry
     return entries
+
+
+def canonical_vm_interface_name(value):
+    """Normalize only the documented diagnostic Ethernet prefix, never other names."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if value.startswith("Ethernet"):
+        value = "ethernet" + value[len("Ethernet") :]
+    return value if _NAME.fullmatch(value) else None
+
+
+def vm_interface_identity(row):
+    """Recheck the reviewed diagnostic identity independently of native field values."""
+    if not isinstance(row, dict):
+        return None
+    raw_name, port, bus = (row.get(field) for field in ("raw_name", "base_os_port", "base_os_bus"))
+    if (
+        not isinstance(raw_name, str)
+        or not raw_name
+        or raw_name != raw_name.strip()
+        or any(char.isspace() or ord(char) < 32 for char in raw_name)
+        or not isinstance(port, str)
+        or re.fullmatch(r"[A-Za-z0-9_.:-]+", port) is None
+        or not isinstance(bus, str)
+        or re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\.[0-7]", bus) is None
+    ):
+        return None
+    name = canonical_vm_interface_name(raw_name) or raw_name
+    if row.get("name") != name:
+        return None
+    return name, raw_name, port, bus.lower()
+
+
+def parse_vm_interfaces(output):
+    """Accept complete guest enumeration, retaining management/unknown kinds as observations."""
+    result = _result(output, VM_INTERFACES)
+    rows = []
+    names, ports, buses = set(), set(), set()
+    for entry in result:
+        if entry.tag != "entry" or entry.attrib:
+            raise DiscoveryError("VM interface inventory has an unsupported row structure")
+        _container(entry)
+        for child in entry:
+            if child.attrib or len(child):
+                raise DiscoveryError("VM interface inventory requires scalar row fields")
+            _text(entry, child.tag)
+        raw_name = _text(entry, "Interface_name")
+        row = {
+            "name": canonical_vm_interface_name(raw_name) or raw_name,
+            "raw_name": raw_name,
+            "base_os_port": _text(entry, "Base-OS_port"),
+            "base_os_bus": _text(entry, "Base-OS_BUS"),
+            "base_os_mac": _text(entry, "Base-OS_MAC"),
+            "fields": _operational_row(entry),
+        }
+        identity = vm_interface_identity(row)
+        if identity is None:
+            raise DiscoveryError("VM interface inventory has missing or invalid guest identity")
+        name, _, port, bus = identity
+        if name in names or port in ports or bus in buses:
+            raise DiscoveryError("VM interface inventory has duplicate guest identities")
+        names.add(name)
+        ports.add(port)
+        buses.add(bus)
+        rows.append(row)
+    return rows
 
 
 def observed_physical_ethernet(fact, name):
@@ -282,32 +364,142 @@ def parse_interfaces(output, applied):
     return interfaces, excluded, warnings, observations
 
 
-def collect(client, *, use_ntc_defaults=False):
-    """Three fixed structured reads; guessing never changes PAN-OS facts."""
+def _merge_vm_interfaces(interfaces, excluded, warnings, observations, vm_rows, applied):
+    """Supplement absent hardware rows with independently observed guest adapters."""
+    hardware_names = {
+        canonical_vm_interface_name(row["name"]) or row["name"]
+        for row in observations
+        if row["hardware"]
+    }
+    vm_names = {row["name"] for row in vm_rows if canonical_vm_interface_name(row["raw_name"])}
+    if any(_NAME.fullmatch(name) and name not in vm_names for name in hardware_names):
+        raise DiscoveryError("Operational and VM interface inventories disagree on guest names")
+    observations_by_name = {row["name"]: row for row in observations}
+    for row in vm_rows:
+        name = row["name"]
+        config = applied.get(name)
+        if name in observations_by_name:
+            observations_by_name[name]["vm"] = row
+        else:
+            observations.append(
+                {
+                    "name": name,
+                    "hardware": [],
+                    "logical": [],
+                    "applied": _applied_observation(config),
+                    "vm": row,
+                }
+            )
+        if not _NAME.fullmatch(name):
+            excluded.append({"name": name, "reason": "VM management or unknown interface kind"})
+            continue
+        if name in hardware_names:
+            # A debug row must not repair an existing ambiguous hw/ifnet join.
+            continue
+        excluded[:] = [item for item in excluded if item["name"] != name]
+        state = _text(config, "link-state") if config is not None else None
+        enabled = {"up": True, "down": False}.get(state)
+        if enabled is None:
+            warnings.append("%s: applied administrative state is unresolved" % name)
+        mtu_raw = _text(config, "layer3/mtu") if config is not None else None
+        mtu = configured_mtu(mtu_raw)
+        if mtu_raw is not None and mtu is None:
+            warnings.append("%s: invalid applied MTU; left unresolved" % name)
+        comment = _text(config, "comment") if config is not None else None
+        interfaces.append(
+            {
+                "name": name,
+                "type": None,
+                "type_source": None,
+                "enabled": enabled,
+                "description": comment,
+                "mtu": mtu,
+                "mac_address": None,
+                "speed": None,
+                "duplex": None,
+                "port_type": None,
+                "mgmt_only": None,
+                "physical_ethernet": False,
+                "source": {
+                    "contract": "panos-vm-interface-v1",
+                    "enumeration_command": VM_INTERFACES,
+                    "enumeration_path": "result/entry",
+                    "raw_name": row["raw_name"],
+                    "name": name,
+                    "base_os_port": row["base_os_port"],
+                    "base_os_bus": row["base_os_bus"],
+                    "applied_command": RUNNING_INTERFACES,
+                    "applied_path": "result/interface/ethernet/entry",
+                    "link_state": state,
+                    "comment": comment,
+                    "mtu": mtu_raw,
+                },
+            }
+        )
+        warnings.append(
+            "%s: native type requires an exact DeviceType template; capability unresolved" % name
+        )
+    interfaces.sort(key=lambda row: row["name"])
+    observations.sort(key=lambda row: row["name"])
+
+
+def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None):
+    """Three fixed reads plus KVM guest enumeration; guessing never changes facts."""
     if type(use_ntc_defaults) is not bool:
         raise ValueError("Use NTC defaults when guessing must be true or false")
+    if expected_vm_uuid is not None:
+        canonical_expected = canonical_vm_uuid(expected_vm_uuid)
+        if canonical_expected is None:
+            raise ValueError("Expected PAN-OS VM UUID must be a non-sentinel canonical UUID")
+        expected_vm_uuid = canonical_expected
     identity, system = parse_system_info(client.run(SYSTEM_INFO))
     operational = client.run(INTERFACES)
     applied = parse_running_interfaces(client.run(RUNNING_INTERFACES))
     interfaces, excluded, warnings, observations = parse_interfaces(operational, applied)
+    vm_rows = None
+    if (
+        identity.get("model") == "PA-VM"
+        and system.get("family") == "vm"
+        and system.get("vm-mode") == "KVM"
+    ):
+        vm_rows = parse_vm_interfaces(client.run(VM_INTERFACES))
+        _merge_vm_interfaces(interfaces, excluded, warnings, observations, vm_rows, applied)
     if not interfaces:
         warnings.append(
             "No eligible Ethernet ports reported; this does not establish "
             "complete hardware inventory"
         )
     if system.get("vm-license") == "none":
-        warnings.append("VM-Series reports no license; dataplane interface coverage is unverified")
+        warnings.append("VM-Series reports no license; dataplane MAC uniqueness is not established")
+    binding = None
+    if expected_vm_uuid is not None:
+        binding = {
+            "contract": "panos-vm-identity-v1",
+            "system_command": SYSTEM_INFO,
+            "system_path": "result/system",
+            "expected_uuid": expected_vm_uuid,
+            "observed_uuid": canonical_vm_uuid(system.get("vm-uuid")),
+            "model": identity.get("model"),
+            "family": system.get("family"),
+            "vm_mode": system.get("vm-mode"),
+        }
+    sources = {
+        "identity": {"command": SYSTEM_INFO, "path": "result/system"},
+        "interfaces": {"command": INTERFACES, "path": "result/hw/entry"},
+        "applied_configuration": {"command": RUNNING_INTERFACES, "path": "result/interface"},
+    }
+    collected_observations = {"system": system, "interfaces": observations}
+    if vm_rows is not None:
+        sources["vm_interfaces"] = {"command": VM_INTERFACES, "path": "result/entry"}
+        collected_observations["vm_interfaces"] = vm_rows
     return {
         "adapter": "panos",
         "schema_version": 1,
         "identity": identity,
+        "identity_binding": binding,
         "interfaces": interfaces,
         "excluded_interfaces": excluded,
         "warnings": warnings,
-        "observations": {"system": system, "interfaces": observations},
-        "sources": {
-            "identity": {"command": SYSTEM_INFO, "path": "result/system"},
-            "interfaces": {"command": INTERFACES, "path": "result/hw/entry"},
-            "applied_configuration": {"command": RUNNING_INTERFACES, "path": "result/interface"},
-        },
+        "observations": collected_observations,
+        "sources": sources,
     }

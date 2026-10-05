@@ -5,13 +5,14 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from tests import test_discovery_job
+from tests import test_discovery_job, test_panos, test_reconcile
 from tests._loader import FIXTURES, load
 from tests.test_reconcile import apply_to_snapshot
 
 reconcile = load("reconcile")
 ssh = load("transport_ssh")
 panos = load("adapters.panos")
+VM_UUID = "7ec6197d-9b3b-4b52-8d47-4c2167208938"
 
 
 def discovery(**interface_values):
@@ -75,6 +76,47 @@ def inventory():
     }
 
 
+def vm_discovery(**interface_values):
+    result = discovery(**interface_values)
+    result["identity"]["serial"] = None
+    result["observations"] = {
+        "system": {"family": "vm", "vm-mode": "KVM", "vm-uuid": VM_UUID, "vm-license": "none"}
+    }
+    result["sources"] = {"identity": {"command": ssh.SYSTEM_INFO, "path": "result/system"}}
+    result["identity_binding"] = {
+        "contract": "panos-vm-identity-v1",
+        "system_command": ssh.SYSTEM_INFO,
+        "system_path": "result/system",
+        "expected_uuid": VM_UUID,
+        "observed_uuid": VM_UUID,
+        "model": "PA-VM",
+        "family": "vm",
+        "vm_mode": "KVM",
+    }
+    return result
+
+
+def vm_guest_discovery():
+    outputs = test_panos.vm_payloads()
+    outputs[ssh.SYSTEM_INFO] = outputs[ssh.SYSTEM_INFO].replace(
+        "22222222-2222-4222-8222-222222222222", VM_UUID
+    )
+    return panos.collect(SimpleNamespace(run=outputs.__getitem__), expected_vm_uuid=VM_UUID)
+
+
+def vm_guest_inventory(source):
+    before = inventory()
+    before["device"].update(
+        name=source["identity"]["hostname"],
+        serial="",
+        software_version=source["identity"]["software_version"],
+    )
+    before["interface_templates"] = [
+        {"name": "ethernet1/%d" % port, "type": "virtual"} for port in (1, 2, 3)
+    ]
+    return before
+
+
 class PanosReconciliationTests(unittest.TestCase):
     def test_production_collector_sources_validate_and_repeat_with_native_templates(self):
         outputs = {
@@ -105,6 +147,189 @@ class PanosReconciliationTests(unittest.TestCase):
         self.assertEqual(second["interface_updates"], [])
         self.assertEqual(second["device_updates"], [])
         self.assertEqual(second["conflicts"], [])
+
+    def test_production_collector_vm_binding_crosses_the_planner_contract(self):
+        system = (FIXTURES / "panos_system_info.txt").read_text()
+        system = system.replace("<model>PA-5250</model>", "<model>PA-VM</model>")
+        system = system.replace("<family>5200</family>", "<family>vm</family>")
+        system = system.replace("<serial>013201000001</serial>", "<serial>unknown</serial>")
+        system = system.replace(
+            "</system>",
+            "<vm-mode>KVM</vm-mode><vm-license>none</vm-license>"
+            "<vm-uuid>%s</vm-uuid></system>" % VM_UUID.upper(),
+        )
+        outputs = {
+            ssh.SYSTEM_INFO: system,
+            ssh.INTERFACES: (FIXTURES / "panos_interfaces.txt").read_text(),
+            ssh.RUNNING_INTERFACES: (FIXTURES / "panos_applied_interfaces.xml").read_text(),
+            ssh.VM_INTERFACES: (FIXTURES / "panos_vm_guest_interfaces.xml")
+            .read_text()
+            .replace("Ethernet1/3", "Ethernet1/7"),
+        }
+        source = panos.collect(
+            SimpleNamespace(run=outputs.__getitem__), expected_vm_uuid=VM_UUID.upper()
+        )
+        before = inventory()
+        before["device"].update(
+            name=source["identity"]["hostname"],
+            model="PA-VM",
+            serial="",
+            software_version=source["identity"]["software_version"],
+        )
+        before["interface_templates"] = [
+            {"name": "ethernet1/%d" % port, "type": "virtual"} for port in (1, 2, 7)
+        ]
+        plan = reconcile.build_plan(source, before)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(len(plan["interface_creates"]), 3)
+        self.assertEqual(plan["identity_binding"]["expected_uuid"], VM_UUID)
+        self.assertEqual(plan["identity_binding"]["observed_uuid"], VM_UUID)
+        self.assertIsNone(source["identity"]["serial"])
+        self.assertFalse(any(row["field"] == "serial" for row in plan["device_updates"]))
+
+    def test_live_vm_source_with_empty_hw_creates_only_explicitly_configured_ports(self):
+        source = vm_guest_discovery()
+        before = vm_guest_inventory(source)
+        plan = reconcile.build_plan(source, before)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(
+            [row["name"] for row in plan["interface_creates"]], ["ethernet1/1", "ethernet1/2"]
+        )
+        self.assertEqual([row["enabled"] for row in plan["interface_creates"]], [True, False])
+        self.assertEqual({row["type"] for row in plan["interface_creates"]}, {"virtual"})
+        self.assertIn(
+            {"name": "ethernet1/3", "reason": "unknown admin state"}, plan["excluded_interfaces"]
+        )
+        for row in plan["interface_creates"]:
+            for field in ("mac_address", "speed", "duplex", "port_type", "mgmt_only"):
+                self.assertIsNone(row[field])
+        repeated = reconcile.build_plan(source, apply_to_snapshot(plan, before))
+        self.assertFalse(repeated["errors"])
+        self.assertEqual(repeated["interface_creates"], [])
+        self.assertEqual(repeated["interface_updates"], [])
+        self.assertEqual(repeated["device_updates"], [])
+
+    def test_actual_post_commit_vm_source_applies_only_explicit_admin_and_repeats(self):
+        outputs = test_panos.vm_post_commit_payloads()
+        source = panos.collect(
+            SimpleNamespace(run=outputs.__getitem__),
+            expected_vm_uuid="22222222-2222-4222-8222-222222222222",
+        )
+        before = vm_guest_inventory(source)
+        plan = reconcile.build_plan(source, before)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(
+            [row["name"] for row in plan["interface_creates"]], ["ethernet1/1", "ethernet1/2"]
+        )
+        self.assertEqual([row["enabled"] for row in plan["interface_creates"]], [True, False])
+        self.assertEqual([row["mtu"] for row in plan["interface_creates"]], [1400, 1500])
+        self.assertIn(
+            {"name": "ethernet1/3", "reason": "unknown admin state"}, plan["excluded_interfaces"]
+        )
+        self.assertFalse(any(row["field"] == "serial" for row in plan["device_updates"]))
+        after = apply_to_snapshot(plan, before)
+        self.assertEqual(after["device"]["serial"], "")
+        repeated = reconcile.build_plan(source, after)
+        self.assertFalse(repeated["errors"])
+        self.assertEqual(repeated["interface_creates"], [])
+        self.assertEqual(repeated["interface_updates"], [])
+        self.assertEqual(repeated["device_updates"], [])
+
+    def test_vm_enumeration_does_not_supply_a_native_type_without_exact_templates(self):
+        source = vm_guest_discovery()
+        before = vm_guest_inventory(source)
+        before["interface_templates"] = []
+        plan = reconcile.build_plan(source, before)
+        self.assertFalse(plan["errors"])
+        self.assertEqual(plan["interface_creates"], [])
+        self.assertEqual(plan["unknown_interface_capabilities"], [])
+
+    def test_vm_enumeration_fact_provenance_is_independently_required(self):
+        mutations = (
+            ("enumeration_command", "debug show vm-series interfaces text"),
+            ("enumeration_path", "result/hw/entry"),
+            ("raw_name", "Ethernet1/2"),
+            ("raw_name", "ethernet1/1"),
+            ("name", "ethernet1/2"),
+            ("base_os_port", "eth9"),
+            ("base_os_bus", "0000:00:16.0"),
+            ("applied_command", "show config candidate"),
+            ("applied_path", "result/candidate/interface/ethernet/entry"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field, value=value):
+                source = vm_guest_discovery()
+                before = vm_guest_inventory(source)
+                source["interfaces"][0]["source"][field] = value
+                self.assertTrue(reconcile.build_plan(source, before)["errors"])
+        source = vm_guest_discovery()
+        before = vm_guest_inventory(source)
+        source["interfaces"][2]["source"]["name"] = "ethernet1/99"
+        self.assertTrue(reconcile.build_plan(source, before)["errors"])
+
+    def test_vm_enumeration_observation_and_source_tampering_blocks(self):
+        mutations = (
+            ("vm_source", "command", "show interface hardware"),
+            ("vm_source", "path", "result/hw/entry"),
+            ("identity_source", "command", "show system peer info"),
+            ("identity_source", "path", "result/peer/system"),
+            ("system", "family", "hardware"),
+            ("system", "vm-mode", "ESXi"),
+            ("observation", "base_os_port", "eth99"),
+            ("observation", "base_os_bus", "0000:00:19.0"),
+            ("observation", "raw_name", "Ethernet1/99"),
+        )
+        for scope, field, value in mutations:
+            with self.subTest(scope=scope, field=field):
+                source = vm_guest_discovery()
+                before = vm_guest_inventory(source)
+                {
+                    "vm_source": source["sources"]["vm_interfaces"],
+                    "identity_source": source["sources"]["identity"],
+                    "system": source["observations"]["system"],
+                    "observation": source["observations"]["vm_interfaces"][0],
+                }[scope][field] = value
+                self.assertTrue(reconcile.build_plan(source, before)["errors"])
+
+    def test_vm_enumeration_duplicate_proof_and_hardware_override_block(self):
+        for field in ("name", "base_os_port", "base_os_bus"):
+            with self.subTest(field=field):
+                source = vm_guest_discovery()
+                before = vm_guest_inventory(source)
+                rows = source["observations"]["vm_interfaces"]
+                rows[1][field] = rows[0][field]
+                self.assertTrue(reconcile.build_plan(source, before)["errors"])
+        source = vm_guest_discovery()
+        before = vm_guest_inventory(source)
+        source["observations"]["interfaces"][0]["hardware"] = [{"field": "id", "text": "16"}]
+        self.assertTrue(reconcile.build_plan(source, before)["errors"])
+
+    def test_vm_enumeration_mac_never_becomes_native_identity_or_a_write(self):
+        source = vm_guest_discovery()
+        before = vm_guest_inventory(source)
+        for observation in source["observations"]["vm_interfaces"]:
+            observation["base_os_mac"] = "duplicate-or-unknown"
+        plan = reconcile.build_plan(source, before)
+        self.assertFalse(plan["errors"])
+        self.assertTrue(all(row["mac_address"] is None for row in plan["interface_creates"]))
+
+    def test_collector_rejects_invalid_expected_uuid_before_reads(self):
+        for value in (True, [], "unknown", "00000000-0000-0000-0000-000000000000"):
+            with self.subTest(value=value):
+                client = Mock()
+                with self.assertRaisesRegex(ValueError, "VM UUID"):
+                    panos.collect(client, expected_vm_uuid=value)
+                client.run.assert_not_called()
+
+    def test_repeated_or_nested_vm_uuid_is_failed_identity_evidence(self):
+        system = (FIXTURES / "panos_system_info.txt").read_text()
+        for extra in (
+            "<vm-uuid>%s</vm-uuid><vm-uuid>%s</vm-uuid>" % (VM_UUID, VM_UUID),
+            "<vm-uuid><nested>%s</nested></vm-uuid>" % VM_UUID,
+        ):
+            with self.subTest(extra=extra):
+                with self.assertRaises(panos.DiscoveryError):
+                    panos.parse_system_info(system.replace("</system>", extra + "</system>"))
 
     def test_explicit_mtu_native_bounds_are_shared_with_adapter(self):
         before = inventory()
@@ -284,6 +509,126 @@ class PanosReconciliationTests(unittest.TestCase):
         self.assertFalse(any(row["field"] == "serial" for row in plan["device_updates"]))
         self.assertEqual(before["device"]["serial"], "LABPAN00001")
 
+    def test_explicit_vm_identity_allows_missing_serial_and_remains_blank_on_repeat(self):
+        source, before = vm_discovery(enabled=False), inventory()
+        before["device"]["serial"] = ""
+        before["interface_templates"] = [{"name": "ethernet1/1", "type": "virtual"}]
+        original_source, original_inventory = deepcopy(source), deepcopy(before)
+        first = reconcile.build_plan(source, before)
+        self.assertFalse(first["errors"])
+        self.assertEqual(first["identity_binding"]["observed_uuid"], VM_UUID)
+        self.assertEqual(first["interface_creates"][0]["type"], "virtual")
+        self.assertIs(first["interface_creates"][0]["enabled"], False)
+        self.assertFalse(any(row["field"] == "serial" for row in first["device_updates"]))
+        after = apply_to_snapshot(first, before)
+        self.assertEqual(after["device"]["serial"], "")
+        second = reconcile.build_plan(source, after)
+        self.assertFalse(second["errors"])
+        self.assertEqual(second["device_updates"], [])
+        self.assertEqual(second["interface_creates"], [])
+        self.assertEqual(second["interface_updates"], [])
+        self.assertEqual(source, original_source)
+        self.assertEqual(before, original_inventory)
+
+    def test_unlicensed_vm_without_explicit_binding_still_requires_serial(self):
+        source, before = vm_discovery(), inventory()
+        before["device"]["serial"] = ""
+        source.pop("identity_binding")
+        plan = reconcile.build_plan(source, before)
+        self.assertIn("Discovery did not provide required identity field: serial", plan["errors"])
+        self.assertNotIn("identity_binding", plan)
+
+    def test_vm_identity_never_bypasses_a_populated_selected_serial(self):
+        source, before = vm_discovery(), inventory()
+        plan = reconcile.build_plan(source, before)
+        self.assertIn("Discovery did not provide required identity field: serial", plan["errors"])
+        self.assertEqual(before["device"]["serial"], "LABPAN00001")
+        self.assertFalse(any(row["field"] == "serial" for row in plan["device_updates"]))
+
+    def test_vm_binding_requires_matching_nonzero_uuid_and_reviewed_source(self):
+        mutations = (
+            ("binding", "contract", "panos-vm-identity-v2"),
+            ("binding", "system_command", "show system info text"),
+            ("binding", "system_path", "result/peer/system"),
+            ("binding", "model", "PA-440"),
+            ("binding", "family", "400"),
+            ("binding", "vm_mode", "ESXi"),
+            ("binding", "expected_uuid", None),
+            ("binding", "expected_uuid", True),
+            ("binding", "expected_uuid", "unknown"),
+            ("binding", "expected_uuid", "00000000-0000-0000-0000-000000000000"),
+            ("binding", "expected_uuid", "b924dbfd-1b08-4e22-ae0e-71164c2257c9"),
+            ("binding", "observed_uuid", None),
+            ("binding", "observed_uuid", "b924dbfd-1b08-4e22-ae0e-71164c2257c9"),
+            ("system", "vm-uuid", None),
+            ("system", "vm-uuid", "b924dbfd-1b08-4e22-ae0e-71164c2257c9"),
+            ("system", "family", "hardware"),
+            ("system", "vm-mode", "ESXi"),
+            ("source", "command", "show system peer info"),
+            ("source", "path", "result/peer/system"),
+            ("identity", "model", "PA-440"),
+            ("device", "model", "PA-440"),
+        )
+        for scope, field, value in mutations:
+            with self.subTest(scope=scope, field=field, value=value):
+                source, before = vm_discovery(), inventory()
+                before["device"]["serial"] = ""
+                target = {
+                    "binding": source["identity_binding"],
+                    "system": source["observations"]["system"],
+                    "source": source["sources"]["identity"],
+                    "identity": source["identity"],
+                    "device": before["device"],
+                }[scope]
+                target[field] = value
+                plan = reconcile.build_plan(source, before)
+                self.assertTrue(plan["errors"])
+                self.assertNotIn("identity_binding", plan)
+                self.assertIn(
+                    "Discovery did not provide required identity field: serial", plan["errors"]
+                )
+
+    def test_malformed_vm_identity_structures_block_without_crashing(self):
+        for field, value in (
+            ("identity_binding", []),
+            ("observations", []),
+            ("sources", None),
+        ):
+            with self.subTest(field=field):
+                source, before = vm_discovery(), inventory()
+                before["device"]["serial"] = ""
+                source[field] = value
+                self.assertTrue(reconcile.build_plan(source, before)["errors"])
+
+    def test_explicit_vm_binding_also_validates_licensed_identity(self):
+        source, before = vm_discovery(), inventory()
+        source["identity"]["serial"] = before["device"]["serial"]
+        self.assertFalse(reconcile.build_plan(source, before)["errors"])
+        source["identity_binding"]["expected_uuid"] = "b924dbfd-1b08-4e22-ae0e-71164c2257c9"
+        self.assertTrue(reconcile.build_plan(source, before)["errors"])
+        source["identity_binding"]["expected_uuid"] = VM_UUID
+        source["identity"]["serial"] = "CONFLICTING-SERIAL"
+        self.assertTrue(reconcile.build_plan(source, before)["errors"])
+
+    def test_physical_panos_serial_remains_required_with_copied_vm_binding(self):
+        source, before = vm_discovery(), inventory()
+        before["device"].update(model="PA-440", serial="")
+        source["identity"]["model"] = "PA-440"
+        source["identity_binding"]["model"] = "PA-440"
+        source["observations"]["system"].update(family="400", **{"vm-mode": None})
+        source["identity_binding"].update(family="400", vm_mode=None)
+        plan = reconcile.build_plan(source, before)
+        self.assertIn("Discovery did not provide required identity field: serial", plan["errors"])
+
+    def test_cisco_required_serial_cannot_be_bypassed_by_copied_vm_binding(self):
+        source, before = test_reconcile.discovery(), test_reconcile.inventory()
+        source["identity"]["serial"] = None
+        before["device"]["serial"] = ""
+        source["identity_binding"] = vm_discovery()["identity_binding"]
+        plan = reconcile.build_plan(source, before)
+        self.assertIn("Discovery did not provide required identity field: serial", plan["errors"])
+        self.assertNotIn("identity_binding", plan)
+
     def test_applied_field_provenance_is_required_for_every_native_write(self):
         mutations = (
             ("contract", "unknown-contract"),
@@ -380,7 +725,34 @@ class PanosJobTests(unittest.TestCase):
         self.job.run(self.device, use_ntc_defaults=True)
         messages = test_discovery_job.rendered_logs(self.job.logger)
         self.assertTrue(any("applies only to Cisco IOS XE" in message for message in messages))
-        self.module.panos.collect.assert_called_once_with(self.client, use_ntc_defaults=True)
+        self.module.panos.collect.assert_called_once_with(
+            self.client, use_ntc_defaults=True, expected_vm_uuid=None
+        )
+
+    def test_expected_vm_uuid_is_canonicalized_forwarded_and_reported(self):
+        self.job.run(self.device, expected_vm_uuid=VM_UUID.upper())
+        self.module.panos.collect.assert_called_once_with(
+            self.client, use_ntc_defaults=False, expected_vm_uuid=VM_UUID
+        )
+        self.assertEqual(self.job.request.meta["discovery_report"]["expected_vm_uuid"], VM_UUID)
+
+    def test_invalid_expected_vm_uuid_fails_before_credentials_or_transport(self):
+        for value in (True, 123, [], "unknown", "00000000-0000-0000-0000-000000000000"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "VM UUID"):
+                    self.job.run(self.device, expected_vm_uuid=value)
+                self.module.resolve_credentials.assert_not_called()
+                self.ssh.assert_not_called()
+                self.module.panos.collect.assert_not_called()
+
+    def test_non_panos_expected_vm_uuid_fails_before_credentials_or_transport(self):
+        self.device.platform = SimpleNamespace(network_driver="cisco_iosxe", name="IOS XE")
+        self.device.device_type.manufacturer.name = "Cisco"
+        with self.assertRaisesRegex(ValueError, "only for PAN-OS"):
+            self.job.run(self.device, expected_vm_uuid=VM_UUID)
+        self.module.resolve_credentials.assert_not_called()
+        self.module.RestconfClient.assert_not_called()
+        self.ssh.assert_not_called()
 
     def test_panos_errors_close_transport_and_survive_job_exception_boundary(self):
         for error_type in (self.module.SshError, self.module.panos.DiscoveryError):

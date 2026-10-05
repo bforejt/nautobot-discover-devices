@@ -6,8 +6,10 @@ reported serialized hardware inventory, scoped 802.1Q assignments, configured
 static IPv4/IPv6 addressing, and explicitly mapped named VRFs. The first adapter
 supports Cisco IOS XE switches on 17.9
 or later using RESTCONF JSON exclusively. PAN-OS schema v1 adds SSH/XML identity
-and conservative interface collection; see the [PAN-OS contract](docs/panos-discovery.md)
-for the PA-VM 11.2.8 lab evidence and unresolved physical capability.
+and conservative interface collection. The [VM-Series validation contract](docs/panos-vm-validation.md)
+defines explicit UUID binding for PA-VM on KVM and reviewed virtual templates;
+the [first-pass history](docs/panos-discovery.md) records initial lab evidence.
+Physical-appliance capability remains unresolved.
 The job defaults to a preview.
 
 This project targets Nautobot 3.2. Native `SoftwareVersion` is used for
@@ -18,7 +20,15 @@ Module inventory and template suppression.
 
 Verified on the lab's Nautobot 3.2.5 and C9300-48UXM running IOS XE 17.12.8
 and 17.18.4.
-The live worker apply created 57 missing interfaces and enriched one existing
+The PAN-OS live helper also validated PA-VM 11.2.8 on KVM with strict SSH trust
+and guessing disabled: it created two virtual interfaces, filled software
+version 11.2.8, preserved blank serial, and repeated with zero inventory DML.
+A third unconfigured guest adapter remains observed and deferred. Normal
+queued preview/apply/repeat then preserved that populated baseline; a queued
+wrong-UUID apply failed without changing inventory. See the
+[VM-Series evidence](docs/panos-vm-validation.md) for the exact scope and lab
+endpoint setup.
+The Cisco live worker apply created 57 missing interfaces and enriched one existing
 interface; a second worker apply produced zero inventory changes. Real ORM
 checks verified software catalog creation, fill-only
 updates, repeat-run idempotence, and rollback after an injected late validation
@@ -68,8 +78,16 @@ For PAN-OS, select an existing Palo Alto Networks DeviceType and a PAN-OS
 Platform (`paloalto_panos` or `panos`). SSH credentials resolve SSH then Generic
 access in the selected Secrets Group. SSH host-key checking defaults to enabled
 and reads the worker account's known hosts. Use the explicit host-key checkbox
-for a lab connection without installed keys. Cisco-only inventory options and
-the guessing checkbox do not grant PAN-OS new mapping/default rules.
+for a lab connection without installed keys. For PA-VM reporting family `vm`
+and VM mode `KVM`, the optional **Expected PAN-OS VM UUID** input must match
+the exact structured system UUID independently verified on the hypervisor.
+When the firewall supplies no serial, this permits a blank selected Device
+serial to remain blank while preserving all populated serial and
+physical-appliance identity checks. It does not
+require a license or create a serial/custom field. Review exact DeviceType
+interface templates and explicit applied up/down state before creating guest
+adapters; omitted/automatic state remains unresolved. Cisco-only inventory
+options and the guessing checkbox do not grant PAN-OS new mapping/default rules.
 
 The job form contains these inputs:
 
@@ -81,6 +99,7 @@ The job form contains these inputs:
 | RESTCONF port | 443 | Cisco HTTPS port |
 | SSH port | 22 | PAN-OS SSH port |
 | Verify SSH host key | Enabled | Validate PAN-OS host keys against worker known hosts |
+| Expected PAN-OS VM UUID | Blank | Bind selected PA-VM/KVM inventory to an independently verified guest UUID; permit an absent serial without fabricating one |
 | Secrets Group | Device's group | Optional credential override |
 | Interface status | Applicable `Active` | Status for newly created interfaces |
 | Software version status | Applicable `Active` | Status for newly created software versions |
@@ -120,7 +139,8 @@ result data, or download the attached `discovery_<device UUID>.json` report.
 The job does not return the large report into the main **Result Data** field.
 The Advanced data and download include discovered facts,
 structured source fields, YANG module revisions when available, request
-metadata, the TLS verification, port, and NTC-fallback settings, proposed changes, conflicts,
+metadata, TLS/SSH verification, port, expected VM UUID and NTC-fallback settings,
+proposed changes, conflicts,
 exclusions, and missing interfaces. Individual warning messages and field
 conflict values are kept in that report. Expected discovery failures log the
 cause and retain the report under Advanced, as well as attaching a download,
@@ -136,8 +156,12 @@ and module catalogs, Module Bays, Modules, interface ownership, VLANs, and
 tagged-VLAN relationships. Unsaved catalog and component objects are validated
 before an apply is offered.
 Cisco requests are GET-only in both modes. PAN-OS uses three exact read-only
-SSH commands returning XML, plus session presentation settings. No unstructured
-output fallback is present. Authentication values and raw response bodies are omitted
+SSH commands for system, operational interfaces and applied configuration.
+PA-VM reporting family `vm` and VM mode `KVM` also requires the documented
+`debug show vm-series interfaces all` XML read, because healthy operational
+views can omit recognized guest adapters. Its failure blocks collection;
+physical targets keep the original three reads. Session presentation settings
+prepare XML output. No unstructured output fallback is present. Authentication values and raw response bodies are omitted
 from request diagnostics. The report contains inventory facts such as serials,
 MAC addresses, and descriptions.
 
@@ -741,11 +765,12 @@ agree on its interpretation, add an adapter or mapping, review a preview,
 then verify the application and repeat-run behavior. Cisco, Palo Alto,
 OpenGear, Proxmox, and VMware can add collection adapters while preserving
 the reconciliation and Nautobot boundaries. This release's planner accepts
-only the initial Cisco adapter schema until those adapters are introduced.
+the versioned Cisco IOS XE and PAN-OS adapter schemas.
 
-The [PAN-OS discovery handoff](docs/panos-discovery-handoff.md) records the next
+The [PAN-OS discovery handoff](docs/panos-discovery-handoff.md) preserves the
 platform's starting sources, lab prerequisites, modeling decisions and initial
-scope for a new task.
+scope. The current [VM-Series validation contract](docs/panos-vm-validation.md)
+records UUID binding, reviewed interface templates and live validation evidence.
 
 Run offline regressions without a Nautobot installation or lab credentials:
 

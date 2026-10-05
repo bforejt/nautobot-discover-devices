@@ -1,0 +1,20 @@
+<response status="success"><result>
+  <entry>
+    <Interface_name>Ethernet1/1</Interface_name>
+    <Base-OS_port>eth1</Base-OS_port>
+    <Base-OS_MAC>02:00:00:00:00:01</Base-OS_MAC>
+    <Base-OS_BUS>0000:00:13.0</Base-OS_BUS>
+  </entry>
+  <entry>
+    <Interface_name>Ethernet1/2</Interface_name>
+    <Base-OS_port>eth2</Base-OS_port>
+    <Base-OS_MAC>02:00:00:00:00:02</Base-OS_MAC>
+    <Base-OS_BUS>0000:00:14.0</Base-OS_BUS>
+  </entry>
+  <entry>
+    <Interface_name>Ethernet1/3</Interface_name>
+    <Base-OS_port>eth3</Base-OS_port>
+    <Base-OS_MAC>02:00:00:00:00:03</Base-OS_MAC>
+    <Base-OS_BUS>0000:00:15.0</Base-OS_BUS>
+  </entry>
+</result></response>

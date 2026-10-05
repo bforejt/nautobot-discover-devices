@@ -11,7 +11,7 @@ from .reconcile_ipam import plan_ipam
 from .reconcile_route_targets import plan_route_targets
 from .reconcile_stack import plan_stack
 from .reconcile_vlans import plan_vlans
-from .transport_ssh import INTERFACES, RUNNING_INTERFACES
+from .transport_ssh import INTERFACES, RUNNING_INTERFACES, SYSTEM_INFO, VM_INTERFACES
 
 INTERFACE_FIELDS = (
     "type",
@@ -84,18 +84,80 @@ def _equal(field, before, after, *, canonical_version=canonical_software_version
     return before == after
 
 
-def _panos_native_values(fact, name, values, plan):
-    """Require schema-v1 applied evidence for every PAN-OS configured field."""
+def _panos_vm_interface_source(discovery, source, name):
+    """Recheck complete KVM guest enumeration before it can prove a native port."""
+    observations = discovery.get("observations")
+    sources = discovery.get("sources")
+    if not isinstance(observations, dict) or not isinstance(sources, dict):
+        return False
+    system, rows = observations.get("system"), observations.get("vm_interfaces")
+    operational_rows = observations.get("interfaces")
+    identity_source, vm_source = sources.get("identity"), sources.get("vm_interfaces")
+    if (
+        not isinstance(system, dict)
+        or not isinstance(rows, list)
+        or not isinstance(operational_rows, list)
+        or not isinstance(identity_source, dict)
+        or not isinstance(vm_source, dict)
+        or discovery["identity"].get("model") != "PA-VM"
+        or system.get("family") != "vm"
+        or system.get("vm-mode") != "KVM"
+        or identity_source.get("command") != SYSTEM_INFO
+        or identity_source.get("path") != "result/system"
+        or vm_source.get("command") != VM_INTERFACES
+        or vm_source.get("path") != "result/entry"
+        or source.get("enumeration_command") != VM_INTERFACES
+        or source.get("enumeration_path") != "result/entry"
+        or panos.canonical_vm_interface_name(source.get("raw_name")) != name
+    ):
+        return False
+    identities = [panos.vm_interface_identity(row) for row in rows]
+    if any(identity is None for identity in identities):
+        return False
+    for position in (0, 2, 3):
+        if len({identity[position] for identity in identities}) != len(identities):
+            return False
+    observed = [
+        row
+        for row in operational_rows
+        if isinstance(row, dict)
+        and (panos.canonical_vm_interface_name(row.get("name")) or row.get("name")) == name
+    ]
+    if len(observed) != 1 or observed[0].get("hardware") != []:
+        return False
+    names = {identity[0] for identity in identities}
+    if any(
+        isinstance(row, dict)
+        and row.get("hardware")
+        and panos.canonical_vm_interface_name(row.get("name")) is not None
+        and panos.canonical_vm_interface_name(row["name"]) not in names
+        for row in operational_rows
+    ):
+        return False
+    identity = panos.vm_interface_identity(source)
+    return identity is not None and identities.count(identity) == 1
+
+
+def _panos_native_values(discovery, fact, name, values, plan):
+    """Require reviewed enumeration and applied evidence for configured PAN-OS fields."""
     source = fact.get("source")
-    reviewed = (
-        isinstance(source, dict)
-        and source.get("contract") == "panos-interface-v1"
-        and source.get("operational_command") == INTERFACES
-        and source.get("hardware_path") == "result/hw/entry"
-        and source.get("name") == name
-        and source.get("applied_command") == RUNNING_INTERFACES
-        and source.get("applied_path") == "result/interface/ethernet/entry"
-    )
+    reviewed = isinstance(source, dict) and source.get("name") == name
+    vm_contract = isinstance(source, dict) and source.get("contract") == "panos-vm-interface-v1"
+    if reviewed:
+        reviewed = (
+            _panos_vm_interface_source(discovery, source, name)
+            if vm_contract
+            else source.get("contract") == "panos-interface-v1"
+            and source.get("operational_command") == INTERFACES
+            and source.get("hardware_path") == "result/hw/entry"
+        )
+        reviewed = (
+            reviewed
+            and source.get("applied_command") == RUNNING_INTERFACES
+            and source.get("applied_path") == "result/interface/ethernet/entry"
+        )
+    if vm_contract and not reviewed:
+        plan["errors"].append("%s: invalid PAN-OS VM enumeration provenance" % name)
     for field in ("enabled", "description", "mtu"):
         after = values[field]
         if _blank(after):
@@ -114,6 +176,47 @@ def _panos_native_values(fact, name, values, plan):
         if not valid:
             plan["errors"].append("%s: invalid PAN-OS applied %s provenance" % (name, field))
             values[field] = None
+
+
+def _panos_vm_identity(discovery, device, plan):
+    """Verify the selected VM's explicitly supplied identity without fabricating a serial."""
+    binding = discovery.get("identity_binding")
+    if binding is None:
+        return False
+    identity = discovery["identity"]
+    observations = discovery.get("observations")
+    system = observations.get("system") if isinstance(observations, dict) else None
+    sources = discovery.get("sources")
+    source = sources.get("identity") if isinstance(sources, dict) else None
+    if (
+        not isinstance(binding, dict)
+        or not isinstance(system, dict)
+        or not isinstance(source, dict)
+    ):
+        plan["errors"].append("PAN-OS VM identity binding has invalid structured provenance")
+        return False
+    expected = panos.canonical_vm_uuid(binding.get("expected_uuid"))
+    observed = panos.canonical_vm_uuid(binding.get("observed_uuid"))
+    system_uuid = panos.canonical_vm_uuid(system.get("vm-uuid"))
+    reviewed = (
+        binding.get("contract") == "panos-vm-identity-v1"
+        and binding.get("system_command") == SYSTEM_INFO
+        and binding.get("system_path") == "result/system"
+        and source.get("command") == SYSTEM_INFO
+        and source.get("path") == "result/system"
+        and binding.get("model") == identity.get("model") == device.get("model") == "PA-VM"
+        and binding.get("family") == system.get("family") == "vm"
+        and binding.get("vm_mode") == system.get("vm-mode") == "KVM"
+        and expected is not None
+        and expected == observed == system_uuid
+    )
+    if not reviewed:
+        plan["errors"].append(
+            "PAN-OS VM identity binding does not match the reviewed UUID contract"
+        )
+        return False
+    plan["identity_binding"] = dict(binding, expected_uuid=expected, observed_uuid=observed)
+    return True
 
 
 def _management_value(discovery, fact, row, effective_type, plan, conflict):
@@ -256,7 +359,11 @@ def build_plan(discovery, existing):
             {"scope": scope, "name": name, "field": field, "before": before, "observed": after}
         )
 
-    for field in ("serial", "model", "hostname", "software_version"):
+    vm_identity = _panos_vm_identity(discovery, device, plan) if adapter is panos else False
+    required_identity = ["serial", "model", "hostname", "software_version"]
+    if vm_identity and _blank(device.get("serial")):
+        required_identity.remove("serial")
+    for field in required_identity:
         if _blank(identity.get(field)):
             plan["errors"].append("Discovery did not provide required identity field: %s" % field)
     for field in ("serial", "model"):
@@ -329,7 +436,7 @@ def build_plan(discovery, existing):
                         "%s: PAN-OS schema v1 retains %s as report-only evidence" % (name, field)
                     )
                 values[field] = None
-            _panos_native_values(fact, name, values, plan)
+            _panos_native_values(discovery, fact, name, values, plan)
         for field in existing.get("unsupported_interface_fields", []):
             if not _blank(values.get(field)):
                 plan["warnings"].append(

@@ -729,6 +729,10 @@ OpenGear, Proxmox, and VMware can add collection adapters while preserving
 the reconciliation and Nautobot boundaries. This release's planner accepts
 only the initial Cisco adapter schema until those adapters are introduced.
 
+The [PAN-OS discovery handoff](docs/panos-discovery-handoff.md) records the next
+platform's starting sources, lab prerequisites, modeling decisions and initial
+scope for a new task.
+
 Run offline regressions without a Nautobot installation or lab credentials:
 
 ```bash

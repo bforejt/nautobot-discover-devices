@@ -203,8 +203,6 @@ def _ipv6(row):
     if address is None:
         return [], {"dhcp": False, "autoconfig": False}
     address = _object(address)
-    if _has(address, "prefix-name"):
-        raise _ScopedDataError("Named IPv6 prefixes require additional structured resolution")
     configuration = {}
     for method in ("dhcp", "autoconfig"):
         value = _value(address, method)
@@ -213,13 +211,17 @@ def _ipv6(row):
         configuration[method] = value is not None
     result = []
     prefixes = _value(address, "prefix-list")
+    seen_prefixes = set()
     for entry in _rows(prefixes) if prefixes is not None else []:
         configured_prefix = _text(_value(entry, "prefix"))
         if "/" not in configured_prefix:
             raise _ScopedDataError("Configured IPv6 prefix length is missing")
         prefix = ipaddress.IPv6Interface(configured_prefix)
-        if prefix.ip.is_unspecified:
-            raise _ScopedDataError("IPv6 prefix lacks an address")
+        if prefix.ip.is_unspecified or prefix.ip.is_multicast or prefix.scope_id is not None:
+            raise _ScopedDataError("IPv6 prefix lacks an unambiguous unicast address")
+        if str(prefix) in seen_prefixes:
+            raise _ScopedDataError("Duplicate configured IPv6 prefixes")
+        seen_prefixes.add(str(prefix))
         flags = {}
         for flag in ("eui-64", "anycast"):
             if _has(entry, flag) and _value(entry, flag) != [None]:
@@ -227,11 +229,39 @@ def _ipv6(row):
             flags[flag.replace("-", "_")] = _has(entry, flag)
         result.append({"configured_prefix": str(prefix), "method": "configured", **flags})
     link_local = _value(address, "link-local-address")
-    for entry in _rows(link_local) if link_local is not None else []:
+    link_local_rows = _rows(link_local) if link_local is not None else []
+    link_local_container = _value(address, "link-local-address-container")
+    if link_local_container is not None:
+        link_local_rows = link_local_rows + [_object(link_local_container)]
+    seen_link_local = set()
+    for entry in link_local_rows:
         host = ipaddress.IPv6Address(_text(_value(entry, "address")))
-        if not host.is_link_local or _value(entry, "link-local") != [None]:
+        if (
+            not host.is_link_local
+            or host.scope_id is not None
+            or _value(entry, "link-local") != [None]
+            or str(host) in seen_link_local
+        ):
             raise _ScopedDataError("Malformed configured IPv6 link-local address")
+        seen_link_local.add(str(host))
         result.append({"address": str(host), "method": "configured-link-local"})
+    named_prefixes = _value(address, "prefix-name")
+    seen_names = set()
+    for entry in _rows(named_prefixes) if named_prefixes is not None else []:
+        name = _text(_value(entry, "name"))
+        if name in seen_names:
+            raise _ScopedDataError("Duplicate named IPv6 prefix references")
+        seen_names.add(name)
+        # General-prefix sub-bits cannot establish a complete configured host
+        # without separately resolving the named prefix. Preserve this scoped
+        # observation without discarding independent literal IPv6 or IPv4 data.
+        result.append(
+            {
+                "method": "configured-named-prefix",
+                "prefix_name": name,
+                "configuration": deepcopy(entry),
+            }
+        )
     return result, configuration
 
 

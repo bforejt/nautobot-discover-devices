@@ -20,6 +20,13 @@ from nautobot.ipam.models import (
 
 from .adapters.cisco_iosxe import canonical_interface_name
 from .exceptions import InventoryError
+from .nautobot_route_targets import (
+    route_target_objects,
+    save_route_target_assignments,
+    save_route_target_catalog,
+    snapshot_route_targets,
+    validate_route_target_objects,
+)
 
 
 def _id(value):
@@ -106,6 +113,7 @@ def snapshot_ipam(device, policy, *, lock=False, discovery=None):
         .order_by("pk"),
         lock,
     )
+    route_targets = snapshot_route_targets(vrfs, lock=lock)
     return {
         "supported": True,
         "policy": copy.deepcopy(policy),
@@ -121,9 +129,11 @@ def snapshot_ipam(device, policy, *, lock=False, discovery=None):
                 "name": row.name,
                 "namespace_id": str(row.namespace_id),
                 "rd": row.rd,
+                **route_targets["relationships"][str(row.pk)],
             }
             for row in vrfs
         ],
+        "route_targets": route_targets["route_targets"],
         "vrf_device_assignments": [
             {
                 "id": str(row.pk),
@@ -292,6 +302,7 @@ def ipam_objects(plan, interfaces, device, *, prefix_status, ip_address_status, 
             )
         )
         objects["ip_assignments"][spec["key"]] = assignment
+    objects["route_targets"] = route_target_objects(plan, objects["vrfs"], device)
     return objects
 
 
@@ -434,7 +445,7 @@ def validate_ipam_objects(objects, device):
     for spec in plan["prefixes"]:
         prefix = objects["prefixes"][spec["key"]]
         if (
-            str(prefix.prefix) != spec["prefix"]
+            ipaddress.ip_network(str(prefix.prefix)) != ipaddress.ip_network(spec["prefix"])
             or str(prefix.namespace_id) != str(spec["namespace_id"])
             or prefix.type != spec["type"]
             or spec["create"]
@@ -454,7 +465,10 @@ def validate_ipam_objects(objects, device):
     for spec in plan["ip_addresses"]:
         address = objects["ip_addresses"][spec["key"]]
         parent = objects["prefixes"][spec["parent_key"]]
-        if str(address.host) != spec["host"] or address.mask_length != spec["mask_length"]:
+        if (
+            ipaddress.ip_address(str(address.host)) != ipaddress.ip_address(spec["host"])
+            or address.mask_length != spec["mask_length"]
+        ):
             raise InventoryError("An existing IP Address host or mask must be preserved")
         closest = _closest(graph, parent.namespace_id, address.host)["object"]
         if closest.pk != parent.pk:
@@ -499,11 +513,13 @@ def validate_ipam_objects(objects, device):
         assignment.full_clean(
             exclude=_exclude_new_relations(assignment, ("ip_address", "interface"))
         )
+    validate_route_target_objects(objects["route_targets"], device)
 
 
 def save_ipam_catalog(objects, device):
     """Persist routing parents before interfaces inside the caller's transaction."""
     validate_ipam_objects(objects, device)
+    save_route_target_catalog(objects["route_targets"])
     for spec in objects["plan"]["vrfs"]:
         if spec["create"] or spec.get("changes"):
             objects["vrfs"][spec["key"]].validated_save()
@@ -526,6 +542,7 @@ def save_ipam_catalog(objects, device):
             address.validated_save()
         else:
             objects["ip_addresses"][spec["key"]].refresh_from_db()
+    save_route_target_assignments(objects["route_targets"], device)
 
 
 def save_ipam_assignments(objects, device):

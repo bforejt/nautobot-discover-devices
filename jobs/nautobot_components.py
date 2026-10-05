@@ -23,7 +23,11 @@ def _scope_device_ids(device, discovery):
     serials = set()
     source = (discovery or {}).get("components", {})
     source = source if isinstance(source, dict) else {}
-    for rows in (source.get("items", []), source.get("physical_bays", [])):
+    for rows in (
+        source.get("items", []),
+        source.get("identities", []),
+        source.get("physical_bays", []),
+    ):
         if isinstance(rows, list):
             serials.update(
                 row["device_serial"].strip()
@@ -79,9 +83,18 @@ def snapshot_components(device, *, lock=False, discovery=None):
         return {"supported": False}
     source = (discovery or {}).get("components")
     raw_items = source.get("items", []) if isinstance(source, dict) else []
-    items = (
+    placed_items = (
         [row for row in raw_items if isinstance(row, dict)] if isinstance(raw_items, list) else []
     )
+    raw_identities = source.get("identities", []) if isinstance(source, dict) else []
+    identities = (
+        [row for row in raw_identities if isinstance(row, dict)]
+        if isinstance(raw_identities, list)
+        else []
+    )
+    # A placement-free identity must see the same complete manufacturer catalog
+    # on every run, including operator model aliases and conflicting PIDs.
+    items = placed_items + identities
     manufacturers = list(_locked(Manufacturer.objects.all().order_by("pk"), lock))
     module_query = Module.objects.all()
     scoped_ids = _scope_device_ids(device, discovery)

@@ -1,11 +1,13 @@
 """Pure, fill-only reconciliation. Building a plan never writes to Nautobot."""
 
+import re
 from collections import defaultdict
 
 from .adapters.cisco_iosxe import canonical_interface_name, canonical_software_version
 from .reconcile_components import plan_components
 from .reconcile_console import plan_console_ports, reviewed_profile
 from .reconcile_ipam import plan_ipam
+from .reconcile_route_targets import plan_route_targets
 from .reconcile_stack import plan_stack
 from .reconcile_vlans import plan_vlans
 
@@ -21,6 +23,38 @@ INTERFACE_FIELDS = (
     "mgmt_only",
 )
 COPPER_DUPLEX_TYPES = {"100base-tx", "1000base-t", "2.5gbase-t", "5gbase-t", "10gbase-t"}
+UNKNOWN_ETHERNET_TYPE_SOURCE = (
+    "Observed IANA Ethernet interface; maximum physical capability unknown; "
+    "Nautobot Other is an explicit unknown capability placeholder"
+)
+_PHYSICAL_ETHERNET_NAME = re.compile(
+    r"(?:FastEthernet|GigabitEthernet|TwoGigabitEthernet|FiveGigabitEthernet|"
+    r"TenGigabitEthernet|TwentyFiveGigE|FortyGigabitEthernet|FiftyGigabitEthernet|"
+    r"HundredGigE|TwoHundredGigE|FourHundredGigE)\d+/\d+(?:/\d+)?"
+)
+
+
+def _observed_physical_ethernet(fact, name):
+    """Recognize explicit Ethernet evidence without inferring a cage capability.
+
+    Interface names only reject logical/internal/breakout rows. Neither the
+    prefix nor operational speed supplies the physical type. The adapter's
+    structured IANA classification and known admin state remain mandatory.
+    """
+    source = fact.get("physical_ethernet_source")
+    return (
+        fact.get("physical_ethernet") is True
+        and isinstance(source, dict)
+        and source.get("module") == "Cisco-IOS-XE-interfaces-oper"
+        and source.get("path") == "interfaces/interface/interface-type"
+        and source.get("value") == "iana-iftype-ethernet-csmacd"
+        and source.get("name") == name
+        and source.get("oper_status") != "if-oper-state-not-present"
+        and source.get("admin_status") in ("if-state-up", "if-state-down")
+        and type(fact.get("enabled")) is bool
+        and fact["enabled"] == (source["admin_status"] == "if-state-up")
+        and _PHYSICAL_ETHERNET_NAME.fullmatch(name) is not None
+    )
 
 
 def _blank(value):
@@ -126,7 +160,8 @@ def build_plan(discovery, existing):
 
     Empty means None or empty text; False, zero, and 'other' are populated.
     A conflicting serial/model or an ambiguous canonical name blocks apply.
-    Unsupported interface types are reported and skipped, never guessed.
+    Explicit physical Ethernet observations can use Other to mean capability
+    unknown. Unclassified interface types are reported and skipped, never guessed.
     """
     if discovery.get("adapter") != "cisco_iosxe" or discovery.get("schema_version") != 1:
         raise ValueError("Unsupported discovery adapter or schema version")
@@ -148,6 +183,7 @@ def build_plan(discovery, existing):
         "warnings": list(discovery.get("warnings", [])) + stack["warnings"],
         "missing_interfaces": [],
         "excluded_interfaces": list(discovery.get("excluded_interfaces", [])),
+        "unknown_interface_capabilities": [],
     }
 
     def conflict(scope, name, field, before, after):
@@ -231,6 +267,29 @@ def build_plan(discovery, existing):
             type_source = "existing DeviceType interface template"
         if len(by_name[name]) > 1:
             continue
+        capability_unknown = not values["type"] and _observed_physical_ethernet(fact, name)
+        if capability_unknown:
+            preserved_type = by_name[name][0].get("type") if by_name[name] else None
+            plan["unknown_interface_capabilities"].append(
+                {
+                    "name": name,
+                    "reason": "Maximum physical capability is not established by structured data",
+                    "classification_source": fact["physical_ethernet_source"],
+                    "preserved_type": preserved_type,
+                }
+            )
+            if not by_name[name]:
+                values["type"] = "other"
+                type_source = UNKNOWN_ETHERNET_TYPE_SOURCE
+            plan["warnings"].append(
+                "%s: observed physical Ethernet, maximum capability unknown; %s"
+                % (
+                    name,
+                    "preserved existing interface type"
+                    if by_name[name]
+                    else "using Nautobot type Other as an unknown capability placeholder",
+                )
+            )
         effective_type = (by_name[name][0].get("type") if by_name[name] else None) or values["type"]
         values["mgmt_only"] = (
             _management_value(
@@ -271,6 +330,8 @@ def build_plan(discovery, existing):
                 plan["excluded_interfaces"].append({"name": name, "reason": reason})
                 continue
             spec = {"name": name, **values, "type_source": type_source}
+            if capability_unknown:
+                spec["capability_unknown"] = True
             if values["mgmt_only"] is True:
                 spec["mgmt_only_source"] = fact["mgmt_only_source"]
             plan["interface_creates"].append(spec)
@@ -314,6 +375,13 @@ def build_plan(discovery, existing):
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["console_ports"][key])
     plan["ipam"] = plan_ipam(discovery, existing, interface_plan=plan)
+    route_targets = plan_route_targets(discovery, existing, plan["ipam"])
+    for key in ("route_targets", "vrf_route_targets"):
+        plan["ipam"][key] = route_targets[key]
+    for key in ("unresolved", "conflicts", "errors", "warnings"):
+        plan["ipam"][key].extend(route_targets[key])
+    plan["ipam"]["summary"].update(route_targets["summary"])
+    plan["ipam"]["summary"]["unresolved_ipam"] = len(plan["ipam"]["unresolved"])
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["ipam"][key])
     changed_interfaces = {row["id"] for row in plan["interface_updates"]}
@@ -347,6 +415,7 @@ def build_plan(discovery, existing):
         "conflicts": len(plan["conflicts"]),
         "missing_interfaces": len(plan["missing_interfaces"]),
         "excluded_interfaces": len(plan["excluded_interfaces"]),
+        "unknown_interface_capabilities": len(plan["unknown_interface_capabilities"]),
         "blocked": bool(plan["errors"]),
         **plan["components"]["summary"],
         **plan["layer2"]["summary"],

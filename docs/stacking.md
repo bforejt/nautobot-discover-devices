@@ -103,12 +103,16 @@ The NTC guessing checkbox does not relax stack identity or placement checks.
 Reviewed PSU bays, serialized assets and native power inlets belong to their
 physical serial-matched member Device, including newly created members. See
 [power-supply-discovery.md](power-supply-discovery.md) for identity, inlet and
-strict-mode requirements. The reviewed C9300-48UXM / C3850-NM-4-1G network-module
-profile also creates native ModuleBays and serialized Modules on their physical
-members. Eligible SFPs use nested ModuleBays under the confirmed network module.
+strict-mode requirements. Compatible 9300 network modules in the
+[Catalyst hardware library](catalyst-hardware-profiles.md) also create native
+ModuleBays and serialized Modules on their physical members when structured
+placement agrees. Eligible optics use nested ModuleBays under the confirmed
+network module.
 Hardware, platform and stack sources must agree on model, serial and member;
 an optic's parent identity and eligible physical interface must also agree.
-Unsupported profiles or ambiguous ownership remain unresolved in the report.
+The [reported hardware path](reported-hardware-discovery.md) can also use explicit
+parent references for unlisted parts and chassis. Unmapped capabilities remain
+unknown; ambiguous ownership remains unresolved in the report.
 
 Nautobot requires an Interface and its Module to share a root Device. Interfaces
 remain on the selected Device, so a network module on another physical member

@@ -389,10 +389,17 @@ def run(device_id=None):
     from tests.nautobot_components_integration import (
         run as verify_component_inventory,
     )
+    from tests.nautobot_generic_components_integration import run as verify_generic_components
+    from tests.nautobot_hardware_profiles_integration import run as verify_hardware_profiles
     from tests.nautobot_ipam_integration import catalog_counts as ipam_catalog_counts
     from tests.nautobot_ipam_integration import run as verify_ipam_inventory
+    from tests.nautobot_ipv6_integration import run as verify_ipv6_inventory
     from tests.nautobot_power_integration import catalog_counts as power_catalog_counts
     from tests.nautobot_power_integration import run as verify_power_inventory
+    from tests.nautobot_route_targets_integration import (
+        catalog_counts as route_target_catalog_counts,
+    )
+    from tests.nautobot_route_targets_integration import run as verify_route_target_inventory
     from tests.nautobot_stack_components_integration import run as verify_stack_components_inventory
     from tests.nautobot_stack_console_integration import run as verify_stack_console_inventory
     from tests.nautobot_stack_integration import catalog_counts as stack_catalog_counts
@@ -415,6 +422,7 @@ def run(device_id=None):
     initial_stack_catalog_counts = stack_catalog_counts()
     initial_ipam_catalog_counts = ipam_catalog_counts()
     initial_power_catalog_counts = power_catalog_counts()
+    initial_route_target_catalog_counts = route_target_catalog_counts()
     interface_status = Status.objects.filter(
         name="Active", content_types=ContentType.objects.get_for_model(Interface)
     ).first()
@@ -591,6 +599,10 @@ def run(device_id=None):
             verify_transceiver_inventory(device, interface_status, checks)
             verify_stack_inventory(device, interface_status, checks)
             verify_ipam_inventory(device, interface_status, checks)
+            verify_hardware_profiles(device, interface_status, checks)
+            verify_generic_components(device, interface_status, checks)
+            verify_ipv6_inventory(device, interface_status, checks)
+            verify_route_target_inventory(device, interface_status, checks)
             verify_power_inventory(device, interface_status, checks)
             verify_stack_power_inventory(device, interface_status, checks)
             verify_stack_software_inventory(device, interface_status, checks)
@@ -608,6 +620,7 @@ def run(device_id=None):
     assert stack_catalog_counts() == initial_stack_catalog_counts
     assert ipam_catalog_counts() == initial_ipam_catalog_counts
     assert power_catalog_counts() == initial_power_catalog_counts
+    assert route_target_catalog_counts() == initial_route_target_catalog_counts
     checks.append("outer rollback restores original lab inventory and catalog counts")
     return {"device_id": str(device.pk), "passed": True, "checks": checks, "persistent_changes": 0}
 

@@ -2,8 +2,8 @@
 
 `Discover Device` verifies an existing Nautobot Device against structured facts
 from the device, then fills missing identity, interface, console connector,
-reviewed serialized hardware inventory, scoped 802.1Q assignments, configured
-static IPv4 addressing, and explicitly mapped named VRFs. The first adapter
+reported serialized hardware inventory, scoped 802.1Q assignments, configured
+static IPv4/IPv6 addressing, and explicitly mapped named VRFs. The first adapter
 supports Cisco IOS XE switches on 17.9
 or later using RESTCONF JSON exclusively. The job defaults to a preview.
 
@@ -75,16 +75,16 @@ The job form contains these inputs:
 | VLAN Group | None | Explicit Layer-2 domain required for VLAN catalog and interface switching writes |
 | VLAN status | Applicable `Active` | Operator-selected status for newly created VLANs |
 | Use NTC defaults when guessing | Disabled | Apply the reviewed Network to Code Device Onboarding fallback for eligible down dynamic switchports and Nautobot's 0.95 power-factor default for new PSU inlets; mark inferred values in the report |
-| Default IPAM namespace | None | Select an existing Namespace to enable static IPv4/VRF reconciliation; blank keeps IPAM report-only |
+| Default IPAM namespace | None | Select an existing Namespace to enable static IPv4/IPv6 and VRF reconciliation; blank keeps IPAM report-only |
 | Override IPAM namespace | None | Optional Namespace for RFC1918 and manually entered override networks |
-| Use override for RFC1918 | Enabled | With an override selected, match the three exact RFC1918 ranges |
-| Additional override networks | Blank | IPv4 network CIDRs, one per line, combined with RFC1918 matches |
+| Use override for RFC1918 | Enabled | With an override selected, match the three exact IPv4 RFC1918 ranges |
+| Additional override networks | Blank | IPv4 or IPv6 network CIDRs, one per line, combined with RFC1918 matches |
 | Create missing networks | Enabled | Create exact connected Network Prefixes attached to the Prefix Location |
 | Group matching user VRF names across devices | Disabled | Explicitly group matching user VRF names within one Namespace |
 | Keep these VRF names device-local | `Mgmt-vrf` | Exact exceptions to grouping, one per line |
 | Prefix Location | Closest Site ancestor, otherwise Device Location | Optional Device ancestor override; Location Type must permit Prefixes |
 | New Prefix status | Applicable `Active` | Status for newly created connected Prefixes |
-| New IP Address status | Applicable `Active` | Status for newly created configured IPv4 hosts |
+| New IP Address status | Applicable `Active` | Status for newly created configured IPv4/IPv6 hosts |
 
 Start with Dry run enabled. The main job log shows progress, readable change
 counts, and brief notices for preserved differences and skipped observations.
@@ -127,6 +127,20 @@ fallback is present. Authentication values and raw response bodies are omitted
 from request diagnostics. The report contains inventory facts such as serials,
 MAC addresses, and descriptions.
 
+## Catalyst hardware library
+
+Documented exact chassis and uplink profiles cover Catalyst 9300/9300L/9300LM/
+9300X and 9500/9500X families. They classify only eligible observed interfaces
+using documented physical capability and compatible installed-module identity.
+The [hardware library reference](docs/catalyst-hardware-profiles.md) lists exact
+PIDs, regions, compatibility, source evidence and unresolved special cases.
+These profiles enrich physical capability and reviewed placement. Unlisted
+chassis and parts can use [reported hardware discovery](docs/reported-hardware-discovery.md)
+without a product matrix: explicit Ethernet ports use `Other` when capability
+is unknown, and reported component identities/parent references remain eligible.
+9500-specific serialized placement conventions remain deferred; generic
+containment can proceed when the returned data meets the same evidence rules.
+
 ## Initial interpretation rules
 
 | Discovery fact | Nautobot behavior |
@@ -138,14 +152,17 @@ MAC addresses, and descriptions.
 | Provisioned install release | Fill blank native software field using a matching platform SoftwareVersion, creating one if needed |
 | Present interface | Match canonical name within the Device; create missing or enrich blank fields |
 | Configured channel-group | Fill blank member `Interface.lag` with its discovered port-channel |
-| Reviewed serialized component | Match or create native ModuleType, ModuleBay, and Module inventory |
+| Explicit Ethernet with unknown capability | Create with native `Other`; retain known facts and flag unresolved capability |
+| Complete reported component identity | Match or create native Manufacturer and ModuleType independently of placement |
+| Verified reported or reviewed component placement | Match or create native ModuleBay and Module inventory |
 | Reviewed module interface ownership | Fill blank `Interface.module` using the existing interface record |
 | Ready physical interface speed | Fill blank `Interface.speed` in Kbps from the structured operational value |
 | Explicit operational RJ45 media | Fill blank `Interface.port_type` with `8p8c` |
 | Configured copper duplex | Fill blank `Interface.duplex` from explicit configuration or the narrowly reviewed configured default |
 | Reviewed dedicated management hardware | Mark the confirmed `Gi0/0` as management-only using the narrow purpose-correction policy below |
 | Reviewed physical console connectors | Create or adopt native ConsolePorts, preserving existing names, UUIDs and cables |
-| Configured static IPv4 and named VRFs | Reconcile connected Prefixes, hosts and explicit routing memberships after a default Namespace is selected; otherwise report-only |
+| Configured static IPv4/IPv6 and named VRFs | Reconcile connected Prefixes, hosts and explicit routing memberships after a default Namespace is selected; otherwise report-only |
+| Supported user VRF import/export targets | Fill empty native RouteTarget associations from complete literal policy; preserve populated sets and management isolation |
 | Negotiated and MAC duplex | Retain as observations; never substitute for the configured duplex setting |
 | Supported configured 802.1Q bundle | Fill blank mode and VLAN assignments in the selected VLAN Group |
 | Directly reported ordinary dynamic access/trunk mode | Use the actual mode with known configured VLAN policy to fill the existing 802.1Q fields |
@@ -180,8 +197,8 @@ not change lifecycle status. The supported fields are type, enabled, description
 MTU, MAC, operational speed, supported connector type, documented management-only
 purpose, and configured 802.1Q assignments, including directly reported
 access/trunk selection for ordinary dynamic ports when available.
-Configured static IPv4 and named VRFs are reconciled through the selected
-Namespace policy below. IPv6, dynamic addressing, shared/FHRP addressing,
+Configured static IPv4/IPv6 and named VRFs are reconciled through the selected
+Namespace policy below. Generated or link-local IPv6, dynamic addressing, shared/FHRP addressing,
 cables, unreviewed transceiver placements, and additional component profiles
 are future increments.
 
@@ -197,25 +214,29 @@ Unavailable membership data produces a warning and preserves existing links.
 
 Physical type comes from an explicit hardware capability mapping or an
 unambiguous existing DeviceType interface template, never negotiated link
-speed. The initial hardware map covers:
+speed. The expanded [hardware library](docs/catalyst-hardware-profiles.md) covers
+exact documented 9300 and 9500 PIDs; the original lab mappings remain:
 
 - `C9300-48UXM`: access ports 1–36 are 2.5G copper; ports 37–48 are 10G copper.
 - Its management `GigabitEthernet0/0`: 1G copper.
 - Installed `C3850-NM-4-1G`: four 1G SFP uplink ports for the identified member.
 - SVIs and loopbacks: virtual; port-channels: LAG.
 
-An unsupported physical type or unknown administrative state skips creation
+An explicitly reported ordinary Ethernet port with known administrative state
+can be created with native `Other` when its physical capability is unknown.
+Unclassified ports or ports with unknown administrative state skip creation
 with an explicit warning. Existing interfaces can still receive independently
-known blank fields. No generic physical type is invented.
+known blank fields; populated types are preserved.
 
 ## IPAM and named VRFs
 
-Select **Default IPAM namespace** to enable configured static IPv4 and named
+Select **Default IPAM namespace** to enable configured static IPv4/IPv6 and named
 VRF reconciliation. Leaving it blank keeps IPAM report-only even when other
 inventory changes are applied. To use the common split, choose **Internet** as
 the default, **Corporate** as **Override IPAM namespace**, and leave **Use override
 for RFC1918** checked. Add internally used public ranges or other exceptions to
-**Additional override networks**, one IPv4 network CIDR per line. Unchecking
+**Additional override networks**, one IPv4 or IPv6 network CIDR per line. Add
+`fd00::/8` explicitly if ULA should use the override. Unchecking
 RFC1918 makes only those manual networks match. The names are operator labels;
 all unmatched addresses use the default without an inferred public designation.
 
@@ -242,8 +263,16 @@ The preview lists rule matches, VRF identities, networks, hosts, assignments and
 hierarchy effects. More specific Prefixes can reparent existing inventory;
 changes to inherited VRF associations, incompatible masks, duplicate/shared
 hosts, exclusive ranges and conflicting site scope are deferred or blocked.
-DHCP, unnumbered and IPv6 remain observations. Device primary IPs are preserved.
+DHCP, unnumbered, generated and link-local IPv6 remain observations. Both address
+families within a named VRF must select one Namespace. Device primary IPs are preserved.
 No custom fields are created. Namespace policy is independent of NTC guessing.
+
+Ordinary user VRFs can also receive supported literal import/export RouteTargets.
+Each direction is filled only when empty; conflicting populated sets are preserved.
+Management `Mgmt-vrf` targets stay report-only. Address-family policies that cannot
+fit one native import/export pair, automatic targets and stitching stay unresolved.
+Equal targets do not establish a shared VRF identity. A shared VRF already assigned
+to another Device is not enriched from one Device's observations alone.
 
 See [IPAM discovery](docs/ipam-discovery.md) for the exact input fields,
 RESTCONF/YANG sources, preservation guards, report structure and test coverage.
@@ -315,9 +344,9 @@ collected separately under `discovery.management`. Operational address values
 remain observations: `0.0.0.0` is not assigned, and an IPv6 address without a
 prefix length does not establish a mask. DHCP, autoconfiguration, EUI-64 and
 anycast flags retain their explicit meaning. The broader `discovery.ipam`
-collector supplies static IPv4 and all named VRF facts independently of this
+collector supplies static IPv4/IPv6 and all named VRF facts independently of this
 hardware profile. Select the Namespace policy above to enable those writes;
-IPv6 and dynamic addressing stay observation-only. Existing primary IPs and
+Generated/link-local IPv6 and dynamic addressing stay observation-only. Existing primary IPs and
 populated assignments remain preserved.
 
 The lab exposes shutdown `Gi0/0` in `Mgmt-vrf` with no configured address;
@@ -329,8 +358,16 @@ and [management-port guide](https://www.cisco.com/c/en/us/td/docs/switches/lan/c
 
 ## Serialized components
 
-Uplink and transceiver profiles cover the `C9300-48UXM` chassis with a
-`C3850-NM-4-1G` uplink module. PSU profiles cover exact reviewed C9300, C9300L,
+Uplink and transceiver profiles cover explicitly compatible documented 9300-family
+chassis and uplink modules, with independently corroborated slot-1 placement.
+The existing `C9300-48UXM` / `C3850-NM-4-1G` lab mapping is preserved.
+Generic classification and explicit parent references also support unlisted
+chassis and parts. Unknown capability, connector and physical label remain blank;
+unknown containment permits catalog identity without an installed Module. See
+[reported hardware discovery](docs/reported-hardware-discovery.md). Specific
+9500 slot conventions await verified structured evidence. See the
+[hardware library](docs/catalyst-hardware-profiles.md) for exact coverage.
+PSU profiles cover exact reviewed C9300, C9300L,
 C9300LM and C9300X chassis and compatible power supplies. Resolved parts use
 Nautobot's native `ModuleType`, `ModuleBay`, and `Module` models and
 appear in the normal module inventory GUI. The Device's module bays represent
@@ -363,8 +400,9 @@ PSU A and three fans in the lab have no structured PID or serial and remain
 unresolved assets. Both documented PSU bays can be created independently of
 asset identity. A disabled PSU reporting `no-input` does not establish that its
 bay is vacant; no recorded Module means that no identified asset is recorded.
-Unknown serialized parts and unreviewed placement also
-remain unresolved, with evidence for the next interpretation increment. Exact
+Unlisted serialized parts can retain their reported catalog identity, and
+explicit parent relationships can establish placement. Missing or ambiguous
+identity and placement remain unresolved with their source evidence. Exact
 reviewed stack aggregate aliases are excluded; matching a chassis serial alone
 does not exclude another component.
 
@@ -376,17 +414,19 @@ and operational readings do not become configured input draw. See
 [power-supply-discovery.md](docs/power-supply-discovery.md) for coverage,
 stack-member placement and validation.
 
-SFPs installed in the reviewed C3850-NM-4-1G uplink ports are serialized native
-Modules in nested ModuleBays under the uplink Module, following
+Optics installed in corroborated, documented 9300 optical uplink ports are
+serialized native Modules in nested ModuleBays under the uplink Module, following
 [Nautobot's documented transceiver model](https://docs.nautobot.com/projects/core/en/stable/user-guide/core-data-model/dcim/modulebay/).
-The `c9300-48uxm-c3850-nm-4-1g-transceivers-v1` profile requires a physical,
+The existing `c9300-48uxm-c3850-nm-4-1g-transceivers-v1` lab profile and
+new documented uplink profiles require a physical,
 field-replaceable `hw-type-transceiver`, complete PID/serial, a unique matching
 platform identity, explicit nonempty presence, and agreement between the
 hardware interface name, platform component name, and an observed eligible
 uplink port. The parent uplink Module must itself pass discovery. Individual
-port placement comes from those matching names and the reviewed four-port
-hardware profile; numeric inventory indexes and the generic location string
-do not identify an individual SFP slot. Platform `comp-port` and
+port placement comes from those matching names and the resolved module port
+region; copper uplinks cannot establish optical cages. Exact documented
+interface aliases are normalized before the identity comparison; numeric inventory
+indexes and the generic location string do not identify an individual SFP slot. Platform `comp-port` and
 `removable=False` are retained as the observed lab representation; the explicit
 hardware transceiver classification establishes the serialized asset type.
 
@@ -398,8 +438,10 @@ Cisco-compatible PID. A missing Manufacturer can be created only from this
 reviewed source evidence, with its exact reported name; ambiguous matches block
 apply. New manufacturer and ModuleType catalog entries validate before saving
 and participate in the same atomic transaction as the asset. Catalog records
-are not created for a blocked occupied slot. Missing manufacturer, identity,
-parent, or placement evidence remains unresolved.
+from reviewed asset-only sources are not created for a blocked occupied slot.
+The generic reported-identity path can resolve catalogs independently of placement.
+Missing manufacturer or identity prevents catalog creation; missing parent or
+placement evidence keeps installation unresolved.
 
 The lab SFP reports `GLC-SX-MM`, serial `ZZ306221998`, revision `V03`, and
 manufacturer `CISCO-EQUIV` on `GigabitEthernet1/1/1`. Its nested bay identifies
@@ -686,6 +728,10 @@ then verify the application and repeat-run behavior. Cisco, Palo Alto,
 OpenGear, Proxmox, and VMware can add collection adapters while preserving
 the reconciliation and Nautobot boundaries. This release's planner accepts
 only the initial Cisco adapter schema until those adapters are introduced.
+
+The [PAN-OS discovery handoff](docs/panos-discovery-handoff.md) records the next
+platform's starting sources, lab prerequisites, modeling decisions and initial
+scope for a new task.
 
 Run offline regressions without a Nautobot installation or lab credentials:
 

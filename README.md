@@ -6,7 +6,11 @@ reported serialized hardware inventory, scoped 802.1Q assignments, configured
 static IPv4/IPv6 addressing, and explicitly mapped named VRFs. The first adapter
 supports Cisco IOS XE switches on 17.9
 or later using RESTCONF JSON exclusively. PAN-OS schema v1 adds SSH/XML identity
-and conservative interface collection. The [VM-Series validation contract](docs/panos-vm-validation.md)
+and conservative interface collection. Version `0.20.0-dev` also records
+separate applied and runtime HA/IPsec facts under `observations.ha` and
+`observations.vpn`; these facts are report-only. The
+[HA/VPN collection contract](docs/panos-ha-vpn-collection.md) defines source
+scope, privacy and collection limits. The [VM-Series validation contract](docs/panos-vm-validation.md)
 defines explicit UUID binding for PA-VM on KVM and reviewed virtual templates;
 the [first-pass history](docs/panos-discovery.md) records initial lab evidence.
 Physical-appliance capability remains unresolved.
@@ -14,7 +18,7 @@ The job defaults to a preview.
 
 This project targets Nautobot 3.2. Native `SoftwareVersion` is used for
 the main Device software field; that model requires Nautobot 2.2 or later.
-Only Nautobot 3.2.5 has been tested. Compatibility with older releases is not
+Nautobot 3.2.5 and 3.2.6 have been tested. Compatibility with older releases is not
 claimed until the same implementation has been tested on them, including native
 Module inventory and template suppression.
 
@@ -23,11 +27,14 @@ and 17.18.4.
 The PAN-OS live helper also validated PA-VM 11.2.8 on KVM with strict SSH trust
 and guessing disabled: it created two virtual interfaces, filled software
 version 11.2.8, preserved blank serial, and repeated with zero inventory DML.
-A third unconfigured guest adapter remains observed and deferred. Normal
+A third unconfigured guest adapter was observed and deferred at that checkpoint. Normal
 queued preview/apply/repeat then preserved that populated baseline; a queued
 wrong-UUID apply failed without changing inventory. See the
 [VM-Series evidence](docs/panos-vm-validation.md) for the exact scope and lab
-endpoint setup.
+endpoint setup. The HA/IPsec increment subsequently passed live collection on
+the active/passive pair and VPN peer, 904 offline tests, 22 PAN-OS and 150 Cisco
+native rollback checks on Nautobot 3.2.6, and an installed/queued preview with
+unchanged inventory. Its facts remain report-only.
 The Cisco live worker apply created 57 missing interfaces and enriched one existing
 interface; a second worker apply produced zero inventory changes. Real ORM
 checks verified software catalog creation, fill-only
@@ -100,6 +107,7 @@ The job form contains these inputs:
 | SSH port | 22 | PAN-OS SSH port |
 | Verify SSH host key | Enabled | Validate PAN-OS host keys against worker known hosts |
 | Expected PAN-OS VM UUID | Blank | Bind selected PA-VM/KVM inventory to an independently verified guest UUID; permit an absent serial without fabricating one |
+| Maximum VPN flow details | 256 | PAN-OS limit, 1–65535; fail before detail reads if the complete flow summary exceeds it, with no partial VPN result |
 | Secrets Group | Device's group | Optional credential override |
 | Interface status | Applicable `Active` | Status for newly created interfaces |
 | Software version status | Applicable `Active` | Status for newly created software versions |
@@ -155,13 +163,19 @@ it issues no inventory INSERT, UPDATE, or DELETE statements, including software
 and module catalogs, Module Bays, Modules, interface ownership, VLANs, and
 tagged-VLAN relationships. Unsaved catalog and component objects are validated
 before an apply is offered.
-Cisco requests are GET-only in both modes. PAN-OS uses three exact read-only
-SSH commands for system, operational interfaces and applied configuration.
+Cisco requests are GET-only in both modes. PAN-OS inventory uses three exact
+read-only SSH commands for system, operational interfaces and applied configuration.
 PA-VM reporting family `vm` and VM mode `KVM` also requires the documented
 `debug show vm-series interfaces all` XML read, because healthy operational
 views can omit recognized guest adapters. Its failure blocks collection;
-physical targets keep the original three reads. Session presentation settings
-prepare XML output. No unstructured output fallback is present. Authentication values and raw response bodies are omitted
+physical targets retain those three inventory reads. HA/VPN observations add
+six fixed reads for applied deviceconfig/network ancestors, HA state, IKE SAs,
+IPsec SAs and the flow summary, plus one fenced numeric detail read per flow.
+Applied configuration and runtime stay separate, with no HA/VPN inventory
+writes or Nautobot VPN model imports. A blank IKE response remains unknown
+with a static unresolved reason; it is never converted to zero SAs. Session
+presentation settings prepare XML output. No unstructured output fallback is
+present. Authentication values and raw response bodies are omitted
 from request diagnostics. The report contains inventory facts such as serials,
 MAC addresses, and descriptions.
 
@@ -771,6 +785,9 @@ The [PAN-OS discovery handoff](docs/panos-discovery-handoff.md) preserves the
 platform's starting sources, lab prerequisites, modeling decisions and initial
 scope. The current [VM-Series validation contract](docs/panos-vm-validation.md)
 records UUID binding, reviewed interface templates and live validation evidence.
+The [HA/VPN collection contract](docs/panos-ha-vpn-collection.md) records the
+report-only extension in `0.20.0-dev`; its reviewed PA-VM 11.2.8 XML shapes do
+not establish full OS coverage or native VPN model compatibility on Nautobot 2.4.
 
 Run offline regressions without a Nautobot installation or lab credentials:
 

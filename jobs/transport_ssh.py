@@ -6,14 +6,48 @@ only discovery's exact reads, load Netmiko lazily, and suppress secret-bearing
 transport exceptions. Session preparation changes presentation only.
 """
 
+import re
 import time
 
 SYSTEM_INFO = "show system info"
 INTERFACES = "show interface all"
 VM_INTERFACES = "debug show vm-series interfaces all"
 RUNNING_INTERFACES = "show config effective-running xpath devices/entry/network/interface"
+HA_STATE = "show high-availability all"
+RUNNING_HA = "show config effective-running xpath devices/entry/deviceconfig"
+RUNNING_VPN = "show config effective-running xpath devices/entry/network"
+IKE_SAS = "show vpn ike-sa"
+IPSEC_SAS = "show vpn ipsec-sa"
+VPN_FLOWS = "show vpn flow"
 SESSION_PREP = ("set cli pager off", "set cli op-command-xml-output on")
-READ_COMMANDS = frozenset((SYSTEM_INFO, INTERFACES, RUNNING_INTERFACES, VM_INTERFACES))
+HA_VPN_READ_COMMANDS = (
+    RUNNING_HA,
+    HA_STATE,
+    RUNNING_VPN,
+    IKE_SAS,
+    IPSEC_SAS,
+    VPN_FLOWS,
+)
+READ_COMMANDS = frozenset(
+    (SYSTEM_INFO, INTERFACES, RUNNING_INTERFACES, VM_INTERFACES) + HA_VPN_READ_COMMANDS
+)
+_FLOW_DETAIL = re.compile(r"show vpn flow tunnel-id ([1-9][0-9]{0,4})")
+
+
+def vpn_flow_detail_command(tunnel_id):
+    """Use an observed integer in the documented CLI range; never interpolate names."""
+    if type(tunnel_id) is not int or not 1 <= tunnel_id <= 65535:
+        raise ValueError("VPN flow tunnel ID must be an integer between 1 and 65535")
+    return "show vpn flow tunnel-id %s" % tunnel_id
+
+
+def is_read_command(command):
+    if not isinstance(command, str):
+        return False
+    if command in READ_COMMANDS:
+        return True
+    match = _FLOW_DETAIL.fullmatch(command)
+    return bool(match and int(match.group(1)) <= 65535)
 
 
 class SshError(RuntimeError):
@@ -92,7 +126,7 @@ class PanosSshClient:
             record["elapsed_ms"] = int((time.monotonic() - start) * 1000)
 
     def run(self, command, *, timeout=60):
-        if command not in READ_COMMANDS:
+        if not is_read_command(command):
             raise ValueError("PAN-OS discovery command is not in the exact read allowlist")
         if type(timeout) not in (int, float) or not 1 <= timeout <= 120:
             raise ValueError("SSH read timeout must be between 1 and 120 seconds")

@@ -91,3 +91,42 @@ Explicit applied up/down and MTU 1400/1500 are retained. PCI identities and
 base-OS port/name relationships preserve the observed schema; they do not
 classify native type, native MAC or administrative state. These payloads
 contain no credentials, license keys or unrelated configuration.
+
+`panos_ha_active.xml`, `panos_ha_passive.xml`, `panos_ha_disabled.xml`,
+`panos_ha_configured.xml` and `panos_ha_unconfigured_deviceconfig.xml` preserve
+reviewed dedicated PA-VM/KVM PAN-OS 11.2.8 HA shapes. The configured payload is
+scoped to the approved HA branch within the effective-running deviceconfig
+ancestor; unrelated system configuration and key-bearing branches are removed.
+The notes in `panos_ha_fixture_notes.json` record exact commands and sanitizing
+scope. Unknown peer serials do not become UUID/device identity. Explicit
+disabled HA differs from missing configuration or missing runtime evidence.
+
+`panos_vpn_applied_network.xml` is an allowlisted projection of the actual
+effective-running network-parent SSH/XML read captured on 2026-10-05. It retains
+IKE gateways, IPsec auto-key tunnels/selectors, and IKE/IPsec crypto profiles.
+Gateway authentication, unrelated network branches, certificates, key material
+and private authentication values are removed. IPsec crypto-profile
+`esp/authentication/member` retains safe algorithm labels such as `sha256`,
+which are not authentication hashes or keys. Configured lifetime units and
+the observed scalar IPsec DH group/list-valued IKE DH groups retain their shape.
+
+`panos_vpn_ike_sas.xml`, `panos_vpn_ike_single.xml`,
+`panos_vpn_ipsec_sas.xml`, `panos_vpn_peer_ipsec_sas.xml`,
+`panos_vpn_flows.xml`, `panos_vpn_flow_detail.xml` and
+`panos_vpn_local_flow_detail.xml` preserve sanitized reviewed PA-VM 11.2.8
+unfiltered SA/flow and numeric flow-detail shapes. Names and addresses are
+sanitized while full selector-name structure, identity fields, reciprocal SPI
+relationships, negotiated selectors and counter values remain meaningful.
+`panos_vpn_flow_inactive.xml` is a synthetic numeric-detail adaptation of
+previously captured name-filtered unnegotiated fields, with explicit `dp0`
+scope added for parser coverage. It does not establish a live numeric
+inactive-flow capture. Production transport and parsers accept only the
+reviewed numeric tunnel-ID detail query. None of these payloads contains key material.
+
+The new pure tests also construct absent, empty, malformed, duplicate,
+future-enum, IPv6/manual-mode and synthetic secret-exclusion cases in memory.
+Successful absent XML used by offline/native helpers is synthetic test evidence,
+not a substitute for an actual missing-subtree lab read. The
+[collection contract](../../docs/panos-ha-vpn-collection.md) defines the exact
+report-only scope. These fixtures do not establish other hardware/releases,
+complete OS support, or Nautobot 2.4/3.x native VPN writer compatibility.

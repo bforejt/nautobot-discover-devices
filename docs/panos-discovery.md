@@ -8,6 +8,12 @@ for the optional PA-VM/KVM UUID binding, reviewed virtual templates and subseque
 live results. The collection and conservative field mappings below remain the
 base contract; the current increment does not infer physical capability.
 
+Job `0.20.0-dev` adds a separate
+[report-only HA/IPsec collection increment](panos-ha-vpn-collection.md).
+It retains the outer PAN-OS schema v1 and identity/interface write rules,
+separates applied configuration from runtime, and uses no Nautobot VPN models.
+The first-pass delivery counts and blocked lab state below remain historical.
+
 This increment establishes SSH/XML collection and a conservative inventory
 contract for an existing selected Device. Keep every observed hardware row,
 including down, unaddressed and unconfigured ports, and preserve separately
@@ -54,7 +60,10 @@ The current [VM-Series increment](panos-vm-validation.md) retains these reads
 and additionally requires structured `debug show vm-series interfaces all`
 for exact PA-VM/family-vm/KVM targets. That fourth source preserves recognized
 guest adapters omitted from healthy operational hardware views. Physical
-targets keep the three-read collection.
+targets retain the three inventory reads. The later
+[HA/VPN increment](panos-ha-vpn-collection.md) adds six fixed report-only reads
+and one exact numeric detail read per observed IPsec flow to either target kind;
+the configurable detail limit prevents partial collection.
 
 The
 [PAN-OS 11.2 operational hierarchy](https://docs.paloaltonetworks.com/ngfw/pan-os-cli-quick-start/cli-command-hierarchy/pan-os-11-2-cli-ops-command-hierarchy)
@@ -145,7 +154,10 @@ uses `effective-running` to request applied configuration; the two views were
 identical on this direct, initially empty lab. Effective merged Panorama
 configuration remains unvalidated on a managed firewall.
 
-Scope reads to interfaces rather than full configuration. Even an Ethernet
+Keep native interface mapping scoped to its interface read. The later HA/VPN
+increment reads the minimal successful deviceconfig/network ancestors because
+absent leaf queries return unstructured errors, then discards all unrelated and
+key-bearing branches through explicit field allowlists. Even an Ethernet
 entry may contain PPPoE credentials: reports retain only reviewed applied fields
 and address observations, never the complete applied subtree. Operational rows
 retain repeated and nested fields. Parse and validate actual complete structured XML, rather than

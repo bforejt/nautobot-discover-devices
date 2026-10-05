@@ -52,14 +52,31 @@ def _fact(name, **values):
 
 
 def _vm_discovery(
-    name, vm_uuid, *, expected_vm_uuid=None, ports=(100, 101, 102, 103), version="99.99.3-h1"
+    name,
+    vm_uuid,
+    *,
+    expected_vm_uuid=None,
+    ports=(100, 101, 102, 103),
+    version="99.99.3-h1",
+    report_payloads=None,
 ):
     """Collect production adapter facts from explicit synthetic structured evidence."""
     import xml.etree.ElementTree as ET
     from types import SimpleNamespace
 
     from jobs.adapters import panos
-    from jobs.transport_ssh import INTERFACES, RUNNING_INTERFACES, SYSTEM_INFO, VM_INTERFACES
+    from jobs.transport_ssh import (
+        HA_STATE,
+        IKE_SAS,
+        INTERFACES,
+        IPSEC_SAS,
+        RUNNING_HA,
+        RUNNING_INTERFACES,
+        RUNNING_VPN,
+        SYSTEM_INFO,
+        VM_INTERFACES,
+        VPN_FLOWS,
+    )
 
     system_response = ET.Element("response", status="success")
     system = ET.SubElement(ET.SubElement(system_response, "result"), "system")
@@ -108,6 +125,23 @@ def _vm_discovery(
             (VM_INTERFACES, vm_response),
         )
     }
+    # These successful envelopes assert only synthetic structured absence. Do
+    # not import unit-test modules (which replace jobs imports outside Django).
+    outputs.update(
+        {
+            RUNNING_HA: '<response status="success"><result><deviceconfig/></result></response>',
+            HA_STATE: '<response status="success"><result><enabled>no</enabled>'
+            "<group><peer-info><enabled>no</enabled></peer-info></group></result></response>",
+            RUNNING_VPN: '<response status="success"><result><network/></result></response>',
+            IKE_SAS: '<response status="success"><result/></response>',
+            IPSEC_SAS: '<response status="success"><result><entries/><ntun>0</ntun>'
+            "</result></response>",
+            VPN_FLOWS: '<response status="success"><result><dp>dp0</dp><num_ipsec>0</num_ipsec>'
+            "<num_sslvpn>0</num_sslvpn><IPSec/><total>0</total></result></response>",
+        }
+    )
+    if report_payloads is not None:
+        outputs.update(report_payloads)
     return panos.collect(
         SimpleNamespace(run=outputs.__getitem__), expected_vm_uuid=expected_vm_uuid
     )
@@ -116,6 +150,7 @@ def _vm_discovery(
 def run(device_id=None):
     """Verify strict previews, native apply, preservation, repeats and rollback."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from django.apps import apps
     from django.core.exceptions import ValidationError
     from django.db import connection, transaction
     from django.test.utils import CaptureQueriesContext
@@ -140,6 +175,15 @@ def run(device_id=None):
         validate_plan,
     )
     from jobs.reconcile import build_plan
+    from jobs.transport_ssh import (
+        HA_STATE,
+        IKE_SAS,
+        IPSEC_SAS,
+        RUNNING_HA,
+        RUNNING_VPN,
+        VPN_FLOWS,
+        vpn_flow_detail_command,
+    )
 
     device_id = device_id or os.environ.get("NAUTOBOT_DISCOVERY_DEVICE_ID")
     if not device_id:
@@ -158,6 +202,22 @@ def run(device_id=None):
         CableToCableTermination,
         CustomField,
     )
+    # Discover only actual installed models; do not assume VPN exists on 2.4.
+    report_only_models = tuple(
+        model
+        for model in apps.get_models()
+        if model._meta.app_label == "vpn"
+        or (
+            model._meta.app_label == "dcim"
+            and model._meta.model_name
+            in {
+                "deviceredundancygroup",
+                "interfaceredundancygroup",
+                "interfaceredundancygroupassociation",
+            }
+        )
+    )
+    tracked += report_only_models
     before_counts = {model.__name__: model.objects.count() for model in tracked}
     interface_status = Status.objects.get_for_model(Interface).get(name="Active")
     checks = []
@@ -543,6 +603,74 @@ def run(device_id=None):
             assert snapshot_inventory(vm_target, discovery=vm_discovery) == after_vm
             checks.append("fresh UUID-bound VM repeat issues zero inventory DML")
 
+            # Valid collected report facts change independently of inventory.
+            # Use sanitized reviewed evidence, then change an actual HA role and
+            # VPN counter through XML parsing rather than inventing native data.
+            import xml.etree.ElementTree as ET
+
+            fixtures = Path(__file__).parent / "fixtures"
+            detail_command = vpn_flow_detail_command(1)
+            report_payloads = {
+                RUNNING_HA: (fixtures / "panos_ha_configured.xml").read_text(),
+                HA_STATE: (fixtures / "panos_ha_active.xml").read_text(),
+                RUNNING_VPN: (fixtures / "panos_vpn_applied_network.xml").read_text(),
+                IKE_SAS: (fixtures / "panos_vpn_ike_sas.xml").read_text(),
+                IPSEC_SAS: (fixtures / "panos_vpn_ipsec_sas.xml").read_text(),
+                VPN_FLOWS: (fixtures / "panos_vpn_flows.xml").read_text(),
+                detail_command: (fixtures / "panos_vpn_local_flow_detail.xml").read_text(),
+            }
+            observed_vm = _vm_discovery(
+                vm_target.name, vm_uuid, expected_vm_uuid=vm_uuid, report_payloads=report_payloads
+            )
+            changed_payloads = dict(report_payloads)
+            changed_payloads[HA_STATE] = (fixtures / "panos_ha_passive.xml").read_text()
+            detail_xml = ET.fromstring(changed_payloads[detail_command])
+            counter = detail_xml.find("result/IPSec/entry/pkt-encap")
+            counter.text = str(int(counter.text) + 7)
+            changed_payloads[detail_command] = ET.tostring(detail_xml, encoding="unicode")
+            changed_vm = _vm_discovery(
+                vm_target.name, vm_uuid, expected_vm_uuid=vm_uuid, report_payloads=changed_payloads
+            )
+            assert observed_vm["observations"]["ha"]["runtime"]["local"]["role"] == "active"
+            assert changed_vm["observations"]["ha"]["runtime"]["local"]["role"] == "passive"
+            observed_counter = observed_vm["observations"]["vpn"]["runtime"]["flow_details"][0][
+                "counters"
+            ]["pkt_encap"]
+            changed_counter = changed_vm["observations"]["vpn"]["runtime"]["flow_details"][0][
+                "counters"
+            ]["pkt_encap"]
+            assert changed_counter == observed_counter + 7
+            assert observed_vm["observations"]["vpn"]["native_writes"] is False
+            assert changed_vm["observations"]["vpn"]["native_writes"] is False
+            observation_counts = {model.__name__: model.objects.count() for model in tracked}
+            with CaptureQueriesContext(connection) as captured:
+                base_plan = build_plan(
+                    vm_discovery, snapshot_inventory(vm_target, discovery=vm_discovery)
+                )
+                observed_plan = build_plan(
+                    observed_vm, snapshot_inventory(vm_target, discovery=observed_vm)
+                )
+                changed_plan = build_plan(
+                    changed_vm, snapshot_inventory(vm_target, discovery=changed_vm)
+                )
+                assert observed_plan == base_plan == changed_plan
+                validate_plan(changed_plan, vm_target, interface_status=interface_status)
+                observed_repeat = apply_discovery(
+                    changed_vm, vm_target, interface_status=interface_status
+                )
+            _no_dml(captured, "Changed HA role or VPN counter issued native inventory DML")
+            assert observed_repeat["summary"]["interfaces_created"] == 0
+            assert observed_repeat["summary"]["interfaces_updated"] == 0
+            assert observed_repeat["summary"]["device_fields_updated"] == 0
+            assert snapshot_inventory(vm_target, discovery=changed_vm) == after_vm
+            assert {
+                model.__name__: model.objects.count() for model in tracked
+            } == observation_counts
+            checks.append(
+                "parsed HA role and VPN counter changes preserve the same native plan, "
+                "issue zero DML, and leave installed HA/VPN models unchanged"
+            )
+
             Device.objects.filter(pk=vm_target.pk).update(software_version=None)
             vm_target.refresh_from_db()
             vm_failing = _vm_discovery(
@@ -598,6 +726,7 @@ def run(device_id=None):
         "passed": True,
         "checks": checks,
         "persistent_changes": 0,
+        "observation_only_native_models": sorted(model._meta.label for model in report_only_models),
     }
 
 

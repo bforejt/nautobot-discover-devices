@@ -1,0 +1,12 @@
+<!-- Sanitized PA-VM 11.2.8 SSH/XML: show vpn ike-sa, active peer. -->
+<response status="success"><result>
+  <entry>
+    <gwid>1</gwid>
+    <name>gateway-a</name>
+    <role>Init</role>
+    <mode>IKEv2</mode>
+    <algo>PSK/DH14/AES256-CBC/SHA256</algo>
+    <created>Oct.04 21:40:49</created>
+    <expires>Oct.05 05:40:49</expires>
+  </entry>
+</result></response>

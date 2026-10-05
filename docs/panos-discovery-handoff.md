@@ -5,6 +5,44 @@ the existing testsuite collection work, propose the native Nautobot mappings,
 and implement one reviewed increment at a time. The first increment should
 verify device identity and discover physical interfaces on an existing Device.
 
+The original baseline and opening-task instructions below are historical.
+Current identity/interface work is described in the
+[first-pass history](panos-discovery.md) and
+[VM-Series validation contract](panos-vm-validation.md). Job `0.20.0-dev` adds
+[HA/IPsec collection](panos-ha-vpn-collection.md) as report-only observations,
+with separate applied/runtime contracts and the existing outer schema v1.
+Continue from the checked current repository state rather than repeating the
+original Cisco-only framework migration. Historical proof counts below do not
+describe this new increment's validation.
+
+## Current HA/VPN increment
+
+The PAN-OS collector adds six exact HA/VPN reads: applied deviceconfig and
+network parents, HA state, unfiltered IKE/IPsec SA inventories and the flow
+summary. It adds one fenced numeric tunnel-ID read per observed IPsec flow.
+**Maximum VPN flow details** defaults to 256, accepts 1–65535 and fails before
+detail reads if the complete summary exceeds the limit. No name-derived CLI
+queries, traffic probes or configuration operations enter production discovery.
+
+Facts live under `observations.ha` and `observations.vpn`. Missing values remain
+`None`; explicit `False` and zero remain populated observations. Blank IKE SSH
+output, observed on the passive lab member, stays unknown with an unresolved
+source and `runtime.complete=False`, rather than becoming an empty SA list.
+Read completeness does not establish full OS support. HA peer UUID/Device
+identity is unresolved, and flow names are never split to invent relationships.
+Allowlisted configuration excludes authentication/key material; safe crypto
+algorithm labels remain observations. `last_rekey` has no inferred unit.
+
+This increment imports no Nautobot VPN models and proposes no HA/VPN native
+writes. A later writer needs independent feature detection and model-semantic
+validation on Nautobot 2.4/3.x. No 2.4 compatibility result is claimed. Reviewed
+XML shapes are PA-VM/KVM 11.2.8; synthetic absent helper responses remain test
+inputs. This increment passed 904 offline tests, 22 PAN-OS and 150 Cisco native
+rollback checks on Nautobot 3.2.6, live production collection on all three lab
+VMs, and normal Secrets/strict-SSH installed and queued previews. Inventory
+remained unchanged. The [collection contract](panos-ha-vpn-collection.md)
+records exact proof scope and the unresolved passive IKE evidence.
+
 ## Project and baseline
 
 Repository/PR state checked on **2026-10-05**; source and lab observations below

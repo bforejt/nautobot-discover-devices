@@ -16,7 +16,7 @@ from .transport_restconf import RestconfClient, RestconfError
 from .transport_ssh import PanosSshClient, SshError
 
 name = "Device Discovery"
-JOB_VERSION = "0.19.0-dev"
+JOB_VERSION = "0.20.0-dev"
 
 
 def _host(device):
@@ -102,6 +102,16 @@ class DiscoverDevice(Job):
             "Explicit identity for the selected PAN-OS PA-VM on KVM. Requires an exact match "
             "with the firewall's reported VM UUID. A blank Device serial may remain blank "
             "when this identity is verified; populated serials remain protected."
+        ),
+    )
+    max_vpn_flow_details = IntegerVar(
+        default=256,
+        min_value=1,
+        max_value=65535,
+        label="Maximum VPN flow details",
+        description=(
+            "PAN-OS: maximum IPsec flows to read in detail. Increase for larger firewalls. "
+            "Exceeding the limit stops discovery rather than returning partial VPN evidence."
         ),
     )
     secrets_group = ObjectVar(
@@ -226,7 +236,8 @@ class DiscoverDevice(Job):
     class Meta:
         name = "Discover Device"
         description = (
-            "Verify Cisco IOS XE or PAN-OS identity and fill supported physical interfaces. "
+            "Verify Cisco IOS XE or PAN-OS identity and fill supported interfaces. "
+            "PAN-OS also reports HA and IPsec configuration and operational evidence. "
             "Cisco IOS XE also supports console ports, VLANs, "
             "serialized hardware, static IPv4/IPv6 addressing and named VRFs with "
             "supported import/export route targets."
@@ -245,6 +256,7 @@ class DiscoverDevice(Job):
             "ssh_port",
             "ssh_strict",
             "expected_vm_uuid",
+            "max_vpn_flow_details",
             "secrets_group",
             "interface_status",
             "software_version_status",
@@ -289,6 +301,7 @@ class DiscoverDevice(Job):
         ssh_port=22,
         ssh_strict=True,
         expected_vm_uuid="",
+        max_vpn_flow_details=256,
     ):
         device = Device.objects.get(pk=device.pk)
         report = {
@@ -353,6 +366,11 @@ class DiscoverDevice(Job):
             if adapter is panos:
                 if type(ssh_strict) is not bool:
                     raise ValueError("Verify SSH host key must be true or false")
+                if type(max_vpn_flow_details) is not int or not 1 <= max_vpn_flow_details <= 65535:
+                    raise ValueError(
+                        "Maximum VPN flow details must be an integer between 1 and 65535"
+                    )
+                report["max_vpn_flow_details"] = max_vpn_flow_details
                 username, password = resolve_credentials(
                     device, override_group=secrets_group, transport="ssh"
                 )
@@ -368,11 +386,24 @@ class DiscoverDevice(Job):
                 collect_options = {"use_ntc_defaults": use_ntc_defaults}
                 if adapter is panos:
                     collect_options["expected_vm_uuid"] = expected_vm_uuid
+                    collect_options["max_vpn_flow_details"] = max_vpn_flow_details
                 report["discovery"] = adapter.collect(client, **collect_options)
             finally:
                 client.close()
                 report["requests"] = client.trace
             discovery = report["discovery"]
+            if adapter is panos:
+                observations = discovery.get("observations", {})
+                vpn = observations.get("vpn", {})
+                configuration = vpn.get("configuration", {})
+                runtime = vpn.get("runtime", {})
+                self.logger.info(
+                    "Collected HA state and %s configured IPsec tunnels with %s flow details. "
+                    "HA/VPN observations are available under Advanced and in the report; "
+                    "they do not change native HA/VPN inventory.",
+                    len(configuration.get("ipsec_tunnels", [])),
+                    len(runtime.get("flow_details", [])),
+                )
             management = discovery.get("management", {})
             if (
                 ipam_policy is None

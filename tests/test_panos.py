@@ -15,8 +15,31 @@ def output(name):
     return (FIXTURES / name).read_text()
 
 
+def empty_ha_vpn_payloads():
+    """Explicit structured synthetic absence; never infer empty from a failed read."""
+    return {
+        transport.RUNNING_HA: (
+            '<response status="success"><result><deviceconfig/></result></response>'
+        ),
+        transport.HA_STATE: (
+            '<response status="success"><result><enabled>no</enabled><group>'
+            "<peer-info><enabled>no</enabled></peer-info></group></result></response>"
+        ),
+        transport.RUNNING_VPN: '<response status="success"><result><network/></result></response>',
+        transport.IKE_SAS: '<response status="success"><result/></response>',
+        transport.IPSEC_SAS: (
+            '<response status="success"><result><entries/><ntun>0</ntun></result></response>'
+        ),
+        transport.VPN_FLOWS: (
+            '<response status="success"><result><dp>dp0</dp><num_ipsec>0</num_ipsec>'
+            "<num_sslvpn>0</num_sslvpn><IPSec/><total>0</total></result></response>"
+        ),
+    }
+
+
 def vm_payloads():
     return {
+        **empty_ha_vpn_payloads(),
         transport.SYSTEM_INFO: output("panos_vm_system_info.xml"),
         transport.INTERFACES: output("panos_vm_empty_interfaces.xml"),
         transport.RUNNING_INTERFACES: (
@@ -33,6 +56,7 @@ def vm_payloads():
 
 def vm_post_commit_payloads():
     return {
+        **empty_ha_vpn_payloads(),
         transport.SYSTEM_INFO: output("panos_vm_system_info.xml"),
         transport.INTERFACES: output("panos_vm_configured_interfaces.xml"),
         transport.RUNNING_INTERFACES: output("panos_vm_applied_interfaces.xml"),
@@ -232,7 +256,16 @@ class PanosParserTests(unittest.TestCase):
         payloads = vm_payloads()
         client = Mock(run=Mock(side_effect=payloads.__getitem__))
         result = panos.collect(client)
-        self.assertEqual([call.args[0] for call in client.run.call_args_list], list(payloads))
+        self.assertEqual(
+            [call.args[0] for call in client.run.call_args_list],
+            [
+                transport.SYSTEM_INFO,
+                transport.INTERFACES,
+                transport.RUNNING_INTERFACES,
+                transport.VM_INTERFACES,
+            ]
+            + list(transport.HA_VPN_READ_COMMANDS),
+        )
         self.assertEqual(
             [row["name"] for row in result["interfaces"]],
             ["ethernet1/1", "ethernet1/2", "ethernet1/3"],
@@ -288,7 +321,9 @@ class PanosParserTests(unittest.TestCase):
                 )
                 client = Mock(run=Mock(side_effect=payloads.__getitem__))
                 result = panos.collect(client)
-                self.assertEqual(len(client.run.call_args_list), 3)
+                self.assertEqual(
+                    len(client.run.call_args_list), 3 + len(transport.HA_VPN_READ_COMMANDS)
+                )
                 self.assertNotIn("vm_interfaces", result["sources"])
                 self.assertNotIn("vm_interfaces", result["observations"])
 
@@ -414,13 +449,18 @@ class PanosParserTests(unittest.TestCase):
 
     def test_collection_has_fixed_reads_and_guessing_does_not_change_facts(self):
         payloads = {
+            **empty_ha_vpn_payloads(),
             transport.SYSTEM_INFO: self.system,
             transport.INTERFACES: self.ports,
             transport.RUNNING_INTERFACES: self.running,
         }
         client = Mock(run=Mock(side_effect=lambda command: payloads[command]))
         strict = panos.collect(client)
-        self.assertEqual([call.args[0] for call in client.run.call_args_list], list(payloads))
+        self.assertEqual(
+            [call.args[0] for call in client.run.call_args_list],
+            [transport.SYSTEM_INFO, transport.INTERFACES, transport.RUNNING_INTERFACES]
+            + list(transport.HA_VPN_READ_COMMANDS),
+        )
         self.assertEqual(strict, panos.collect(client, use_ntc_defaults=True))
         self.assertFalse(panos.observed_physical_ethernet(strict["interfaces"][0], "ethernet1/1"))
 

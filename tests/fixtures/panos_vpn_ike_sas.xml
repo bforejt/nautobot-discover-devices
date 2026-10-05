@@ -1,0 +1,21 @@
+<!-- Synthetic multi-SA list combining captured unfiltered Init and Resp rows. -->
+<response status="success"><result>
+  <entry>
+    <gwid>1</gwid>
+    <name>gateway-a</name>
+    <role>Init</role>
+    <mode>IKEv2</mode>
+    <algo>PSK/DH14/AES256-CBC/SHA256</algo>
+    <created>Oct.04 21:40:49</created>
+    <expires>Oct.05 05:40:49</expires>
+  </entry>
+<entry>
+    <gwid>1</gwid>
+    <name>gateway-a</name>
+    <role>Resp</role>
+    <mode>IKEv2</mode>
+    <algo>PSK/DH14/AES256-CBC/SHA256</algo>
+    <created>Oct.04 21:40:49</created>
+    <expires>Oct.05 05:40:49</expires>
+  </entry>
+</result></response>

@@ -40,7 +40,10 @@ class SshTransportTests(unittest.TestCase):
         self.assertEqual(ssh.VM_INTERFACES, "debug show vm-series interfaces all")
         self.assertEqual(
             ssh.READ_COMMANDS,
-            frozenset((ssh.SYSTEM_INFO, ssh.INTERFACES, ssh.RUNNING_INTERFACES, ssh.VM_INTERFACES)),
+            frozenset(
+                (ssh.SYSTEM_INFO, ssh.INTERFACES, ssh.RUNNING_INTERFACES, ssh.VM_INTERFACES)
+                + ssh.HA_VPN_READ_COMMANDS
+            ),
         )
         with self.client() as client:
             output = client.run(ssh.VM_INTERFACES)
@@ -72,9 +75,42 @@ class SshTransportTests(unittest.TestCase):
             "debug show vm-series interfaces all\nconfigure",
             "debug show vm-series interfaces all | match eth1",
             "debug dataplane packet-diag set capture on",
+            "show vpn flow name tunnel-a",
+            "show vpn flow tunnel-id 0",
+            "show vpn flow tunnel-id 65536",
+            "show vpn flow tunnel-id 01",
+            "show vpn flow tunnel-id +1",
+            "show vpn flow tunnel-id 1; configure",
+            "show vpn flow tunnel-id 1\ncommit",
+            "show vpn flow tunnel-id 1 | match secret",
+            "show vpn flow tunnel-id 1 ",
+            " show vpn flow tunnel-id 1",
+            None,
+            [],
         ):
             with self.subTest(command=command), self.assertRaises(ValueError):
                 self.client().run(command)
+        self.connect.assert_not_called()
+
+    def test_numeric_flow_details_use_canonical_documented_range(self):
+        with self.client() as client:
+            for tunnel_id in (1, 27, 65535):
+                command = ssh.vpn_flow_detail_command(tunnel_id)
+                self.assertTrue(ssh.is_read_command(command))
+                client.run(command)
+        self.assertEqual(
+            [call.args[0] for call in self.conn.send_command.call_args_list][-3:],
+            [
+                "show vpn flow tunnel-id 1",
+                "show vpn flow tunnel-id 27",
+                "show vpn flow tunnel-id 65535",
+            ],
+        )
+
+    def test_numeric_flow_command_constructor_refuses_unobserved_types_and_ranges(self):
+        for value in (True, False, "1", 1.0, None, 0, -1, 65536):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ssh.vpn_flow_detail_command(value)
         self.connect.assert_not_called()
 
     def test_auth_failure_is_sanitized(self):

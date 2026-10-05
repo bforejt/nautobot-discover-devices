@@ -446,8 +446,10 @@ DeviceType template. Three conflicts preserved the Device alias and existing
 [validation proof](../artifacts/panos-ha-vpn/job-preview/validation.json) retain
 all exact rows.
 
-The current collector still reads only identity and interface evidence. It does
-not discover HA configuration/state, IKE/IPsec configuration, peers or security
-associations, and performs no native VPN writes. Capability-aware native VPN
+At this `0.19.0-dev` checkpoint the collector read only identity and interface
+evidence. It did not discover HA configuration/state, IKE/IPsec configuration,
+peers or security associations, and performed no native VPN writes. Capability-aware native VPN
 mapping on Nautobot 3.x, with report-only behavior where Nautobot 2.4 lacks the
-required models, remains future work; that design is not implemented or tested.
+required models, remained future work at that checkpoint. The subsequent
+[HA/IPsec collection increment](panos-ha-vpn-collection.md) adds report-only
+HA and VPN evidence; native HA/VPN writes remain future work.

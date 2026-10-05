@@ -1,0 +1,58 @@
+<response status="success">
+  <result>
+    <group>
+      <mode>Active-Passive</mode>
+      <local-info>
+        <state>passive</state>
+        <mode>Active-Passive</mode>
+        <serial-num />
+        <platform-model>PA-VM</platform-model>
+        <build-rel>11.2.8</build-rel>
+        <vm-license>vm8000</vm-license>
+        <mgmt-ip>192.0.2.102/24</mgmt-ip>
+        <mgmt-ipv6 />
+        <priority>110</priority>
+        <preemptive>no</preemptive>
+        <state-duration>1073</state-duration>
+        <ha1-port>ethernet1/2</ha1-port>
+        <ha1-macaddr>02:00:00:00:00:02</ha1-macaddr>
+        <ha1-ipaddr>198.18.100.2/30</ha1-ipaddr>
+        <ha2-port>ethernet1/3</ha2-port>
+        <ha2-macaddr>02:00:00:00:00:04</ha2-macaddr>
+        <state-sync>Complete</state-sync>
+        <state-sync-type>ethernet</state-sync-type>
+      </local-info>
+      <peer-info>
+        <state>active</state>
+        <mode>Active-Passive</mode>
+        <serial-num />
+        <platform-model>PA-VM</platform-model>
+        <build-rel>11.2.8</build-rel>
+        <vm-license>vm8000</vm-license>
+        <mgmt-ip>192.0.2.101/24</mgmt-ip>
+        <mgmt-ipv6 />
+        <priority>100</priority>
+        <preemptive>no</preemptive>
+        <state-duration>1081</state-duration>
+        <conn-status>up</conn-status>
+        <ha1-macaddr>02:00:00:00:00:01</ha1-macaddr>
+        <conn-ha1>
+          <conn-status>up</conn-status>
+          <conn-primary>yes</conn-primary>
+        </conn-ha1>
+        <ha1-ipaddr>198.18.100.1</ha1-ipaddr>
+        <ha2-macaddr>02:00:00:00:00:03</ha2-macaddr>
+        <conn-ha2>
+          <conn-status>up</conn-status>
+          <conn-primary>yes</conn-primary>
+          <conn-ka-enbled>yes</conn-ka-enbled>
+          <conn-type>log-only</conn-type>
+          <conn-hold>0</conn-hold>
+        </conn-ha2>
+      </peer-info>
+      <running-sync-enabled>yes</running-sync-enabled>
+      <running-sync>synchronized</running-sync>
+    </group>
+    <enabled>yes</enabled>
+  </result>
+</response>

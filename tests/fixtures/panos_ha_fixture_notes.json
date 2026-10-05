@@ -1,0 +1,40 @@
+{
+  "scope": "Sanitized actual dedicated PA-VM/KVM PAN-OS11.2.8 HA evidence; no broader release/hardware support claim.",
+  "sanitization": "Only approved HA fact paths are retained. Management locators and MACs are replaced with deterministic test addresses. Missing/empty serials are preserved. No unrelated configuration or credentials retained.",
+  "fixtures": {
+    "panos_ha_active.xml": {
+      "source_artifact": "artifacts/panos-ha-vpn/ssh-ha/101-20261005T043000701698Z/01-show-high-availability-all.xml",
+      "command": "show high-availability all",
+      "expected_local_role": "active",
+      "expected_enabled": true
+    },
+    "panos_ha_passive.xml": {
+      "source_artifact": "artifacts/panos-ha-vpn/ssh-ha/102-20261005T043213285191Z/01-show-high-availability-all.xml",
+      "command": "show high-availability all",
+      "expected_local_role": "passive",
+      "expected_enabled": true
+    },
+    "panos_ha_disabled.xml": {
+      "source_artifact": "artifacts/panos-ha-vpn/103-ha-before.xml",
+      "command": "show high-availability all",
+      "expected_local_role": null,
+      "expected_enabled": false
+    },
+    "panos_ha_configured.xml": {
+      "command": "show config effective-running xpath devices/entry/deviceconfig",
+      "wrapper": "response/result/deviceconfig",
+      "present": true,
+      "enabled": true,
+      "sanitization": "Only reviewed HA scalar paths and exact ancestor envelope retained; unrelated deviceconfig branches discarded; description anonymized.",
+      "source_artifact": "artifacts/panos-ha-vpn/collection-shapes/101-20261005T110656608944Z/01-show-config-effective-running-xpath-devices-entry-deviceconfig.xml"
+    },
+    "panos_ha_unconfigured_deviceconfig.xml": {
+      "command": "show config effective-running xpath devices/entry/deviceconfig",
+      "wrapper": "response/result/deviceconfig",
+      "present": false,
+      "enabled": null,
+      "sanitization": "Only reviewed HA scalar paths and exact ancestor envelope retained; unrelated deviceconfig branches discarded; description anonymized.",
+      "source_artifact": "artifacts/panos-ha-vpn/collection-shapes/103-20261005T110655445313Z/01-show-config-effective-running-xpath-devices-entry-deviceconfig.xml"
+    }
+  }
+}

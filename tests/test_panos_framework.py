@@ -120,6 +120,7 @@ def vm_guest_inventory(source):
 class PanosReconciliationTests(unittest.TestCase):
     def test_production_collector_sources_validate_and_repeat_with_native_templates(self):
         outputs = {
+            **test_panos.empty_ha_vpn_payloads(),
             ssh.SYSTEM_INFO: (FIXTURES / "panos_system_info.txt").read_text(),
             ssh.INTERFACES: (FIXTURES / "panos_interfaces.txt").read_text(),
             ssh.RUNNING_INTERFACES: (FIXTURES / "panos_applied_interfaces.xml").read_text(),
@@ -159,6 +160,7 @@ class PanosReconciliationTests(unittest.TestCase):
             "<vm-uuid>%s</vm-uuid></system>" % VM_UUID.upper(),
         )
         outputs = {
+            **test_panos.empty_ha_vpn_payloads(),
             ssh.SYSTEM_INFO: system,
             ssh.INTERFACES: (FIXTURES / "panos_interfaces.txt").read_text(),
             ssh.RUNNING_INTERFACES: (FIXTURES / "panos_applied_interfaces.xml").read_text(),
@@ -726,13 +728,45 @@ class PanosJobTests(unittest.TestCase):
         messages = test_discovery_job.rendered_logs(self.job.logger)
         self.assertTrue(any("applies only to Cisco IOS XE" in message for message in messages))
         self.module.panos.collect.assert_called_once_with(
-            self.client, use_ntc_defaults=True, expected_vm_uuid=None
+            self.client, use_ntc_defaults=True, expected_vm_uuid=None, max_vpn_flow_details=256
         )
+
+    def test_selected_vpn_detail_budget_is_forwarded_and_reported(self):
+        self.job.run(self.device, max_vpn_flow_details=4096)
+        self.module.panos.collect.assert_called_once_with(
+            self.client, use_ntc_defaults=False, expected_vm_uuid=None, max_vpn_flow_details=4096
+        )
+        self.assertEqual(self.job.request.meta["discovery_report"]["max_vpn_flow_details"], 4096)
+
+    def test_invalid_vpn_detail_budget_fails_before_credentials_or_transport(self):
+        for value in (True, 0, -1, 65536, "256", None):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "VPN flow details"):
+                self.job.run(self.device, max_vpn_flow_details=value)
+            self.module.resolve_credentials.assert_not_called()
+            self.ssh.assert_not_called()
+
+    def test_ha_vpn_facts_are_retained_in_advanced_and_attachment(self):
+        from tests.test_panos_ha_vpn_collection import payloads
+
+        client = Mock(run=Mock(side_effect=payloads().__getitem__))
+        ha, vpn = panos._collect_ha_vpn(client, 256)
+        self.observed["observations"] = {"ha": ha, "vpn": vpn}
+        self.job.run(self.device)
+        report = self.job.request.meta["discovery_report"]
+        self.assertIn("ha", report["discovery"]["observations"])
+        self.assertIn("vpn", report["discovery"]["observations"])
+        self.assertFalse(report["applied"])
+        self.assertFalse(report["discovery"]["observations"]["vpn"]["native_writes"])
+        self.module.apply_discovery.assert_not_called()
+        import json
+
+        attachment = json.loads(self.job.create_file.call_args.args[1])
+        self.assertEqual(attachment, report)
 
     def test_expected_vm_uuid_is_canonicalized_forwarded_and_reported(self):
         self.job.run(self.device, expected_vm_uuid=VM_UUID.upper())
         self.module.panos.collect.assert_called_once_with(
-            self.client, use_ntc_defaults=False, expected_vm_uuid=VM_UUID
+            self.client, use_ntc_defaults=False, expected_vm_uuid=VM_UUID, max_vpn_flow_details=256
         )
         self.assertEqual(self.job.request.meta["discovery_report"]["expected_vm_uuid"], VM_UUID)
 

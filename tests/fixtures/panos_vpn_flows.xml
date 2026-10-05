@@ -1,0 +1,24 @@
+<!-- Sanitized PA-VM 11.2.8 SSH/XML: show vpn flow, active peer. -->
+<response status="success"><result>
+  <dp>dp0</dp>
+  <num_ipsec>1</num_ipsec>
+  <num_sslvpn>0</num_sslvpn>
+  <IPSec>
+    <entry>
+      <name>vpn-a:protected-hosts</name>
+      <id>1</id>
+      <gwid>1</gwid>
+      <inner-if>tunnel.1</inner-if>
+      <outer-if>ethernet1/1</outer-if>
+      <ipsec-mode>tunnel</ipsec-mode>
+      <localip>198.51.100.1</localip>
+      <peerip>198.51.100.3</peerip>
+      <state>active</state>
+      <delay-nh-update>False</delay-nh-update>
+      <request-nh-update>False</request-nh-update>
+      <mon>off</mon>
+      <owner>1</owner>
+    </entry>
+  </IPSec>
+  <total>1</total>
+</result></response>

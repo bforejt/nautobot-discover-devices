@@ -1,0 +1,29 @@
+<!-- Sanitized PA-VM 11.2.8 SSH/XML: show vpn ipsec-sa, active peer. -->
+<response status="success"><result>
+  <entries>
+    <entry>
+      <gwid>1</gwid>
+      <gateway>gateway-a</gateway>
+      <tid>1</tid>
+      <remote>198.51.100.3                           </remote>
+      <name>vpn-a:protected-hosts</name>
+      <proto>ESP</proto>
+      <enc>A256</enc>
+      <hash>SHA256</hash>
+      <i_spi>2654440482</i_spi>
+      <o_spi>3647142075</o_spi>
+      <dh>DH14</dh>
+      <pfs_ake1 />
+      <pfs_ake2 />
+      <pfs_ake3 />
+      <pfs_ake4 />
+      <pfs_ake5 />
+      <pfs_ake6 />
+      <pfs_ake7 />
+      <kb>Unlimited</kb>
+      <life>3600</life>
+      <remain>1960</remain>
+    </entry>
+  </entries>
+  <ntun>1</ntun>
+</result></response>

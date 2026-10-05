@@ -10,7 +10,19 @@ import re
 import xml.etree.ElementTree as ET
 from uuid import UUID
 
-from ..transport_ssh import INTERFACES, RUNNING_INTERFACES, SYSTEM_INFO, VM_INTERFACES
+from ..transport_ssh import (
+    HA_STATE,
+    IKE_SAS,
+    INTERFACES,
+    IPSEC_SAS,
+    RUNNING_HA,
+    RUNNING_INTERFACES,
+    RUNNING_VPN,
+    SYSTEM_INFO,
+    VM_INTERFACES,
+    VPN_FLOWS,
+    vpn_flow_detail_command,
+)
 
 MAX_XML_BYTES = 16 * 1024 * 1024
 _NAME = re.compile(r"ethernet\d+/\d+(?:/\d+)?")
@@ -443,10 +455,90 @@ def _merge_vm_interfaces(interfaces, excluded, warnings, observations, vm_rows, 
     observations.sort(key=lambda row: row["name"])
 
 
-def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None):
-    """Three fixed reads plus KVM guest enumeration; guessing never changes facts."""
+def _collect_ha_vpn(client, max_vpn_flow_details):
+    # These facts do not import Nautobot or enter the native inventory planners.
+    from .panos_ha import parse_ha_configuration, parse_ha_state
+    from .panos_vpn_config import parse_vpn_configuration
+    from .panos_vpn_runtime import parse_ike_sas, parse_ipsec_sas, parse_vpn_flows
+
+    ha = {
+        "contract": "panos-ha-v1",
+        "configuration": parse_ha_configuration(client.run(RUNNING_HA), command=RUNNING_HA),
+        "runtime": parse_ha_state(client.run(HA_STATE), command=HA_STATE),
+    }
+    configuration = parse_vpn_configuration(client.run(RUNNING_VPN), command=RUNNING_VPN)
+    ike_output = client.run(IKE_SAS)
+    unresolved = []
+    if isinstance(ike_output, str) and not ike_output.strip():
+        # Reviewed on the passive PA-VM: a successful SSH read can be blank.
+        # This is missing evidence, never a structured assertion of zero SAs.
+        ike_sas = None
+        unresolved.append(
+            {
+                "collection": "ike_sas",
+                "source": {"command": IKE_SAS, "path": "result/entry"},
+                "reason": "Blank SSH output; no structured IKE SA evidence",
+            }
+        )
+    else:
+        ike_sas = parse_ike_sas(ike_output, command=IKE_SAS)
+    ipsec_sas = parse_ipsec_sas(client.run(IPSEC_SAS), command=IPSEC_SAS)
+    flows = parse_vpn_flows(client.run(VPN_FLOWS), command=VPN_FLOWS)
+    if len(flows) > max_vpn_flow_details:
+        raise DiscoveryError(
+            "VPN flow count exceeds the selected detail-read limit; "
+            "increase Maximum VPN flow details to collect the complete observation"
+        )
+    details = []
+    for flow in sorted(flows, key=lambda row: row["tunnel_id"]):
+        try:
+            command = vpn_flow_detail_command(flow["tunnel_id"])
+        except ValueError:
+            raise DiscoveryError(
+                "VPN flow tunnel ID is outside the documented SSH read range"
+            ) from None
+        rows = parse_vpn_flows(client.run(command), command=command, detail=True)
+        if len(rows) != 1:
+            raise DiscoveryError("VPN flow detail does not identify exactly one observed flow")
+        row = rows[0]
+        # IDs are ephemeral. A changed/deleted/reassigned flow cannot silently
+        # attach another tunnel's counters to the earlier summary snapshot.
+        fields = (
+            "tunnel_id",
+            "gateway_id",
+            "name",
+            "tunnel_interface",
+            "outer_interface",
+            "local_address",
+            "peer_address",
+            "dataplane",
+        )
+        if any(flow.get(field) != row.get(field) for field in fields):
+            raise DiscoveryError("VPN flow identity changed between summary and detail reads")
+        details.append(row)
+    return ha, {
+        "contract": "panos-vpn-v1",
+        "scope": "ipsec",
+        "configuration": configuration,
+        "runtime": {
+            "contract": "panos-vpn-runtime-v1",
+            "ike_sas": ike_sas,
+            "ipsec_sas": ipsec_sas,
+            "flows": flows,
+            "flow_details": details,
+            "complete": not unresolved,
+            "unresolved": unresolved,
+        },
+        "native_writes": False,
+    }
+
+
+def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None, max_vpn_flow_details=256):
+    """Read inventory and HA/VPN evidence; never probe or mutate the firewall."""
     if type(use_ntc_defaults) is not bool:
         raise ValueError("Use NTC defaults when guessing must be true or false")
+    if type(max_vpn_flow_details) is not int or not 1 <= max_vpn_flow_details <= 65535:
+        raise ValueError("Maximum VPN flow details must be an integer between 1 and 65535")
     if expected_vm_uuid is not None:
         canonical_expected = canonical_vm_uuid(expected_vm_uuid)
         if canonical_expected is None:
@@ -492,6 +584,21 @@ def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None):
     if vm_rows is not None:
         sources["vm_interfaces"] = {"command": VM_INTERFACES, "path": "result/entry"}
         collected_observations["vm_interfaces"] = vm_rows
+    ha, vpn = _collect_ha_vpn(client, max_vpn_flow_details)
+    warnings.extend(row["reason"] for row in vpn["runtime"]["unresolved"])
+    collected_observations["ha"] = ha
+    collected_observations["vpn"] = vpn
+    sources["ha"] = {
+        "configuration": {"command": RUNNING_HA, "path": "result/deviceconfig/high-availability"},
+        "runtime": {"command": HA_STATE, "path": "result"},
+    }
+    sources["vpn"] = {
+        "configuration": {"command": RUNNING_VPN, "path": "result/network"},
+        "ike_sas": {"command": IKE_SAS, "path": "result/entry"},
+        "ipsec_sas": {"command": IPSEC_SAS, "path": "result/entries/entry"},
+        "flows": {"command": VPN_FLOWS, "path": "result/IPSec/entry"},
+        "flow_details": [row["source"] for row in vpn["runtime"]["flow_details"]],
+    }
     return {
         "adapter": "panos",
         "schema_version": 1,

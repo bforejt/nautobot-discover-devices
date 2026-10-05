@@ -150,8 +150,9 @@ remain in place for hardware-source facts.
    Verify guest enumeration after any required reboot; keep the actual rows
    regardless of addresses or operational link state.
 3. Commit explicit up/down settings, descriptions, and explicit MTUs, including
-   a non-default value, for distinct test ports. Leave another port unconfigured or automatic to test
-   unresolved creation. Confirm applied XML matches the committed settings.
+   a non-default value, for distinct test ports. Leave another port unconfigured
+   or automatic to test unresolved creation. Confirm applied XML matches the
+   committed settings.
 4. Review exact native templates for the observed VirtIO ports. Verify normal
    worker SSH trust before the installed Job uses this endpoint.
 5. Run preview using the explicit expected UUID and assert zero inventory DML.
@@ -335,12 +336,12 @@ ordinary Device-name resolution, guessing disabled, and the exact four required
 XML reads. No process endpoint override or direct-helper Job subclass supplied
 these queued executions.
 
-| Run | JobResult ID prefix | Final status | Report `applied` | Inventory outcome |
+| Run | JobResult ID | Final status | Report `applied` | Inventory outcome |
 | --- | --- | --- | --- | --- |
-| Preview | `89b15d5e` | `SUCCESS` | `False` | No inventory change. |
-| Apply | `b40323ab` | `SUCCESS` | `True` | No inventory change. |
-| Repeat apply | `ab9137c2` | `SUCCESS` | `True` | No inventory change. |
-| Deliberately wrong expected VM UUID | `5d16c2e4` | Expected `FAILURE` | `False` | UUID mismatch and required-serial protection block apply; no inventory change. |
+| Preview | `89b15d5e-7d08-498b-abee-ce143d5634ec` | `SUCCESS` | `False` | No inventory change. |
+| Apply | `b40323ab-7680-4861-84e4-d431ccde7442` | `SUCCESS` | `True` | No inventory change. |
+| Repeat apply | `ab9137c2-bf04-4344-96ce-5737a4fbbca8` | `SUCCESS` | `True` | No inventory change. |
+| Deliberately wrong expected VM UUID | `5d16c2e4-4892-4df0-ae76-8c07c880787b` | Expected `FAILURE` | `False` | UUID mismatch and required-serial protection block apply; no inventory change. |
 
 The three positive queue runs began after the live helper had created the two
 interfaces and software relationship. They verify normal queued collection,
@@ -354,8 +355,10 @@ The main result contained no discovery payload; the framework stored its
 ordinary empty result for successful runs. The expected wrong-UUID failure is
 an identity-protection check and is separate from the earlier DNS setup
 failure. Both remain in normal Job history. Full JobResult identities, statuses,
-source hashes, comparison results and negative plan errors are retained in
-ignored `artifacts/panos-vm-validation/queued-validation.json`.
+comparison results and negative plan errors are retained in ignored
+`artifacts/panos-vm-validation/queued-validation.json`.
+The separate `installed-source.json` records Job version, executable file hashes
+and an empty mismatch list for the deployed source comparison.
 
 The validated live scope is PA-VM 11.2.8 on KVM, three recognized VirtIO guest
 adapters, two explicit configured virtual interfaces, and a third unconfigured

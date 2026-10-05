@@ -1,10 +1,15 @@
-"""Run live GET-only discovery through the actual Job without saving inventory.
+"""Run live read-only discovery through the actual Job without saving inventory.
 
 Execute in the lab Nautobot Django environment with ``runpy.run_path``. Job
 reports are captured in memory; optional ``NAUTOBOT_DISCOVERY_REPORT_PATH``
 saves the complete JSON report to a local file rather than a FileProxy row.
-Credentials are resolved by the normal Device Secrets Group code and are
-never printed. The default verifies TLS; explicitly set
+Select a Device explicitly with ``NAUTOBOT_DISCOVERY_DEVICE_ID`` or ``device_id``.
+Optional ``NAUTOBOT_DISCOVERY_EXPECTED_ADAPTER`` verifies platform dispatch
+before opening a device connection. An explicit ``endpoint_host`` or
+``NAUTOBOT_DISCOVERY_ENDPOINT_HOST`` selects a literal IP only for this process
+when native primary-IP validation requires an unobserved Interface. Credentials
+are resolved by the normal
+Device Secrets Group code and are never printed. The default verifies TLS; set
 ``NAUTOBOT_DISCOVERY_VERIFY_TLS=false`` for a lab self-signed certificate.
 """
 
@@ -13,16 +18,18 @@ import logging
 import os
 import re
 import sys
+from contextlib import nullcontext
+from ipaddress import ip_address
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
-DEFAULT_DEVICE_ID = "eb46c008-e579-4207-8def-f9b6dfbdc525"
 WRITE_SQL = re.compile(r"^\s*(?:INSERT|UPDATE|DELETE|REPLACE|TRUNCATE)\b", re.IGNORECASE)
 
 
 def _boolean(value):
     if value.lower() not in ("true", "false"):
-        raise ValueError("NAUTOBOT_DISCOVERY_VERIFY_TLS must be true or false")
+        raise ValueError("Preview Boolean options must be true or false")
     return value.lower() == "true"
 
 
@@ -38,24 +45,41 @@ def run(
     ipam_override_networks="",
     ipam_group_user_vrfs=False,
     ipam_local_vrf_names="Mgmt-vrf",
+    expected_adapter=None,
+    ssh_strict=None,
+    allow_blocked=None,
+    endpoint_host=None,
 ):
-    """Collect live JSON and validate the Job preview without database mutation."""
+    """Collect structured live data and verify a zero-write Job preview."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from django.db import connection, transaction
     from django.test.utils import CaptureQueriesContext
     from nautobot.dcim.models import Device
     from nautobot.ipam.models import Namespace, VLANGroup
 
-    from jobs.discovery_job import DiscoverDevice
+    from jobs.discovery_job import DiscoverDevice, _adapter
     from jobs.nautobot_inventory import snapshot_inventory
 
-    device_id = device_id or os.environ.get("NAUTOBOT_DISCOVERY_DEVICE_ID", DEFAULT_DEVICE_ID)
+    device_id = device_id or os.environ.get("NAUTOBOT_DISCOVERY_DEVICE_ID")
+    if not device_id:
+        raise ValueError("Select the lab Device explicitly with NAUTOBOT_DISCOVERY_DEVICE_ID")
     if verify_tls is None:
         verify_tls = _boolean(os.environ.get("NAUTOBOT_DISCOVERY_VERIFY_TLS", "true"))
     report_path = report_path or os.environ.get("NAUTOBOT_DISCOVERY_REPORT_PATH")
     if use_ntc_defaults is None:
         use_ntc_defaults = _boolean(os.environ.get("NAUTOBOT_DISCOVERY_USE_NTC_DEFAULTS", "false"))
+    if ssh_strict is None:
+        ssh_strict = _boolean(os.environ.get("NAUTOBOT_DISCOVERY_SSH_STRICT", "true"))
+    if allow_blocked is None:
+        allow_blocked = _boolean(os.environ.get("NAUTOBOT_DISCOVERY_ALLOW_BLOCKED", "false"))
+    endpoint_host = endpoint_host or os.environ.get("NAUTOBOT_DISCOVERY_ENDPOINT_HOST")
+    if endpoint_host:
+        endpoint_host = str(ip_address(endpoint_host))
     device = Device.objects.get(pk=device_id)
+    expected_adapter = expected_adapter or os.environ.get("NAUTOBOT_DISCOVERY_EXPECTED_ADAPTER")
+    adapter_name = _adapter(device).__name__.rsplit(".", 1)[-1]
+    if expected_adapter and adapter_name != expected_adapter:
+        raise ValueError("Selected Device uses %s; expected %s" % (adapter_name, expected_adapter))
     vlan_group_id = vlan_group_id or os.environ.get("NAUTOBOT_DISCOVERY_VLAN_GROUP_ID")
     vlan_group = VLANGroup.objects.get(pk=vlan_group_id) if vlan_group_id else None
     ipam_namespace_id = ipam_namespace_id or os.environ.get("NAUTOBOT_DISCOVERY_IPAM_NAMESPACE_ID")
@@ -75,23 +99,36 @@ def run(
         def create_file(self, filename, data):
             captured_files.append((filename, data))
 
-    with transaction.atomic():
+    transport_host = (
+        patch("jobs.discovery_job._host", return_value=endpoint_host)
+        if endpoint_host
+        else nullcontext()
+    )
+    with transaction.atomic(), transport_host:
         try:
             with CaptureQueriesContext(connection) as captured:
                 job = PreviewJob()
-                result = job.run(
-                    device=device,
-                    dryrun=True,
-                    verify_tls=verify_tls,
-                    vlan_group=vlan_group,
-                    use_ntc_defaults=use_ntc_defaults,
-                    ipam_namespace=ipam_namespace,
-                    ipam_override_namespace=ipam_override_namespace,
-                    ipam_override_rfc1918=ipam_override_rfc1918,
-                    ipam_override_networks=ipam_override_networks,
-                    ipam_group_user_vrfs=ipam_group_user_vrfs,
-                    ipam_local_vrf_names=ipam_local_vrf_names,
-                )
+                result = None
+                try:
+                    result = job.run(
+                        device=device,
+                        dryrun=True,
+                        verify_tls=verify_tls,
+                        ssh_strict=ssh_strict,
+                        vlan_group=vlan_group,
+                        use_ntc_defaults=use_ntc_defaults,
+                        ipam_namespace=ipam_namespace,
+                        ipam_override_namespace=ipam_override_namespace,
+                        ipam_override_rfc1918=ipam_override_rfc1918,
+                        ipam_override_networks=ipam_override_networks,
+                        ipam_group_user_vrfs=ipam_group_user_vrfs,
+                        ipam_local_vrf_names=ipam_local_vrf_names,
+                    )
+                except RuntimeError:
+                    failure_report = job.request.meta.get("discovery_report", {})
+                    if not allow_blocked or not failure_report.get("plan", {}).get("errors"):
+                        raise
+                    assert not failure_report["applied"]
             assert result is None, "Detailed discovery data must not appear in the main result"
             report = job.request.meta["discovery_report"]
             writes = [query for query in captured.captured_queries if WRITE_SQL.match(query["sql"])]
@@ -113,11 +150,16 @@ def run(
         Path(report_path).write_text(captured_files[0][1] + "\n", encoding="utf-8")
     return {
         "device_id": str(device.pk),
+        "adapter": adapter_name,
+        "endpoint_host": endpoint_host,
         "dry_run": True,
         "use_ntc_defaults": use_ntc_defaults,
         "applied": False,
+        "blocked": bool(report["plan"]["errors"]),
         "database_write_statements": 0,
         "identity": report["discovery"]["identity"],
+        "observations": report["discovery"].get("observations", {}),
+        "sources": report["discovery"].get("sources", {}),
         "stack": report["discovery"].get("stack", {}),
         "stack_plan": report["plan"].get("stack", {}),
         "summary": report["plan"]["summary"],

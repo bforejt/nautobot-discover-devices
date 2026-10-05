@@ -3,6 +3,7 @@
 import re
 from collections import defaultdict
 
+from .adapters import cisco_iosxe, panos
 from .adapters.cisco_iosxe import canonical_interface_name, canonical_software_version
 from .reconcile_components import plan_components
 from .reconcile_console import plan_console_ports, reviewed_profile
@@ -10,6 +11,7 @@ from .reconcile_ipam import plan_ipam
 from .reconcile_route_targets import plan_route_targets
 from .reconcile_stack import plan_stack
 from .reconcile_vlans import plan_vlans
+from .transport_ssh import INTERFACES, RUNNING_INTERFACES
 
 INTERFACE_FIELDS = (
     "type",
@@ -70,16 +72,48 @@ def _mac(value):
     return ":".join(value[i : i + 2] for i in range(0, len(value), 2))
 
 
-def _equal(field, before, after):
+def _equal(field, before, after, *, canonical_version=canonical_software_version):
     if field == "mac_address":
         return _mac(before) == _mac(after)
     if field == "software_version":
-        before_version = canonical_software_version(before)
-        after_version = canonical_software_version(after)
+        before_version = canonical_version(before)
+        after_version = canonical_version(after)
         if before_version is None or after_version is None:
             return before == after
         return before_version == after_version
     return before == after
+
+
+def _panos_native_values(fact, name, values, plan):
+    """Require schema-v1 applied evidence for every PAN-OS configured field."""
+    source = fact.get("source")
+    reviewed = (
+        isinstance(source, dict)
+        and source.get("contract") == "panos-interface-v1"
+        and source.get("operational_command") == INTERFACES
+        and source.get("hardware_path") == "result/hw/entry"
+        and source.get("name") == name
+        and source.get("applied_command") == RUNNING_INTERFACES
+        and source.get("applied_path") == "result/interface/ethernet/entry"
+    )
+    for field in ("enabled", "description", "mtu"):
+        after = values[field]
+        if _blank(after):
+            continue
+        valid = reviewed
+        if field == "enabled":
+            valid = valid and type(after) is bool
+            if valid:
+                state = source.get("link_state")
+                valid = state in ("up", "down") and after is (state == "up")
+        elif field == "description":
+            valid = valid and isinstance(after, str) and source.get("comment") == after
+        elif field == "mtu":
+            raw = source.get("mtu") if reviewed else None
+            valid = valid and type(after) is int and panos.configured_mtu(raw) == after
+        if not valid:
+            plan["errors"].append("%s: invalid PAN-OS applied %s provenance" % (name, field))
+            values[field] = None
 
 
 def _management_value(discovery, fact, row, effective_type, plan, conflict):
@@ -163,10 +197,25 @@ def build_plan(discovery, existing):
     Explicit physical Ethernet observations can use Other to mean capability
     unknown. Unclassified interface types are reported and skipped, never guessed.
     """
-    if discovery.get("adapter") != "cisco_iosxe" or discovery.get("schema_version") != 1:
+    adapter_name = discovery.get("adapter")
+    if (
+        adapter_name not in ("cisco_iosxe", "panos")
+        or discovery.get("schema_version") != 1
+        or (adapter_name == "panos" and type(discovery.get("schema_version")) is not int)
+    ):
         raise ValueError("Unsupported discovery adapter or schema version")
+    adapter = panos if adapter_name == "panos" else cisco_iosxe
+    canonical_interface_name = adapter.canonical_interface_name
+    canonical_software_version = adapter.canonical_software_version
+
+    def equal(field, before, after):
+        return _equal(field, before, after, canonical_version=canonical_software_version)
+
+    # PAN-OS schema v1 inventories identity and physical ports only. Keep all
+    # Cisco-only domain planners on their established no-op paths.
+    domain_discovery = discovery if adapter is cisco_iosxe else {"identity": discovery["identity"]}
     device = existing["device"]
-    stack = plan_stack(discovery, existing)
+    stack = plan_stack(domain_discovery, existing)
     identity = stack["identity"]
     plan = {
         "schema_version": 1,
@@ -185,6 +234,22 @@ def build_plan(discovery, existing):
         "excluded_interfaces": list(discovery.get("excluded_interfaces", [])),
         "unknown_interface_capabilities": [],
     }
+
+    if adapter is panos:
+        manufacturer = str(device.get("manufacturer_name") or "").lower()
+        manufacturer = manufacturer.replace(" ", "").replace("-", "")
+        if manufacturer not in ("paloalto", "paloaltonetworks"):
+            plan["errors"].append("The selected DeviceType manufacturer must be Palo Alto Networks")
+        driver = str(device.get("platform_network_driver") or "").lower()
+        platform_name = str(device.get("platform_name") or "").lower()
+        platform_name = platform_name.replace("-", "").replace("_", "").replace(" ", "")
+        if driver not in ("paloalto_panos", "panos") and not (
+            not driver and platform_name in ("panos", "paloaltopanos")
+        ):
+            plan["errors"].append("The selected Device must have a PAN-OS platform")
+        for field in ("stack", "components", "console_ports", "layer2", "ipam", "lag_memberships"):
+            if discovery.get(field) is not None:
+                plan["errors"].append("PAN-OS schema v1 does not support %s inventory" % field)
 
     def conflict(scope, name, field, before, after):
         plan["conflicts"].append(
@@ -210,18 +275,21 @@ def build_plan(discovery, existing):
             continue
         if _blank(before):
             plan["device_updates"].append({"field": field, "before": before, "after": after})
-        elif not _equal(field, before, after):
+        elif not equal(field, before, after):
             conflict("device", device.get("name"), field, before, after)
 
     if any(change["field"] == "software_version" for change in plan["device_updates"]):
         if not device.get("platform_id"):
-            plan["errors"].append("Assign the Device's IOS XE platform before loading software")
+            plan["errors"].append(
+                "Assign the Device's %s platform before loading software"
+                % ("PAN-OS" if adapter is panos else "IOS XE")
+            )
         version = canonical_software_version(identity["software_version"])
         if version is None:
             plan["errors"].append("Discovered software version is not a supported release token")
         versions = []
         for row in existing.get("software_versions", []):
-            if _equal("software_version", row["version"], version):
+            if equal("software_version", row["version"], version):
                 versions.append(row)
         if len(versions) > 1:
             plan["errors"].append("Several SoftwareVersion records represent release %s" % version)
@@ -254,6 +322,14 @@ def build_plan(discovery, existing):
             continue
         observed.add(name)
         values = {field: fact.get(field) for field in INTERFACE_FIELDS}
+        if adapter is panos:
+            for field in ("type", "mac_address", "speed", "duplex", "port_type", "mgmt_only"):
+                if not _blank(values[field]):
+                    plan["warnings"].append(
+                        "%s: PAN-OS schema v1 retains %s as report-only evidence" % (name, field)
+                    )
+                values[field] = None
+            _panos_native_values(fact, name, values, plan)
         for field in existing.get("unsupported_interface_fields", []):
             if not _blank(values.get(field)):
                 plan["warnings"].append(
@@ -267,7 +343,11 @@ def build_plan(discovery, existing):
             type_source = "existing DeviceType interface template"
         if len(by_name[name]) > 1:
             continue
-        capability_unknown = not values["type"] and _observed_physical_ethernet(fact, name)
+        capability_unknown = not values["type"] and (
+            panos.observed_physical_ethernet(fact, name)
+            if adapter is panos
+            else _observed_physical_ethernet(fact, name)
+        )
         if capability_unknown:
             preserved_type = by_name[name][0].get("type") if by_name[name] else None
             plan["unknown_interface_capabilities"].append(
@@ -280,7 +360,12 @@ def build_plan(discovery, existing):
             )
             if not by_name[name]:
                 values["type"] = "other"
-                type_source = UNKNOWN_ETHERNET_TYPE_SOURCE
+                type_source = (
+                    "Reviewed PAN-OS physical Ethernet evidence; maximum physical capability "
+                    "unknown; Nautobot Other is an explicit unknown capability placeholder"
+                    if adapter is panos
+                    else UNKNOWN_ETHERNET_TYPE_SOURCE
+                )
             plan["warnings"].append(
                 "%s: observed physical Ethernet, maximum capability unknown; %s"
                 % (
@@ -300,7 +385,8 @@ def build_plan(discovery, existing):
                 plan,
                 conflict,
             )
-            if "mgmt_only" not in existing.get("unsupported_interface_fields", [])
+            if adapter is cisco_iosxe
+            and "mgmt_only" not in existing.get("unsupported_interface_fields", [])
             else None
         )
         if effective_type in {"virtual", "bridge", "lag", "tunnel"} or str(
@@ -357,25 +443,27 @@ def build_plan(discovery, existing):
                 continue
             if _blank(before):
                 changes.append({"field": field, "before": before, "after": after})
-            elif not _equal(field, before, after):
+            elif not equal(field, before, after):
                 conflict("interface", row["name"], field, before, after)
         if changes:
             plan["interface_updates"].append(
                 {"id": str(row["id"]), "name": row["name"], "changes": changes}
             )
 
-    _lag_assignments(discovery, plan, by_name, observed, conflict)
-    plan["layer2"] = plan_vlans(discovery, existing, interface_plan=plan)
+    _lag_assignments(domain_discovery, plan, by_name, observed, conflict)
+    plan["layer2"] = plan_vlans(domain_discovery, existing, interface_plan=plan)
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["layer2"][key])
-    plan["components"] = plan_components(discovery, existing, interface_plan=plan, stack_plan=stack)
+    plan["components"] = plan_components(
+        domain_discovery, existing, interface_plan=plan, stack_plan=stack
+    )
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["components"][key])
-    plan["console_ports"] = plan_console_ports(discovery, existing, stack_plan=stack)
+    plan["console_ports"] = plan_console_ports(domain_discovery, existing, stack_plan=stack)
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["console_ports"][key])
-    plan["ipam"] = plan_ipam(discovery, existing, interface_plan=plan)
-    route_targets = plan_route_targets(discovery, existing, plan["ipam"])
+    plan["ipam"] = plan_ipam(domain_discovery, existing, interface_plan=plan)
+    route_targets = plan_route_targets(domain_discovery, existing, plan["ipam"])
     for key in ("route_targets", "vrf_route_targets"):
         plan["ipam"][key] = route_targets[key]
     for key in ("unresolved", "conflicts", "errors", "warnings"):

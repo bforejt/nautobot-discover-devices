@@ -5,7 +5,10 @@ from the device, then fills missing identity, interface, console connector,
 reported serialized hardware inventory, scoped 802.1Q assignments, configured
 static IPv4/IPv6 addressing, and explicitly mapped named VRFs. The first adapter
 supports Cisco IOS XE switches on 17.9
-or later using RESTCONF JSON exclusively. The job defaults to a preview.
+or later using RESTCONF JSON exclusively. PAN-OS schema v1 adds SSH/XML identity
+and conservative interface collection; see the [PAN-OS contract](docs/panos-discovery.md)
+for the PA-VM 11.2.8 lab evidence and unresolved physical capability.
+The job defaults to a preview.
 
 This project targets Nautobot 3.2. Native `SoftwareVersion` is used for
 the main Device software field; that model requires Nautobot 2.2 or later.
@@ -48,7 +51,8 @@ Provide this repository through Nautobot's Git Repositories datasource with
 `Jobs` selected as provided content. Sync the repository, then enable
 `Device Discovery / Discover Device` in Nautobot's Jobs administration. The
 `jobs/__init__.py` entry point registers the job. Workers need Nautobot and
-`requests`; repository synchronization does not install Python packages.
+`requests`; PAN-OS workers also need `netmiko` (which supplies Paramiko).
+Repository synchronization does not install Python packages.
 
 Before running, select an existing Device with:
 
@@ -60,6 +64,13 @@ Before running, select an existing Device with:
   supported RESTCONF, HTTP, REST, then Generic access types.
 - RESTCONF reachable over HTTPS and permission to read the required models.
 
+For PAN-OS, select an existing Palo Alto Networks DeviceType and a PAN-OS
+Platform (`paloalto_panos` or `panos`). SSH credentials resolve SSH then Generic
+access in the selected Secrets Group. SSH host-key checking defaults to enabled
+and reads the worker account's known hosts. Use the explicit host-key checkbox
+for a lab connection without installed keys. Cisco-only inventory options and
+the guessing checkbox do not grant PAN-OS new mapping/default rules.
+
 The job form contains these inputs:
 
 | Input | Default | Behavior |
@@ -67,7 +78,9 @@ The job form contains these inputs:
 | Device | Required | Existing Device to verify and enrich |
 | Dry run | Enabled | Collect, compare, and validate without inventory writes |
 | Verify TLS | Enabled | Verify the device HTTPS certificate |
-| RESTCONF port | 443 | Device HTTPS port |
+| RESTCONF port | 443 | Cisco HTTPS port |
+| SSH port | 22 | PAN-OS SSH port |
+| Verify SSH host key | Enabled | Validate PAN-OS host keys against worker known hosts |
 | Secrets Group | Device's group | Optional credential override |
 | Interface status | Applicable `Active` | Status for newly created interfaces |
 | Software version status | Applicable `Active` | Status for newly created software versions |
@@ -122,8 +135,9 @@ it issues no inventory INSERT, UPDATE, or DELETE statements, including software
 and module catalogs, Module Bays, Modules, interface ownership, VLANs, and
 tagged-VLAN relationships. Unsaved catalog and component objects are validated
 before an apply is offered.
-Device requests are GET-only in both modes. No CLI or unstructured output
-fallback is present. Authentication values and raw response bodies are omitted
+Cisco requests are GET-only in both modes. PAN-OS uses three exact read-only
+SSH commands returning XML, plus session presentation settings. No unstructured
+output fallback is present. Authentication values and raw response bodies are omitted
 from request diagnostics. The report contains inventory facts such as serials,
 MAC addresses, and descriptions.
 

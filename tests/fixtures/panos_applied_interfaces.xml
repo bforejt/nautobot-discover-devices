@@ -1,0 +1,5 @@
+<response status="success"><result><interface><ethernet>
+  <entry name="ethernet1/1"><link-state>up</link-state><comment>External interface</comment><layer3><mtu>1500</mtu></layer3></entry>
+  <entry name="ethernet1/2"><link-state>up</link-state><comment>Internal interface</comment><layer3><mtu>9192</mtu></layer3></entry>
+  <entry name="ethernet1/7"><link-state>down</link-state></entry>
+</ethernet></interface></result></response>

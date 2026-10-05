@@ -1,4 +1,5 @@
-These are reduced, sanitized RESTCONF JSON fixtures, not raw lab captures.
+The IOS XE fixtures are reduced, sanitized RESTCONF JSON; the PAN-OS XML
+fixtures are described at the end of this document.
 
 The 71 interface names and presence states preserve the useful shape of the
 `iosxe_interfaces_oper_lab.json` fixture in `/opt/stacks/nautobot-testsuite`:
@@ -61,3 +62,16 @@ observations. The collectors validate
 known excluded interfaces before retaining them outside the writable list.
 The native schema references are the Cisco-published IOS XE 17.9.1 and 17.18.1
 `Cisco-IOS-XE-interfaces.yang` and `Cisco-IOS-XE-ip.yang` model sets in YangModels.
+
+
+`panos_system_info.txt` and `panos_interfaces.txt` are sanitized XML fixtures
+adapted from nautobot-testsuite commit
+`7a2bc1638fe23c5ac23fb9d718f5dc9b79eb4fb9` (Apache-2.0), with only trailing
+blank lines removed. They describe a
+synthetic PA-5250 / 11.1.4-h7 identity and three hardware rows, including down,
+unaddressed `ethernet1/7`, plus logical observations. They are parser evidence,
+not a live compatibility claim. `panos_applied_interfaces.xml` is newly created
+synthetic applied configuration with explicit link-state and selected MTU/comment
+leaves. These fixtures contain no credentials. The live unlicensed PA-VM 11.2.8
+had empty hardware/logical/applied Ethernet containers and no usable serial;
+its report is retained separately in ignored artifacts.

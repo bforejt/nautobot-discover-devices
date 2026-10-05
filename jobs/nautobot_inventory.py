@@ -13,7 +13,7 @@ from nautobot.dcim.models import (
 from nautobot.extras.models import Status
 from nautobot.ipam.models import Namespace
 
-from .adapters.cisco_iosxe import canonical_interface_name
+from .adapters import cisco_iosxe, panos
 from .exceptions import InventoryError
 from .nautobot_components import (
     component_objects,
@@ -81,6 +81,11 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None, i
             "name": device.name,
             "serial": device.serial,
             "model": device.device_type.model,
+            "manufacturer_name": device.device_type.manufacturer.name,
+            "platform_name": device.platform.name if device.platform_id else None,
+            "platform_network_driver": getattr(device.platform, "network_driver", None)
+            if device.platform_id
+            else None,
             "platform_id": str(device.platform_id) if device.platform_id else None,
             "software_version": device.software_version.version
             if device.software_version_id
@@ -201,6 +206,11 @@ def _objects(
     if plan["lag_assignments"] or component_plan["interface_assignments"] or vlan_work or ipam_work:
         interfaces = (
             device.all_interfaces if hasattr(device, "all_interfaces") else device.interfaces
+        )
+        canonical_interface_name = (
+            panos.canonical_interface_name
+            if plan["adapter"] == "panos"
+            else cisco_iosxe.canonical_interface_name
         )
         objects = {canonical_interface_name(row.name): row for row in interfaces}
         objects.update({canonical_interface_name(row.name): row for row in creates + updates})

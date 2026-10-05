@@ -1,0 +1,57 @@
+<!-- Allowlisted actual PA-VM 11.2.8 applied IPAM source, 2026-10-05 12:06:53 UTC; unrelated branches removed. -->
+<response status="success">
+  <result>
+    <network>
+      <interface>
+        <ethernet>
+          <entry name="ethernet1/1">
+            <layer3>
+              <ip>
+                <entry name="198.18.101.3/29" />
+              </ip>
+            </layer3>
+          </entry>
+          <entry name="ethernet1/2">
+            <layer3 />
+          </entry>
+        </ethernet>
+        <loopback>
+          <units>
+            <entry name="loopback.1">
+              <ip>
+                <entry name="10.255.103.1/32" />
+              </ip>
+              <ipv6>
+                <enabled>yes</enabled>
+                <address>
+                  <entry name="2001:db8:103::1/128">
+                    <enable-on-interface>yes</enable-on-interface>
+                  </entry>
+                </address>
+              </ipv6>
+            </entry>
+          </units>
+        </loopback>
+        <tunnel>
+          <units>
+            <entry name="tunnel.1">
+              <ip>
+                <entry name="198.18.102.2/30" />
+              </ip>
+            </entry>
+          </units>
+        </tunnel>
+      </interface>
+      <virtual-router>
+        <entry name="default" />
+        <entry name="lab-vpn-vr">
+          <interface>
+            <member>ethernet1/1</member>
+            <member>loopback.1</member>
+            <member>tunnel.1</member>
+          </interface>
+        </entry>
+      </virtual-router>
+    </network>
+  </result>
+</response>

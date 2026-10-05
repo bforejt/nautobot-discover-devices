@@ -8,6 +8,7 @@ from .adapters.cisco_iosxe import canonical_interface_name, canonical_software_v
 from .reconcile_components import plan_components
 from .reconcile_console import plan_console_ports, reviewed_profile
 from .reconcile_ipam import plan_ipam
+from .reconcile_panos_ipam import plan_panos_ipam
 from .reconcile_route_targets import plan_route_targets
 from .reconcile_stack import plan_stack
 from .reconcile_vlans import plan_vlans
@@ -314,7 +315,7 @@ def build_plan(discovery, existing):
     def equal(field, before, after):
         return _equal(field, before, after, canonical_version=canonical_software_version)
 
-    # PAN-OS schema v1 inventories identity and physical ports only. Keep all
+    # PAN-OS has its own explicit IPAM contract. Keep the remaining
     # Cisco-only domain planners on their established no-op paths.
     domain_discovery = discovery if adapter is cisco_iosxe else {"identity": discovery["identity"]}
     device = existing["device"]
@@ -350,7 +351,7 @@ def build_plan(discovery, existing):
             not driver and platform_name in ("panos", "paloaltopanos")
         ):
             plan["errors"].append("The selected Device must have a PAN-OS platform")
-        for field in ("stack", "components", "console_ports", "layer2", "ipam", "lag_memberships"):
+        for field in ("stack", "components", "console_ports", "layer2", "lag_memberships"):
             if discovery.get(field) is not None:
                 plan["errors"].append("PAN-OS schema v1 does not support %s inventory" % field)
 
@@ -569,7 +570,11 @@ def build_plan(discovery, existing):
     plan["console_ports"] = plan_console_ports(domain_discovery, existing, stack_plan=stack)
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["console_ports"][key])
-    plan["ipam"] = plan_ipam(domain_discovery, existing, interface_plan=plan)
+    plan["ipam"] = (
+        plan_panos_ipam(discovery, existing, interface_plan=plan)
+        if adapter is panos
+        else plan_ipam(domain_discovery, existing, interface_plan=plan)
+    )
     route_targets = plan_route_targets(domain_discovery, existing, plan["ipam"])
     for key in ("route_targets", "vrf_route_targets"):
         plan["ipam"][key] = route_targets[key]

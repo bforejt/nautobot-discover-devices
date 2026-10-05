@@ -1,0 +1,21 @@
+<!-- Allowlisted actual PA-VM 11.2.8 applied IPAM source, 2026-10-05 12:06:53 UTC; unrelated branches removed. -->
+<response status="success">
+  <result>
+    <vsys>
+      <entry name="vsys1">
+        <import>
+          <network>
+            <interface>
+              <member>ethernet1/1</member>
+              <member>loopback.1</member>
+              <member>tunnel.1</member>
+            </interface>
+            <virtual-router>
+              <member>lab-vpn-vr</member>
+            </virtual-router>
+          </network>
+        </import>
+      </entry>
+    </vsys>
+  </result>
+</response>

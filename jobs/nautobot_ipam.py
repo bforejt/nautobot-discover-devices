@@ -6,10 +6,10 @@ import ipaddress
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 from nautobot.dcim.models import Location
+from nautobot.ipam import models as ipam_models
 from nautobot.ipam.models import (
     VRF,
     IPAddress,
-    IPAddressRange,
     IPAddressToInterface,
     Namespace,
     Prefix,
@@ -27,6 +27,17 @@ from .nautobot_route_targets import (
     snapshot_route_targets,
     validate_route_target_objects,
 )
+from .reconcile_panos_ipam import canonical_panos_ipam_name
+
+IPAddressRange = getattr(ipam_models, "IPAddressRange", None)
+
+
+def _canonical(plan, name):
+    return (
+        canonical_panos_ipam_name(name)
+        if plan.get("adapter") == "panos"
+        else canonical_interface_name(name)
+    )
 
 
 def _id(value):
@@ -44,6 +55,7 @@ def _namespace_ids(policy):
             for scope in (policy.get("default_namespace"), policy.get("override_namespace"))
             if scope is not None
         }
+        | {str(row["namespace"]["id"]) for row in policy.get("panos_routing_domains", [])}
     )
 
 
@@ -51,6 +63,15 @@ def snapshot_ipam(device, policy, *, lock=False, discovery=None):
     """Include complete scoped hierarchy and cross-scope device references for safety."""
     if policy is None:
         return {"supported": True, "policy": None}
+    if not hasattr(IPAddress(), "_closest_parent_cache"):
+        return {
+            "supported": False,
+            "policy": copy.deepcopy(policy),
+            "reason": (
+                "Installed IPAddress model lacks write-free staged-parent validation; "
+                "IPAM is report-only"
+            ),
+        }
     namespace_ids = _namespace_ids(policy)
     namespaces = list(_locked(Namespace.objects.filter(pk__in=namespace_ids).order_by("pk"), lock))
     if len(namespaces) != len(namespace_ids):
@@ -107,11 +128,15 @@ def snapshot_ipam(device, policy, *, lock=False, discovery=None):
         .order_by("pk"),
         lock,
     )
-    ranges = _locked(
-        IPAddressRange.objects.filter(parent__namespace_id__in=namespace_ids)
-        .select_related("parent")
-        .order_by("pk"),
-        lock,
+    ranges = (
+        _locked(
+            IPAddressRange.objects.filter(parent__namespace_id__in=namespace_ids)
+            .select_related("parent")
+            .order_by("pk"),
+            lock,
+        )
+        if IPAddressRange is not None
+        else []
     )
     route_targets = snapshot_route_targets(vrfs, lock=lock)
     return {
@@ -140,7 +165,7 @@ def snapshot_ipam(device, policy, *, lock=False, discovery=None):
                 "vrf_id": str(row.vrf_id),
                 "device_id": _id(row.device_id),
                 "virtual_machine_id": _id(row.virtual_machine_id),
-                "virtual_device_context_id": _id(row.virtual_device_context_id),
+                "virtual_device_context_id": _id(getattr(row, "virtual_device_context_id", None)),
                 "name": row.name,
                 "rd": row.rd,
                 "effective_name": row.name or row.vrf.name,
@@ -286,10 +311,10 @@ def ipam_objects(plan, interfaces, device, *, prefix_status, ip_address_status, 
         )
         objects["ip_addresses"][spec["key"]] = address
     for spec in plan["interface_vrfs"]:
-        interface = interfaces[canonical_interface_name(spec["name"])]
+        interface = interfaces[_canonical(plan, spec["name"])]
         objects["interface_vrfs"].append((interface, spec))
     for spec in plan["ip_assignments"]:
-        interface = interfaces[canonical_interface_name(spec["name"])]
+        interface = interfaces[_canonical(plan, spec["name"])]
         assignment = (
             IPAddressToInterface(
                 ip_address=objects["ip_addresses"][spec["ip_key"]],
@@ -359,6 +384,8 @@ def _validate_hierarchy(objects, graph):
         (IPAddress, "host", None),
         (IPAddressRange, "start_host", "end_host"),
     ):
+        if model is None:
+            continue
         rows = model.objects.filter(parent__namespace_id__in=namespace_ids).select_related("parent")
         for row in rows:
             candidate = _closest(
@@ -372,10 +399,14 @@ def _validate_hierarchy(objects, graph):
                 raise InventoryError(
                     "A planned Prefix would change existing IP or range VRF associations"
                 )
-    exclusive = list(
-        IPAddressRange.objects.filter(
-            parent__namespace_id__in=namespace_ids, is_exclusive=True
-        ).select_related("parent")
+    exclusive = (
+        list(
+            IPAddressRange.objects.filter(
+                parent__namespace_id__in=namespace_ids, is_exclusive=True
+            ).select_related("parent")
+        )
+        if IPAddressRange is not None
+        else []
     )
     for spec in objects["plan"]["prefixes"]:
         if not spec["create"]:
@@ -495,8 +526,7 @@ def validate_ipam_objects(objects, device):
             or assignment.interface.device_id != device.pk
             or spec.get("interface_id") is not None
             and str(assignment.interface_id) != str(spec["interface_id"])
-            or canonical_interface_name(assignment.interface.name)
-            != canonical_interface_name(spec["name"])
+            or _canonical(plan, assignment.interface.name) != _canonical(plan, spec["name"])
             or assignment.ip_address_id != objects["ip_addresses"][spec["ip_key"]].pk
         ):
             raise InventoryError("Invalid discovered IP Address Assignment")

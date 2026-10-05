@@ -11,9 +11,44 @@ Current identity/interface work is described in the
 [VM-Series validation contract](panos-vm-validation.md). Job `0.20.0-dev` adds
 [HA/IPsec collection](panos-ha-vpn-collection.md) as report-only observations,
 with separate applied/runtime contracts and the existing outer schema v1.
+Job `0.21.0-dev` adds [static IPAM processing](panos-ipam-discovery.md), with
+explicit existing Namespace/VRF targets and applied vsys/router evidence.
 Continue from the checked current repository state rather than repeating the
 original Cisco-only framework migration. Historical proof counts below do not
 describe this new increment's validation.
+
+## Current IPAM increment
+
+PAN-OS IPAM now collects literal applied IPv4/IPv6 addresses, exact supported
+interface identities, virtual-router membership and vsys imports. The existing
+network-parent read is reused; one fixed vsys-parent read is added. Blank
+**PAN-OS routing domain mappings** keeps processing report-only. A mapping must
+select an existing Namespace and either an existing VRF in that Namespace or
+explicit `null` for global routing. Cisco Namespace and grouping controls do
+not establish PAN-OS targets.
+
+The shared IPAM planner/native boundary supplies prefix hierarchy and range
+checks, fill-only preservation, atomic application and repeat behavior. Existing
+logical Interfaces may receive addresses; their automatic creation remains
+outside this increment. Any enabled HA observation keeps Layer-3 proposals
+report-only until a sharing policy is reviewed. Explicit disabled HA evidence
+is required for native proposals. IPv6 needs literal addressing and explicit
+interface/address enable flags; dynamic, generated and anycast forms remain
+observations.
+
+Native capabilities are detected without version branches. Missing staged
+IPAddress parent-validation capability retains IPAM in the report, rather than
+skipping native validation. No full Nautobot 2.4 runtime result is claimed.
+The [IPAM contract](panos-ipam-discovery.md) records current validation and the
+separate authorized standalone-peer IPv6 lab setup. Historical HA/VPN proof
+below remains the `0.20.0-dev` checkpoint.
+
+The frozen implementation passed 970 offline tests on Python 3.14/3.12,
+17 PAN IPAM, 22 PAN and 150 Cisco native rollback checks on Nautobot 3.2.6,
+strict SSH collection on all three VMs, and the actual standalone-peer Job's
+dual-stack preview/apply/repeat. Preview/repeat issued zero DML; apply processed
+four static hosts and the unconditional outer rollback restored all test
+inventory. The lab Jobs package is installed as `0.21.0-dev`.
 
 ## Current HA/VPN increment
 

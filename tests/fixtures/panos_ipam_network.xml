@@ -1,0 +1,56 @@
+<!-- Synthetic applied network: reviewed PA-VM 11.2.8 envelopes and official interface schemas. -->
+<response status="success"><result><network>
+  <interface>
+    <ethernet>
+      <entry name="ethernet1/1"><layer3>
+        <ip><entry name="192.0.2.1/24"/></ip>
+        <ipv6><enabled>yes</enabled><address><entry name="2001:db8:1::1/64">
+          <enable-on-interface>yes</enable-on-interface>
+          <advertise><enable>yes</enable><onlink-flag>no</onlink-flag></advertise>
+        </entry></address></ipv6>
+        <units><entry name="ethernet1/1.100">
+          <ip><entry name="10.100.0.1/24"/></ip>
+          <ipv6><enabled>yes</enabled><address><entry name="2001:db8:100::1/64">
+            <enable-on-interface>yes</enable-on-interface>
+          </entry></address></ipv6>
+        </entry></units>
+      </layer3></entry>
+      <entry name="ethernet1/2"><layer2><units><entry name="ethernet1/2.101"/></units></layer2></entry>
+      <entry name="ethernet1/3"><ha/></entry>
+      <entry name="ethernet1/4"><virtual-wire/></entry>
+      <entry name="ethernet1/5"><aggregate-group>ae1</aggregate-group></entry>
+    </ethernet>
+    <aggregate-ethernet><entry name="ae1"><layer3>
+      <ip><entry name="198.51.100.1/24"/></ip>
+      <ipv6><enabled>yes</enabled><address><entry name="2001:db8:2::1/64">
+        <enable-on-interface>yes</enable-on-interface>
+      </entry></address></ipv6>
+      <units><entry name="ae1.200">
+        <ip><entry name="10.200.0.1/24"/></ip>
+        <ipv6><enabled>yes</enabled><address><entry name="2001:db8:200::1/64">
+          <enable-on-interface>yes</enable-on-interface>
+        </entry></address></ipv6>
+      </entry></units>
+    </layer3></entry></aggregate-ethernet>
+    <loopback><units><entry name="loopback.1">
+      <ip><entry name="10.255.1.1/32"/></ip>
+      <ipv6><enabled>yes</enabled><address><entry name="2001:db8:255::1/128">
+        <enable-on-interface>yes</enable-on-interface>
+      </entry></address></ipv6>
+    </entry></units></loopback>
+    <tunnel><units><entry name="tunnel.1">
+      <ip><entry name="203.0.113.1/30"/></ip>
+      <ipv6><enabled>yes</enabled><address><entry name="2001:db8:3::1/64">
+        <enable-on-interface>yes</enable-on-interface>
+      </entry></address></ipv6>
+    </entry></units></tunnel>
+    <vlan><units><entry name="vlan.10"><ip><entry name="10.10.0.1/24"/></ip></entry></units></vlan>
+  </interface>
+  <virtual-router>
+    <entry name="vr-public"><interface>
+      <member>ethernet1/1</member><member>ae1</member><member>loopback.1</member><member>tunnel.1</member>
+    </interface></entry>
+    <entry name="vr-internal"><interface><member>ethernet1/1.100</member><member>ae1.200</member></interface></entry>
+    <entry name="unused"/>
+  </virtual-router>
+</network></result></response>

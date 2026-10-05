@@ -28,6 +28,9 @@ from .nautobot_console import (
     validate_console_ports,
 )
 from .nautobot_ipam import (
+    _namespace_ids as ipam_namespace_ids,
+)
+from .nautobot_ipam import (
     ipam_objects,
     save_ipam_assignments,
     save_ipam_catalog,
@@ -374,16 +377,7 @@ def apply_discovery(
     """Re-read under lock and apply the complete valid change set in one transaction."""
     with transaction.atomic():
         if ipam_policy is not None:
-            namespace_ids = sorted(
-                {
-                    row["id"]
-                    for row in (
-                        ipam_policy["default_namespace"],
-                        ipam_policy.get("override_namespace"),
-                    )
-                    if row is not None
-                }
-            )
+            namespace_ids = sorted(ipam_namespace_ids(ipam_policy))
             # Serialize shared Namespace catalogs before the per-Device locks.
             locked = list(
                 Namespace.objects.filter(pk__in=namespace_ids).order_by("pk").select_for_update()

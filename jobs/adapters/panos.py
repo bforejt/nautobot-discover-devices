@@ -18,6 +18,7 @@ from ..transport_ssh import (
     RUNNING_HA,
     RUNNING_INTERFACES,
     RUNNING_VPN,
+    RUNNING_VSYS,
     SYSTEM_INFO,
     VM_INTERFACES,
     VPN_FLOWS,
@@ -466,7 +467,8 @@ def _collect_ha_vpn(client, max_vpn_flow_details):
         "configuration": parse_ha_configuration(client.run(RUNNING_HA), command=RUNNING_HA),
         "runtime": parse_ha_state(client.run(HA_STATE), command=HA_STATE),
     }
-    configuration = parse_vpn_configuration(client.run(RUNNING_VPN), command=RUNNING_VPN)
+    network_output = client.run(RUNNING_VPN)
+    configuration = parse_vpn_configuration(network_output, command=RUNNING_VPN)
     ike_output = client.run(IKE_SAS)
     unresolved = []
     if isinstance(ike_output, str) and not ike_output.strip():
@@ -516,21 +518,25 @@ def _collect_ha_vpn(client, max_vpn_flow_details):
         if any(flow.get(field) != row.get(field) for field in fields):
             raise DiscoveryError("VPN flow identity changed between summary and detail reads")
         details.append(row)
-    return ha, {
-        "contract": "panos-vpn-v1",
-        "scope": "ipsec",
-        "configuration": configuration,
-        "runtime": {
-            "contract": "panos-vpn-runtime-v1",
-            "ike_sas": ike_sas,
-            "ipsec_sas": ipsec_sas,
-            "flows": flows,
-            "flow_details": details,
-            "complete": not unresolved,
-            "unresolved": unresolved,
+    return (
+        ha,
+        {
+            "contract": "panos-vpn-v1",
+            "scope": "ipsec",
+            "configuration": configuration,
+            "runtime": {
+                "contract": "panos-vpn-runtime-v1",
+                "ike_sas": ike_sas,
+                "ipsec_sas": ipsec_sas,
+                "flows": flows,
+                "flow_details": details,
+                "complete": not unresolved,
+                "unresolved": unresolved,
+            },
+            "native_writes": False,
         },
-        "native_writes": False,
-    }
+        network_output,
+    )
 
 
 def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None, max_vpn_flow_details=256):
@@ -584,7 +590,10 @@ def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None, max_vpn_fl
     if vm_rows is not None:
         sources["vm_interfaces"] = {"command": VM_INTERFACES, "path": "result/entry"}
         collected_observations["vm_interfaces"] = vm_rows
-    ha, vpn = _collect_ha_vpn(client, max_vpn_flow_details)
+    from .panos_ipam import parse_ipam_configuration
+
+    ha, vpn, network_output = _collect_ha_vpn(client, max_vpn_flow_details)
+    ipam = parse_ipam_configuration(network_output, client.run(RUNNING_VSYS))
     warnings.extend(row["reason"] for row in vpn["runtime"]["unresolved"])
     collected_observations["ha"] = ha
     collected_observations["vpn"] = vpn
@@ -607,6 +616,7 @@ def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None, max_vpn_fl
         "interfaces": interfaces,
         "excluded_interfaces": excluded,
         "warnings": warnings,
+        "ipam": ipam,
         "observations": collected_observations,
         "sources": sources,
     }

@@ -77,6 +77,11 @@ def _power_row(row):
 
 def snapshot_components(device, *, lock=False, discovery=None):
     """Include installed parts and candidate asset matches elsewhere in inventory."""
+    if (discovery or {}).get("adapter") == "panos" and discovery.get("components") is None:
+        return {
+            "supported": False,
+            "reason": "PAN-OS component inventory has no reviewed writer contract",
+        }
     try:
         ModuleType, ModuleBay, Module = _models()
     except ImportError:

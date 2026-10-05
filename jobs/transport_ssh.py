@@ -16,6 +16,7 @@ RUNNING_INTERFACES = "show config effective-running xpath devices/entry/network/
 HA_STATE = "show high-availability all"
 RUNNING_HA = "show config effective-running xpath devices/entry/deviceconfig"
 RUNNING_VPN = "show config effective-running xpath devices/entry/network"
+RUNNING_VSYS = "show config effective-running xpath devices/entry/vsys"
 IKE_SAS = "show vpn ike-sa"
 IPSEC_SAS = "show vpn ipsec-sa"
 VPN_FLOWS = "show vpn flow"
@@ -29,7 +30,8 @@ HA_VPN_READ_COMMANDS = (
     VPN_FLOWS,
 )
 READ_COMMANDS = frozenset(
-    (SYSTEM_INFO, INTERFACES, RUNNING_INTERFACES, VM_INTERFACES) + HA_VPN_READ_COMMANDS
+    (SYSTEM_INFO, INTERFACES, RUNNING_INTERFACES, VM_INTERFACES, RUNNING_VSYS)
+    + HA_VPN_READ_COMMANDS
 )
 _FLOW_DETAIL = re.compile(r"show vpn flow tunnel-id ([1-9][0-9]{0,4})")
 

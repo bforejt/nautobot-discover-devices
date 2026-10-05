@@ -1,6 +1,7 @@
 """Discover and enrich an existing device using structured device facts."""
 
 import json
+from uuid import UUID
 
 from nautobot.apps.jobs import BooleanVar, DryRunVar, IntegerVar, Job, ObjectVar, TextVar
 from nautobot.dcim.models import Device, Location
@@ -11,12 +12,36 @@ from .adapters import cisco_iosxe, panos
 from .credentials import CredentialsError, resolve_credentials
 from .ipam_policy import normalize_ipam_policy
 from .nautobot_inventory import InventoryError, apply_discovery, snapshot_inventory, validate_plan
+from .panos_ipam_policy import normalize_panos_ipam_policy
 from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 from .transport_ssh import PanosSshClient, SshError
 
 name = "Device Discovery"
-JOB_VERSION = "0.20.0-dev"
+JOB_VERSION = "0.21.0-dev"
+
+
+def _resolve_panos_ipam_target(kind, identifier, namespace_id):
+    """Read one explicitly selected native object, with no creation or fallback."""
+    from nautobot.ipam.models import VRF
+
+    model = Namespace if kind == "namespace" else VRF
+    try:
+        lookup = {"pk": str(UUID(identifier))}
+    except ValueError:
+        lookup = {"name": identifier}
+    if kind == "vrf":
+        lookup["namespace_id"] = namespace_id
+    try:
+        obj = model.objects.get(**lookup)
+    except (model.DoesNotExist, model.MultipleObjectsReturned):
+        raise ValueError(
+            "PAN-OS mapping target is missing or ambiguous in its selected scope"
+        ) from None
+    result = {"id": str(obj.pk), "name": obj.name}
+    if kind == "vrf":
+        result["namespace_id"] = str(obj.namespace_id)
+    return result
 
 
 def _host(device):
@@ -155,8 +180,19 @@ class DiscoverDevice(Job):
         required=False,
         label="Default IPAM namespace",
         description=(
-            "Select an existing Namespace to enable static IPv4/IPv6 and named VRF discovery. "
-            "Unmatched addresses use this Namespace. Leave blank for report-only IPAM."
+            "Cisco IOS XE: select an existing Namespace for static addressing and named VRFs. "
+            "PAN-OS uses the explicit routing-domain mappings below."
+        ),
+    )
+    panos_routing_domains = TextVar(
+        required=False,
+        default="",
+        label="PAN-OS routing-domain mappings",
+        description=(
+            "JSON list with exact vsys, virtual_router, namespace and vrf fields. "
+            "Select existing Namespace/VRF names or UUIDs; vrf:null explicitly selects global "
+            'routing. Example: [{"vsys":"vsys1","virtual_router":"lab-vpn-vr",'
+            '"namespace":"Lab","vrf":null}]. Blank: report-only PAN-OS IPAM.'
         ),
     )
     ipam_override_namespace = ObjectVar(
@@ -264,6 +300,7 @@ class DiscoverDevice(Job):
             "vlan_group",
             "vlan_status",
             "ipam_namespace",
+            "panos_routing_domains",
             "ipam_override_namespace",
             "ipam_override_rfc1918",
             "ipam_override_networks",
@@ -302,6 +339,7 @@ class DiscoverDevice(Job):
         ssh_strict=True,
         expected_vm_uuid="",
         max_vpn_flow_details=256,
+        panos_routing_domains="",
     ):
         device = Device.objects.get(pk=device.pk)
         report = {
@@ -323,26 +361,43 @@ class DiscoverDevice(Job):
             "Starting %s for %s.", "discovery preview" if dryrun else "discovery", device.name
         )
         try:
+            adapter = _adapter(device)
+            if adapter is not panos and panos_routing_domains:
+                raise ValueError("PAN-OS routing-domain mappings are supported only for PAN-OS")
+            panos_policy = (
+                normalize_panos_ipam_policy(
+                    panos_routing_domains,
+                    _resolve_panos_ipam_target,
+                    create_missing_prefixes=ipam_create_missing_prefixes,
+                )
+                if adapter is panos
+                else None
+            )
             location, location_reason = (
                 _prefix_location(device, ipam_location)
-                if ipam_namespace is not None
+                if (adapter is not panos and ipam_namespace is not None) or panos_policy is not None
                 else (None, None)
             )
-            ipam_policy = normalize_ipam_policy(
-                ipam_namespace,
-                ipam_override_namespace,
-                override_rfc1918=ipam_override_rfc1918,
-                override_networks=ipam_override_networks,
-                create_missing_prefixes=ipam_create_missing_prefixes,
-                group_user_vrfs=ipam_group_user_vrfs,
-                local_vrf_names=ipam_local_vrf_names,
-                location=location,
-                location_reason=location_reason,
+            ipam_policy = (
+                panos_policy
+                if adapter is panos
+                else normalize_ipam_policy(
+                    ipam_namespace,
+                    ipam_override_namespace,
+                    override_rfc1918=ipam_override_rfc1918,
+                    override_networks=ipam_override_networks,
+                    create_missing_prefixes=ipam_create_missing_prefixes,
+                    group_user_vrfs=ipam_group_user_vrfs,
+                    local_vrf_names=ipam_local_vrf_names,
+                    location=location,
+                    location_reason=location_reason,
+                )
             )
+            if adapter is panos and ipam_policy is not None:
+                ipam_policy.update(location=location, location_reason=location_reason)
             report["ipam_policy"] = ipam_policy
             if type(use_ntc_defaults) is not bool:
                 raise ValueError("Use NTC defaults when guessing must be true or false")
-            adapter = _adapter(device)
             if expected_vm_uuid is None or (
                 isinstance(expected_vm_uuid, str) and not expected_vm_uuid.strip()
             ):

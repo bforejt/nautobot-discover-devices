@@ -130,3 +130,21 @@ not a substitute for an actual missing-subtree lab read. The
 [collection contract](../../docs/panos-ha-vpn-collection.md) defines the exact
 report-only scope. These fixtures do not establish other hardware/releases,
 complete OS support, or Nautobot 2.4/3.x native VPN writer compatibility.
+
+`panos_ipam_live_network.xml` and `panos_ipam_live_vsys.xml` project actual
+effective-running network and vsys parent reads over SSH from the standalone
+PA-VM/KVM 11.2.8 VPN peer on 2026-10-05 at 12:06:53 UTC. They retain applied
+interface addresses, virtual-router membership and explicit vsys imports only.
+The IPv6 loopback host has explicit interface and address enable flags following
+a separately authorized lab configuration/commit. Network values and names are
+sanitized; unrelated network, authentication and configuration branches are
+omitted. These shapes establish three IPv4 hosts and one literal IPv6 host,
+not broader platform/version support.
+
+`panos_ipam_network.xml` and `panos_ipam_vsys.xml` are synthetic expansions
+covering the six reviewed interface kinds, multiple routing domains, static
+IPv4/IPv6, dynamic configuration and unresolved object references. Pure tests
+construct malformed membership, unsupported names, missing flags and parent
+evidence, generated/anycast and duplicate cases. Synthetic expansions are
+parser/planner checks, not live deployment evidence. The
+[IPAM contract](../../docs/panos-ipam-discovery.md) defines native eligibility.

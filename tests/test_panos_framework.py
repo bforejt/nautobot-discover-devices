@@ -745,11 +745,45 @@ class PanosJobTests(unittest.TestCase):
             self.module.resolve_credentials.assert_not_called()
             self.ssh.assert_not_called()
 
+    def test_panos_mapping_targets_are_resolved_and_reported_before_collection(self):
+        import json
+
+        rows = [{"vsys": "vsys1", "virtual_router": "router-a", "namespace": "Lab", "vrf": None}]
+        with (
+            patch.object(
+                self.module,
+                "_resolve_panos_ipam_target",
+                return_value={"id": "ns-id", "name": "Lab"},
+            ) as resolve,
+            patch.object(self.module, "_prefix_location", return_value=(None, "test")),
+        ):
+            self.job.run(self.device, panos_routing_domains=json.dumps(rows))
+        resolve.assert_called_once_with("namespace", "Lab", None)
+        policy = self.job.request.meta["discovery_report"]["ipam_policy"]
+        self.assertEqual(policy["contract"], "panos-ipam-policy-v1")
+        self.assertEqual(policy["panos_routing_domains"][0]["namespace"]["id"], "ns-id")
+        self.assertIsNone(policy["panos_routing_domains"][0]["vrf"])
+        self.assertEqual(self.module.snapshot_inventory.call_args.kwargs["ipam_policy"], policy)
+
+    def test_invalid_panos_mapping_stops_before_credentials_or_transport(self):
+        for raw in (True, "[invalid", '[{"vsys":"vsys1"}]', "[]"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                self.job.run(self.device, panos_routing_domains=raw)
+            self.module.resolve_credentials.assert_not_called()
+            self.ssh.assert_not_called()
+
+    def test_cisco_namespace_selection_does_not_implicitly_enable_panos_ipam(self):
+        selected = SimpleNamespace(pk="ns-id", name="Lab")
+        with patch.object(self.module, "_prefix_location") as location:
+            self.job.run(self.device, ipam_namespace=selected)
+        location.assert_not_called()
+        self.assertIsNone(self.job.request.meta["discovery_report"]["ipam_policy"])
+
     def test_ha_vpn_facts_are_retained_in_advanced_and_attachment(self):
         from tests.test_panos_ha_vpn_collection import payloads
 
         client = Mock(run=Mock(side_effect=payloads().__getitem__))
-        ha, vpn = panos._collect_ha_vpn(client, 256)
+        ha, vpn, _ = panos._collect_ha_vpn(client, 256)
         self.observed["observations"] = {"ha": ha, "vpn": vpn}
         self.job.run(self.device)
         report = self.job.request.meta["discovery_report"]

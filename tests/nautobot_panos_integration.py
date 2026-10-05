@@ -73,6 +73,7 @@ def _vm_discovery(
         RUNNING_HA,
         RUNNING_INTERFACES,
         RUNNING_VPN,
+        RUNNING_VSYS,
         SYSTEM_INFO,
         VM_INTERFACES,
         VPN_FLOWS,
@@ -129,6 +130,7 @@ def _vm_discovery(
     # not import unit-test modules (which replace jobs imports outside Django).
     outputs.update(
         {
+            RUNNING_VSYS: '<response status="success"><result><vsys/></result></response>',
             RUNNING_HA: '<response status="success"><result><deviceconfig/></result></response>',
             HA_STATE: '<response status="success"><result><enabled>no</enabled>'
             "<group><peer-info><enabled>no</enabled></peer-info></group></result></response>",

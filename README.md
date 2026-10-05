@@ -6,11 +6,14 @@ reported serialized hardware inventory, scoped 802.1Q assignments, configured
 static IPv4/IPv6 addressing, and explicitly mapped named VRFs. The first adapter
 supports Cisco IOS XE switches on 17.9
 or later using RESTCONF JSON exclusively. PAN-OS schema v1 adds SSH/XML identity
-and conservative interface collection. Version `0.20.0-dev` also records
+and conservative interface collection. Version `0.20.0-dev` records
 separate applied and runtime HA/IPsec facts under `observations.ha` and
 `observations.vpn`; these facts are report-only. The
 [HA/VPN collection contract](docs/panos-ha-vpn-collection.md) defines source
-scope, privacy and collection limits. The [VM-Series validation contract](docs/panos-vm-validation.md)
+scope, privacy and collection limits. Version `0.21.0-dev` adds
+[static PAN-OS IPAM processing](docs/panos-ipam-discovery.md) with explicit
+vsys/virtual-router mappings to existing Namespaces and VRFs. The
+[VM-Series validation contract](docs/panos-vm-validation.md)
 defines explicit UUID binding for PA-VM on KVM and reviewed virtual templates;
 the [first-pass history](docs/panos-discovery.md) records initial lab evidence.
 Physical-appliance capability remains unresolved.
@@ -35,6 +38,11 @@ endpoint setup. The HA/IPsec increment subsequently passed live collection on
 the active/passive pair and VPN peer, 904 offline tests, 22 PAN-OS and 150 Cisco
 native rollback checks on Nautobot 3.2.6, and an installed/queued preview with
 unchanged inventory. Its facts remain report-only.
+The static IPAM increment passed 970 offline tests and 189 native rollback
+checks. It also validated live dual-stack Job preview/apply/repeat inside an
+outer rollback.
+The [IPAM contract](docs/panos-ipam-discovery.md) records explicit mapping setup,
+HA sharing deferral, native model behavior and compatibility limits.
 The Cisco live worker apply created 57 missing interfaces and enriched one existing
 interface; a second worker apply produced zero inventory changes. Real ORM
 checks verified software catalog creation, fill-only
@@ -115,7 +123,8 @@ The job form contains these inputs:
 | VLAN Group | None | Explicit Layer-2 domain required for VLAN catalog and interface switching writes |
 | VLAN status | Applicable `Active` | Operator-selected status for newly created VLANs |
 | Use NTC defaults when guessing | Disabled | Apply the reviewed Network to Code Device Onboarding fallback for eligible down dynamic switchports and Nautobot's 0.95 power-factor default for new PSU inlets; mark inferred values in the report |
-| Default IPAM namespace | None | Select an existing Namespace to enable static IPv4/IPv6 and VRF reconciliation; blank keeps IPAM report-only |
+| Default IPAM namespace | None | Cisco: select an existing Namespace to enable static IPv4/IPv6 and VRF reconciliation; blank keeps IPAM report-only |
+| PAN-OS routing domain mappings | Blank | JSON list of exact vsys/virtual-router bindings to existing Namespace and VRF identifiers; explicit `null` VRF selects global routing, blank keeps PAN-OS IPAM report-only |
 | Override IPAM namespace | None | Optional Namespace for RFC1918 and manually entered override networks |
 | Use override for RFC1918 | Enabled | With an override selected, match the three exact IPv4 RFC1918 ranges |
 | Additional override networks | Blank | IPv4 or IPv6 network CIDRs, one per line, combined with RFC1918 matches |
@@ -171,6 +180,8 @@ views can omit recognized guest adapters. Its failure blocks collection;
 physical targets retain those three inventory reads. HA/VPN observations add
 six fixed reads for applied deviceconfig/network ancestors, HA state, IKE SAs,
 IPsec SAs and the flow summary, plus one fenced numeric detail read per flow.
+IPAM reuses the network parent and adds one fixed applied vsys-parent read
+for explicit interface imports; no address or routing-domain name enters a query.
 Applied configuration and runtime stay separate, with no HA/VPN inventory
 writes or Nautobot VPN model imports. A blank IKE response remains unknown
 with a static unresolved reason; it is never converted to zero SAs. Session
@@ -282,7 +293,13 @@ known blank fields; populated types are preserved.
 
 ## IPAM and named VRFs
 
-Select **Default IPAM namespace** to enable configured static IPv4/IPv6 and named
+For PAN-OS, use **PAN-OS routing domain mappings** and the
+[static IPAM contract](docs/panos-ipam-discovery.md). Static addresses require
+explicit applied routing membership and standalone HA-disabled evidence.
+Existing exact logical Interfaces are supported; HA shared-address ownership
+remains unresolved.
+
+For Cisco, select **Default IPAM namespace** to enable configured static IPv4/IPv6 and named
 VRF reconciliation. Leaving it blank keeps IPAM report-only even when other
 inventory changes are applied. To use the common split, choose **Internet** as
 the default, **Corporate** as **Override IPAM namespace**, and leave **Use override
@@ -788,6 +805,9 @@ records UUID binding, reviewed interface templates and live validation evidence.
 The [HA/VPN collection contract](docs/panos-ha-vpn-collection.md) records the
 report-only extension in `0.20.0-dev`; its reviewed PA-VM 11.2.8 XML shapes do
 not establish full OS coverage or native VPN model compatibility on Nautobot 2.4.
+The [PAN-OS IPAM contract](docs/panos-ipam-discovery.md) records the explicit
+routing-domain policy, static IPv4/IPv6 source requirements and native capability
+checks in `0.21.0-dev`.
 
 Run offline regressions without a Nautobot installation or lab credentials:
 
@@ -804,6 +824,9 @@ outer transaction always rolls back test inventory changes. The independent
 checks zero database mutation statements, and captures the JSON report.
 Both accept `NAUTOBOT_DISCOVERY_DEVICE_ID`; the preview also accepts
 `NAUTOBOT_DISCOVERY_VERIFY_TLS` and `NAUTOBOT_DISCOVERY_REPORT_PATH`.
+`tests/nautobot_panos_ipam_integration.py` separately validates explicit PAN-OS
+IPAM mappings, native static IPv4/IPv6 assignment, preservation, repeat behavior
+and late-failure rollback inside an unconditional outer rollback.
 
 The tests cover structured identity selection, the 71-row alias/presence
 fixture, physical capability mapping despite misleading negotiated speeds,

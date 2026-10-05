@@ -41,7 +41,13 @@ class SshTransportTests(unittest.TestCase):
         self.assertEqual(
             ssh.READ_COMMANDS,
             frozenset(
-                (ssh.SYSTEM_INFO, ssh.INTERFACES, ssh.RUNNING_INTERFACES, ssh.VM_INTERFACES)
+                (
+                    ssh.SYSTEM_INFO,
+                    ssh.INTERFACES,
+                    ssh.RUNNING_INTERFACES,
+                    ssh.VM_INTERFACES,
+                    ssh.RUNNING_VSYS,
+                )
                 + ssh.HA_VPN_READ_COMMANDS
             ),
         )

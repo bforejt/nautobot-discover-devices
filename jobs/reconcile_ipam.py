@@ -171,7 +171,7 @@ def _parse_ipv6(row, name, plan):
     return addresses
 
 
-def _parse_source(source, plan):
+def _parse_source(source, plan, canonical_name=canonical_interface_name):
     if (
         not isinstance(source, dict)
         or type(source.get("schema_version")) is not int
@@ -220,7 +220,7 @@ def _parse_source(source, plan):
         ):
             plan["errors"].append("IPAM interface observations require structured configuration")
             continue
-        name = canonical_interface_name(row["name"])
+        name = canonical_name(row["name"])
         if name in facts:
             plan["errors"].append("Several IPAM rows normalize to interface %s" % name)
         local_vrf = _text(row.get("vrf"))
@@ -263,7 +263,90 @@ def _parse_source(source, plan):
     return facts, vrfs
 
 
-def plan_ipam(discovery, existing, interface_plan=None):
+def _explicit_routing_refs(targets, inventory, plan):
+    """Bind operator-selected existing VRFs without local-name/RD inference."""
+    catalog, references, assignments = {}, {}, {}
+    for name, target in sorted(targets.items()):
+        namespace = target.get("namespace") if isinstance(target, dict) else None
+        vrf_target = target.get("vrf") if isinstance(target, dict) else None
+        if (
+            not isinstance(namespace, dict)
+            or not namespace.get("id")
+            or not isinstance(target, dict)
+            or "vrf" not in target
+        ):
+            plan["errors"].append(
+                "Explicit routing target requires a Namespace and VRF or global selection"
+            )
+            continue
+        if vrf_target is None:
+            references[name] = None
+            continue
+        if not isinstance(vrf_target, dict) or not vrf_target.get("id"):
+            plan["errors"].append("Explicit routing target requires an existing VRF identity")
+            continue
+        matches = [row for row in inventory["vrfs"] if _id(row["id"]) == _id(vrf_target["id"])]
+        if len(matches) != 1 or _id(matches[0]["namespace_id"]) != _id(namespace["id"]):
+            plan["errors"].append("Explicit existing VRF identity or Namespace is invalid")
+            continue
+        vrf = matches[0]
+        device_id, vrf_id = _id(inventory["device"]["id"]), _id(vrf["id"])
+        bound = [
+            row
+            for row in inventory["vrf_device_assignments"]
+            if _id(row.get("device_id")) == device_id and _id(row["vrf_id"]) == vrf_id
+        ]
+        if len(bound) > 1:
+            plan["unresolved"].append(
+                {
+                    "scope": "interface",
+                    "name": name,
+                    "reason": (
+                        "Several existing Device assignments match the explicitly selected VRF"
+                    ),
+                }
+            )
+            continue
+        if bound and (
+            bound[0].get("virtual_machine_id") is not None
+            or bound[0].get("virtual_device_context_id") is not None
+        ):
+            plan["errors"].append("Explicit Device VRF assignment has unsupported ownership scope")
+            continue
+        key = "vrf-existing:%s" % vrf_id
+        catalog[key] = {
+            "key": key,
+            "id": vrf_id,
+            "create": False,
+            "name": vrf["name"],
+            "namespace_id": _id(vrf["namespace_id"]),
+            "rd": vrf.get("rd"),
+            "changes": [],
+        }
+        references[name] = key
+        assignment = bound[0] if bound else None
+        assignments[key] = {
+            "key": "vrf-device-explicit:%s:%s" % (device_id, vrf_id),
+            "id": _id(assignment["id"]) if assignment else None,
+            "create": assignment is None,
+            "vrf_key": key,
+            "device_id": device_id,
+            "name": assignment.get("name") if assignment else "",
+            "rd": assignment.get("rd") if assignment else None,
+            "changes": [],
+        }
+    plan["vrf_device_assignments"].extend(assignments.values())
+    return catalog, references
+
+
+def plan_ipam(
+    discovery,
+    existing,
+    interface_plan=None,
+    *,
+    canonical_name=canonical_interface_name,
+    routing_targets=None,
+):
     """Build a dependency graph without importing models or mutating the snapshot.
 
     The namespace policy is organizational intent, never a transport default.
@@ -284,7 +367,7 @@ def plan_ipam(discovery, existing, interface_plan=None):
     }
     if discovery.get("ipam") is None:
         return _finish(plan)
-    facts, observed_vrfs = _parse_source(discovery["ipam"], plan)
+    facts, observed_vrfs = _parse_source(discovery["ipam"], plan, canonical_name)
     if plan["errors"]:
         return _finish(plan)
     inventory = existing.get("ipam_inventory", {})
@@ -310,7 +393,7 @@ def plan_ipam(discovery, existing, interface_plan=None):
         reason = (
             "Select a default namespace before loading IPAM inventory"
             if inventory.get("supported", False)
-            else "IPAM inventory is unavailable"
+            else inventory.get("reason") or "IPAM inventory is unavailable"
         )
         for name, row in facts.items():
             plan["settings"].append(
@@ -324,10 +407,15 @@ def plan_ipam(discovery, existing, interface_plan=None):
             plan["warnings"].append(reason)
         return _finish(plan)
     try:
-        if not isinstance(policy, dict) or not isinstance(policy.get("default_namespace"), dict):
-            raise ValueError("A selected default namespace is required")
-        if not policy["default_namespace"].get("id"):
-            raise ValueError("A selected default namespace ID is required")
+        if not isinstance(policy, dict):
+            raise ValueError("An explicit IPAM policy is required")
+        if routing_targets is None:
+            if not isinstance(policy.get("default_namespace"), dict):
+                raise ValueError("A selected default namespace is required")
+            if not policy["default_namespace"].get("id"):
+                raise ValueError("A selected default namespace ID is required")
+        elif not isinstance(routing_targets, dict):
+            raise ValueError("Explicit routing targets must be name-keyed objects")
         override = policy.get("override_namespace")
         if override is not None and (not isinstance(override, dict) or not override.get("id")):
             raise ValueError("The override namespace requires an explicit identity")
@@ -375,11 +463,9 @@ def plan_ipam(discovery, existing, interface_plan=None):
 
     interfaces = defaultdict(list)
     for row in existing.get("interfaces", []):
-        interfaces[canonical_interface_name(row["name"])].append(row)
+        interfaces[canonical_name(row["name"])].append(row)
     for row in (interface_plan or {}).get("interface_creates", []):
-        interfaces[canonical_interface_name(row["name"])].append(
-            {**row, "id": None, "vrf_id": None}
-        )
+        interfaces[canonical_name(row["name"])].append({**row, "id": None, "vrf_id": None})
     vrf_by_id = {_id(row["id"]): row for row in inventory["vrfs"]}
     prefix_by_id = {_id(row["id"]): row for row in prefixes}
     all_prefix_by_id = {_id(row["id"]): row for row in inventory["prefixes"]}
@@ -395,7 +481,19 @@ def plan_ipam(discovery, existing, interface_plan=None):
     for name, fact in sorted(facts.items()):
         classified[name] = []
         for address in fact["ipv4"] + fact["ipv6"]:
-            namespace, match, reason = _namespace(ip_network(address["prefix"]), policy, overrides)
+            if routing_targets is None:
+                namespace, match, reason = _namespace(
+                    ip_network(address["prefix"]), policy, overrides
+                )
+            else:
+                target = routing_targets.get(name)
+                namespace = target.get("namespace") if isinstance(target, dict) else None
+                match = "explicit routing-domain binding"
+                reason = (
+                    None
+                    if isinstance(namespace, dict) and namespace.get("id")
+                    else "Interface has no explicit existing Namespace routing target"
+                )
             setting = {
                 "name": name,
                 "vrf": fact["vrf"],
@@ -420,116 +518,132 @@ def plan_ipam(discovery, existing, interface_plan=None):
     for name in blocked_vrfs:
         unresolved("vrf", name, "Named VRF cannot span incompatible selected namespaces")
     vrf_catalog, local_refs = {}, {}
-    for local_name, observation in sorted(observed_vrfs.items()):
-        if local_name in blocked_vrfs:
-            continue
-        namespace = namespace_by_vrf.get(local_name, policy["default_namespace"])
-        namespace_id = _id(namespace["id"])
-        assignments = assignments_by_local[local_name]
-        if len(assignments) > 1:
-            unresolved(
-                "vrf", local_name, "Several Device assignments match the reported local VRF name"
-            )
-            continue
-        assignment = assignments[0] if assignments else None
-        vrf = vrf_by_id.get(_id(assignment["vrf_id"])) if assignment else None
-        if assignment and vrf is None:
-            plan["errors"].append("An existing VRF Device assignment refers to a missing VRF")
-            continue
-        if vrf and local_name not in namespace_by_vrf:
-            # No address evidence exists to contradict this established device
-            # assignment. The default namespace applies only to a new VRF.
-            namespace_id = _id(vrf["namespace_id"])
-        if vrf and _id(vrf["namespace_id"]) != namespace_id:
-            conflict(
-                "vrf",
-                local_name,
-                "namespace_id",
-                _id(vrf["namespace_id"]),
-                namespace_id,
-                "Preserve existing Device VRF assignment namespace",
-            )
-            unresolved(
-                "vrf", local_name, "Existing Device VRF assignment conflicts with namespace policy"
-            )
-            continue
-        shared = policy.get("group_user_vrfs", False) and local_name not in policy.get(
-            "local_vrf_names", ["Mgmt-vrf"]
+    explicit_refs = {}
+    if routing_targets is not None:
+        vrf_catalog, explicit_refs = _explicit_routing_refs(
+            {name: target for name, target in routing_targets.items() if name in facts},
+            inventory,
+            plan,
         )
-        canonical_name = local_name if shared else "%s / %s" % (device["name"], local_name)
-        if vrf is None:
-            matches = [
-                row
-                for row in inventory["vrfs"]
-                if _id(row["namespace_id"]) == namespace_id and row["name"] == canonical_name
-            ]
-            if len(matches) > 1 or matches and not shared:
+    else:
+        for local_name, observation in sorted(observed_vrfs.items()):
+            if local_name in blocked_vrfs:
+                continue
+            namespace = namespace_by_vrf.get(local_name, policy["default_namespace"])
+            namespace_id = _id(namespace["id"])
+            assignments = assignments_by_local[local_name]
+            if len(assignments) > 1:
                 unresolved(
                     "vrf",
                     local_name,
-                    "Canonical VRF name collides with an unassigned existing routing domain",
+                    "Several Device assignments match the reported local VRF name",
                 )
                 continue
-            vrf = matches[0] if matches else None
-        canonical_name = vrf["name"] if vrf else canonical_name
-        if assignment is None and vrf:
-            adoption_reason = route_target_adoption_reason(
-                observation, vrf, inventory.get("route_targets")
-            )
-            if adoption_reason:
-                unresolved("vrf", local_name, adoption_reason)
+            assignment = assignments[0] if assignments else None
+            vrf = vrf_by_id.get(_id(assignment["vrf_id"])) if assignment else None
+            if assignment and vrf is None:
+                plan["errors"].append("An existing VRF Device assignment refers to a missing VRF")
                 continue
-        if assignment is None and vrf and vrf.get("rd") and not observation.get("rd"):
-            unresolved(
-                "vrf",
-                local_name,
-                "New Device assignment would inherit an unreported canonical VRF RD",
-            )
-            continue
-        if len(canonical_name) > 255:
-            unresolved(
-                "vrf", local_name, "Canonical device-local VRF name exceeds the native field length"
-            )
-            continue
-        key = "vrf:%s:%s" % (namespace_id, canonical_name)
-        spec = {
-            "key": key,
-            "id": _id(vrf["id"]) if vrf else None,
-            "create": vrf is None,
-            "name": canonical_name,
-            "namespace_id": namespace_id,
-            "rd": vrf.get("rd") if vrf else None,
-            "changes": [],
-        }
-        rd = observation.get("rd")
-        changes = []
-        if assignment:
-            inherited_rd = assignment.get("effective_rd") or assignment.get("rd") or vrf.get("rd")
-            if rd and inherited_rd and inherited_rd != rd:
+            if vrf and local_name not in namespace_by_vrf:
+                # No address evidence exists to contradict this established device
+                # assignment. The default namespace applies only to a new VRF.
+                namespace_id = _id(vrf["namespace_id"])
+            if vrf and _id(vrf["namespace_id"]) != namespace_id:
                 conflict(
-                    "vrf_device_assignment",
+                    "vrf",
                     local_name,
-                    "rd",
-                    inherited_rd,
-                    rd,
-                    "Preserve populated Device assignment RD",
+                    "namespace_id",
+                    _id(vrf["namespace_id"]),
+                    namespace_id,
+                    "Preserve existing Device VRF assignment namespace",
                 )
-            elif rd and not inherited_rd:
-                changes.append({"field": "rd", "before": assignment.get("rd"), "after": rd})
-        vrf_catalog[key] = spec
-        local_refs[local_name] = key
-        plan["vrf_device_assignments"].append(
-            {
-                "key": "vrf-device:%s:%s" % (device["id"], local_name),
-                "id": _id(assignment["id"]) if assignment else None,
-                "create": assignment is None,
-                "vrf_key": key,
-                "device_id": _id(device["id"]),
-                "name": local_name,
-                "rd": assignment.get("rd") if assignment else rd,
-                "changes": changes,
+                unresolved(
+                    "vrf",
+                    local_name,
+                    "Existing Device VRF assignment conflicts with namespace policy",
+                )
+                continue
+            shared = policy.get("group_user_vrfs", False) and local_name not in policy.get(
+                "local_vrf_names", ["Mgmt-vrf"]
+            )
+            output_vrf_name = local_name if shared else "%s / %s" % (device["name"], local_name)
+            if vrf is None:
+                matches = [
+                    row
+                    for row in inventory["vrfs"]
+                    if _id(row["namespace_id"]) == namespace_id and row["name"] == output_vrf_name
+                ]
+                if len(matches) > 1 or matches and not shared:
+                    unresolved(
+                        "vrf",
+                        local_name,
+                        "Canonical VRF name collides with an unassigned existing routing domain",
+                    )
+                    continue
+                vrf = matches[0] if matches else None
+            output_vrf_name = vrf["name"] if vrf else output_vrf_name
+            if assignment is None and vrf:
+                adoption_reason = route_target_adoption_reason(
+                    observation, vrf, inventory.get("route_targets")
+                )
+                if adoption_reason:
+                    unresolved("vrf", local_name, adoption_reason)
+                    continue
+            if assignment is None and vrf and vrf.get("rd") and not observation.get("rd"):
+                unresolved(
+                    "vrf",
+                    local_name,
+                    "New Device assignment would inherit an unreported canonical VRF RD",
+                )
+                continue
+            if len(output_vrf_name) > 255:
+                unresolved(
+                    "vrf",
+                    local_name,
+                    "Canonical device-local VRF name exceeds the native field length",
+                )
+                continue
+            key = "vrf:%s:%s" % (namespace_id, output_vrf_name)
+            spec = {
+                "key": key,
+                "id": _id(vrf["id"]) if vrf else None,
+                "create": vrf is None,
+                "name": output_vrf_name,
+                "namespace_id": namespace_id,
+                "rd": vrf.get("rd") if vrf else None,
+                "changes": [],
             }
-        )
+            rd = observation.get("rd")
+            changes = []
+            if assignment:
+                inherited_rd = (
+                    assignment.get("effective_rd") or assignment.get("rd") or vrf.get("rd")
+                )
+                if rd and inherited_rd and inherited_rd != rd:
+                    conflict(
+                        "vrf_device_assignment",
+                        local_name,
+                        "rd",
+                        inherited_rd,
+                        rd,
+                        "Preserve populated Device assignment RD",
+                    )
+                elif rd and not inherited_rd:
+                    changes.append({"field": "rd", "before": assignment.get("rd"), "after": rd})
+            vrf_catalog[key] = spec
+            local_refs[local_name] = key
+            plan["vrf_device_assignments"].append(
+                {
+                    "key": "vrf-device:%s:%s" % (device["id"], local_name),
+                    "id": _id(assignment["id"]) if assignment else None,
+                    "create": assignment is None,
+                    "vrf_key": key,
+                    "device_id": _id(device["id"]),
+                    "name": local_name,
+                    "rd": assignment.get("rd") if assignment else rd,
+                    "changes": changes,
+                }
+            )
     plan["vrfs"] = list(vrf_catalog.values())
     prefix_requests, address_requests = {}, []
     observed_hosts = defaultdict(set)
@@ -539,8 +653,17 @@ def plan_ipam(discovery, existing, interface_plan=None):
             unresolved("interface", name, "Interface identity is missing or ambiguous")
             continue
         interface = rows[0]
-        vrf_key = local_refs.get(fact["vrf"]) if fact["vrf"] else None
-        if fact["vrf"] and vrf_key is None:
+        vrf_key = (
+            explicit_refs.get(name)
+            if routing_targets is not None
+            else local_refs.get(fact["vrf"])
+            if fact["vrf"]
+            else None
+        )
+        if routing_targets is not None and name not in explicit_refs:
+            unresolved("interface", name, "Explicit routing target is unresolved")
+            continue
+        if routing_targets is None and fact["vrf"] and vrf_key is None:
             unresolved("interface", name, "Named routing context is unresolved")
             continue
         expected_vrf_id = vrf_catalog[vrf_key]["id"] if vrf_key else None
@@ -976,7 +1099,9 @@ def plan_ipam(discovery, existing, interface_plan=None):
                     "changes": [],
                 }
         local_vrf = facts[name]["vrf"]
-        local_key = local_refs.get(local_vrf)
+        local_key = (
+            explicit_refs.get(name) if routing_targets is not None else local_refs.get(local_vrf)
+        )
         intended_vrf = vrf_catalog[local_key]["id"] or "key:" + local_key if local_key else None
         if intended_vrf and intended_vrf not in effective_vrfs:
             unresolved(

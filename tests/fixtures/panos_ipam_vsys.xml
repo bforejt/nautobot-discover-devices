@@ -1,0 +1,11 @@
+<!-- Synthetic import scope matching panos_ipam_network.xml; no default vsys/VR inference. -->
+<response status="success"><result><vsys>
+  <entry name="vsys1"><import><network>
+    <interface><member>ethernet1/1</member><member>ae1</member><member>loopback.1</member><member>tunnel.1</member></interface>
+    <virtual-router><member>vr-public</member></virtual-router>
+  </network></import></entry>
+  <entry name="vsys2"><import><network>
+    <interface><member>ethernet1/1.100</member><member>ae1.200</member></interface>
+    <virtual-router><member>vr-internal</member></virtual-router>
+  </network></import></entry>
+</vsys></result></response>

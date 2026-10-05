@@ -7,15 +7,16 @@ from nautobot.dcim.models import Device, Location
 from nautobot.extras.models import SecretsGroup, Status
 from nautobot.ipam.models import Namespace, VLANGroup
 
-from .adapters import cisco_iosxe
+from .adapters import cisco_iosxe, panos
 from .credentials import CredentialsError, resolve_credentials
 from .ipam_policy import normalize_ipam_policy
 from .nautobot_inventory import InventoryError, apply_discovery, snapshot_inventory, validate_plan
 from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
+from .transport_ssh import PanosSshClient, SshError
 
 name = "Device Discovery"
-JOB_VERSION = "0.17.0-dev"
+JOB_VERSION = "0.18.0-dev"
 
 
 def _host(device):
@@ -31,14 +32,22 @@ def _host(device):
 
 
 def _adapter(device):
+    """Select only reviewed platform/manufacturer pairs before resolving secrets."""
     platform = device.platform
     driver = str(getattr(platform, "network_driver", "") or "").lower()
     platform_name = str(getattr(platform, "name", "") or "").lower()
-    if driver not in ("cisco_ios", "cisco_iosxe") and "iosxe" not in platform_name.replace(
-        "-", ""
-    ).replace("_", ""):
-        raise ValueError("The selected Device must have a Cisco IOS XE platform")
+    normalized_name = platform_name.replace("-", "").replace("_", "").replace(" ", "")
     manufacturer = device.device_type.manufacturer.name.lower()
+    if driver in ("paloalto_panos", "panos") or (
+        not driver and normalized_name in ("panos", "paloaltopanos")
+    ):
+        if manufacturer.replace(" ", "").replace("-", "") not in ("paloalto", "paloaltonetworks"):
+            raise ValueError("The selected Device must have a Palo Alto DeviceType")
+        return panos
+    if driver not in ("cisco_ios", "cisco_iosxe") and "iosxe" not in normalized_name:
+        raise ValueError(
+            "The selected Device must have a supported Cisco IOS XE or PAN-OS platform"
+        )
     if "cisco" not in manufacturer:
         raise ValueError("The selected Device must have a Cisco DeviceType")
     return cisco_iosxe
@@ -79,6 +88,12 @@ class DiscoverDevice(Job):
     )
     verify_tls = BooleanVar(default=True, description="Verify the device HTTPS certificate.")
     restconf_port = IntegerVar(default=443, min_value=1, max_value=65535)
+    ssh_port = IntegerVar(default=22, min_value=1, max_value=65535)
+    ssh_strict = BooleanVar(
+        default=True,
+        label="Verify SSH host key",
+        description="Verify the PAN-OS SSH host key against the worker's known hosts.",
+    )
     secrets_group = ObjectVar(
         model=SecretsGroup,
         required=False,
@@ -201,7 +216,8 @@ class DiscoverDevice(Job):
     class Meta:
         name = "Discover Device"
         description = (
-            "Verify Cisco IOS XE identity and fill interfaces, console ports, VLANs, "
+            "Verify Cisco IOS XE or PAN-OS identity and fill supported physical interfaces. "
+            "Cisco IOS XE also supports console ports, VLANs, "
             "serialized hardware, static IPv4/IPv6 addressing and named VRFs with "
             "supported import/export route targets."
         )
@@ -216,6 +232,8 @@ class DiscoverDevice(Job):
             "use_ntc_defaults",
             "verify_tls",
             "restconf_port",
+            "ssh_port",
+            "ssh_strict",
             "secrets_group",
             "interface_status",
             "software_version_status",
@@ -257,6 +275,8 @@ class DiscoverDevice(Job):
         ipam_location=None,
         ipam_prefix_status=None,
         ipam_ip_address_status=None,
+        ssh_port=22,
+        ssh_strict=True,
     ):
         device = Device.objects.get(pk=device.pk)
         report = {
@@ -267,6 +287,8 @@ class DiscoverDevice(Job):
             "use_ntc_defaults": use_ntc_defaults,
             "verify_tls": verify_tls,
             "restconf_port": restconf_port,
+            "ssh_port": ssh_port,
+            "ssh_strict": ssh_strict,
             "applied": False,
             "vlan_group_id": str(vlan_group.pk) if vlan_group else None,
             "vlan_group_name": vlan_group.name if vlan_group else None,
@@ -294,16 +316,30 @@ class DiscoverDevice(Job):
             report["ipam_policy"] = ipam_policy
             if type(use_ntc_defaults) is not bool:
                 raise ValueError("Use NTC defaults when guessing must be true or false")
+            adapter = _adapter(device)
+            report["transport"] = "ssh" if adapter is panos else "restconf"
             if use_ntc_defaults:
                 self.logger.info(
-                    "NTC default guessing is enabled. Any inferred assignments are identified "
+                    "PAN-OS discovery retains strict evidence rules; the NTC defaults option "
+                    "applies only to Cisco IOS XE."
+                    if adapter is panos
+                    else "NTC default guessing is enabled. Any inferred assignments are identified "
                     "as guesses in the discovery report."
                 )
-            adapter = _adapter(device)
-            username, password = resolve_credentials(device, override_group=secrets_group)
-            client = RestconfClient(
-                _host(device), username, password, port=restconf_port, verify=verify_tls
-            )
+            if adapter is panos:
+                if type(ssh_strict) is not bool:
+                    raise ValueError("Verify SSH host key must be true or false")
+                username, password = resolve_credentials(
+                    device, override_group=secrets_group, transport="ssh"
+                )
+                client = PanosSshClient(
+                    _host(device), username, password, port=ssh_port, ssh_strict=ssh_strict
+                )
+            else:
+                username, password = resolve_credentials(device, override_group=secrets_group)
+                client = RestconfClient(
+                    _host(device), username, password, port=restconf_port, verify=verify_tls
+                )
             try:
                 report["discovery"] = adapter.collect(client, use_ntc_defaults=use_ntc_defaults)
             finally:
@@ -380,7 +416,15 @@ class DiscoverDevice(Job):
         except Exception as exc:
             report["error"] = str(exc)
             if isinstance(
-                exc, (RestconfError, CredentialsError, cisco_iosxe.DiscoveryError, InventoryError)
+                exc,
+                (
+                    RestconfError,
+                    SshError,
+                    CredentialsError,
+                    cisco_iosxe.DiscoveryError,
+                    panos.DiscoveryError,
+                    InventoryError,
+                ),
             ):
                 self.logger.error("Discovery failed: %s", exc)
                 # Jobs are dynamically imported in the child process. The

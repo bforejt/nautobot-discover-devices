@@ -13,6 +13,10 @@ separate applied and runtime HA/IPsec facts under `observations.ha` and
 scope, privacy and collection limits. Version `0.21.0-dev` adds
 [static PAN-OS IPAM processing](docs/panos-ipam-discovery.md) with explicit
 vsys/virtual-router mappings to existing Namespaces and VRFs. The
+[capacity contract](docs/panos-capacity-discovery.md) in `0.22.0-dev` adds
+Palo-only processing of existing Device capacity fields: verified VM core count
+may fill `vcpus`; memory and primary-disk capacity remain unresolved until their
+structured source meanings are established. The
 [VM-Series validation contract](docs/panos-vm-validation.md)
 defines explicit UUID binding for PA-VM on KVM and reviewed virtual templates;
 the [first-pass history](docs/panos-discovery.md) records initial lab evidence.

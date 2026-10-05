@@ -5,6 +5,7 @@ from collections import defaultdict
 
 from .adapters import cisco_iosxe, panos
 from .adapters.cisco_iosxe import canonical_interface_name, canonical_software_version
+from .reconcile_capacity import plan_capacity
 from .reconcile_components import plan_components
 from .reconcile_console import plan_console_ports, reviewed_profile
 from .reconcile_ipam import plan_ipam
@@ -373,6 +374,10 @@ def build_plan(discovery, existing):
             conflict("device", device.get("name"), field, before, after)
             plan["errors"].append("Selected Device %s differs from discovered chassis" % field)
 
+    plan["capacity"] = plan_capacity(discovery, existing, identity_verified=not plan["errors"])
+    for key in ("conflicts", "errors", "warnings"):
+        plan[key].extend(plan["capacity"][key])
+
     for field, source in (
         ("name", "hostname"),
         ("serial", "serial"),
@@ -621,6 +626,7 @@ def build_plan(discovery, existing):
         **plan["layer2"]["summary"],
         **plan["console_ports"]["summary"],
         **plan["ipam"]["summary"],
+        **plan["capacity"]["summary"],
         **stack["summary"],
     }
     return plan

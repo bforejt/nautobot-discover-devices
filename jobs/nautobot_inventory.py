@@ -15,6 +15,12 @@ from nautobot.ipam.models import Namespace
 
 from .adapters import cisco_iosxe, panos
 from .exceptions import InventoryError
+from .nautobot_capacity import (
+    clean_capacity_device,
+    save_capacity_device,
+    snapshot_capacity,
+    stage_capacity,
+)
 from .nautobot_components import (
     component_objects,
     save_components,
@@ -111,6 +117,7 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None, i
         "console_inventory": snapshot_console_ports(device, lock=lock, discovery=discovery),
         "stack": snapshot_stack(device, lock=lock, discovery=discovery),
         "ipam_inventory": snapshot_ipam(device, ipam_policy, lock=lock, discovery=discovery),
+        "capacity_inventory": snapshot_capacity(device, lock=lock, discovery=discovery),
     }
 
 
@@ -175,6 +182,7 @@ def _objects(
     for change in plan["device_updates"]:
         if change["field"] != "software_version":
             setattr(device, change["field"], change["after"])
+    stage_capacity(plan, device)
     memberships, ownerships = [], []
     component_plan = plan["components"]
     devices_by_serial = {}
@@ -324,7 +332,7 @@ def validate_plan(
     )
     if version is not None:
         version.full_clean()
-    if plan["device_updates"]:
+    if plan["device_updates"] or plan.get("capacity", {}).get("updates"):
         if version is not None and not plan["software_version"]["create"]:
             device.software_version = version
         # A planned new software row has no DB record for foreign-key validation yet.
@@ -335,7 +343,12 @@ def validate_plan(
         )
         if device.virtual_chassis is not None and device.virtual_chassis._state.adding:
             excluded.append("virtual_chassis")
-        device.full_clean(exclude=excluded)
+        if plan.get("capacity", {}).get("preserve_custom_fields") or plan.get("capacity", {}).get(
+            "updates"
+        ):
+            clean_capacity_device(device, exclude=excluded)
+        else:
+            device.full_clean(exclude=excluded)
     if components is not None:
         validate_components(components)
     if vlans is not None:
@@ -442,8 +455,13 @@ def apply_discovery(
             if version._state.adding:
                 version.validated_save()
             device.software_version = version
-        if plan["device_updates"]:
-            device.validated_save()
+        if plan["device_updates"] or plan.get("capacity", {}).get("updates"):
+            if plan.get("capacity", {}).get("preserve_custom_fields") or plan.get(
+                "capacity", {}
+            ).get("updates"):
+                save_capacity_device(device)
+            else:
+                device.validated_save()
         if components is not None:
             save_components(components)
         if vlans is not None:

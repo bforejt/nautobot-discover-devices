@@ -152,6 +152,8 @@ def parse_system_info(output):
             "sw-version",
             "vm-uuid",
             "vm-cpuid",
+            "vm-cores",
+            "vm-mem",
             "serial",
         )
     }
@@ -608,7 +610,7 @@ def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None, max_vpn_fl
         "flows": {"command": VPN_FLOWS, "path": "result/IPSec/entry"},
         "flow_details": [row["source"] for row in vpn["runtime"]["flow_details"]],
     }
-    return {
+    discovery = {
         "adapter": "panos",
         "schema_version": 1,
         "identity": identity,
@@ -620,3 +622,7 @@ def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None, max_vpn_fl
         "observations": collected_observations,
         "sources": sources,
     }
+    from .panos_capacity import parse_capacity
+
+    discovery["capacity"] = parse_capacity(discovery)
+    return discovery

@@ -184,6 +184,8 @@ def run(
         "ipam": report["discovery"].get("ipam", {}),
         "ipam_policy": report.get("ipam_policy"),
         "ipam_plan": report["plan"].get("ipam", {}),
+        "capacity": report["discovery"].get("capacity", {}),
+        "capacity_plan": report["plan"].get("capacity", {}),
         "layer2": report["discovery"].get("layer2", {}),
         "layer2_plan": report["plan"].get("layer2", {}),
         "required_identity_errors": report["plan"]["errors"],

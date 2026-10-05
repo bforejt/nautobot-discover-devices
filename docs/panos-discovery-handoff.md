@@ -17,6 +17,27 @@ Continue from the checked current repository state rather than repeating the
 original Cisco-only framework migration. Historical proof counts below do not
 describe this new increment's validation.
 
+## Current capacity increment
+
+Job `0.22.0-dev` adds [Palo-only capacity processing](panos-capacity-discovery.md)
+for the existing Integer Device custom fields `vcpus`, `memory_mb`, `disk_gb`.
+The user explicitly authorized reuse of these fields and required all discovery
+facts to come from Palo Alto responses. There is no production hypervisor lookup.
+The existing system-info XML establishes VM core count and may fill `vcpus`;
+memory units and structured primary-disk capacity remain unresolved. Do not
+replace them with guest-memory rounding, partition totals, model profiles or
+hypervisor sizing. Missing definitions stay report-only; discovery creates no
+custom-field schema. Populated intent is preserved and mismatches are reported.
+Capacity eligibility does not assume a hypervisor or VM mode. Existing selected
+Device identity rules still apply.
+
+Validation passed 995 offline tests on Python 3.14/3.12 and 204 native checks on
+Nautobot 3.2.6, including capacity preservation and rollback. Strict SSH on all
+three lab firewalls kept the existing twelve-read set. The installed Job's
+preview issued zero DML; apply saved `panos-lab.vcpus=4` and its one already
+eligible missing virtual Interface; repeat issued zero DML. Memory/storage and
+all other custom-field values were preserved. The lab package is `0.22.0-dev`.
+
 ## Current IPAM increment
 
 PAN-OS IPAM now collects literal applied IPv4/IPv6 addresses, exact supported
@@ -125,7 +146,9 @@ inventory preserved. These are checkpoint results, not a permanent test count.
 - **No guessing.** Retain missing or ambiguous facts as blank/unresolved with
   evidence. Documented defaults require explicit applicability and source
   evidence; missing data alone does not establish a default.
-- Use native Nautobot objects and intended field meanings. **No custom fields.**
+- Use native Nautobot objects and intended field meanings. The user's authorized
+  existing Device capacity fields are the explicit exception; create no custom
+  fields or other custom-field mappings.
 - Preserve populated values, including `False`, zero and `Other`; preserve UUIDs,
   aliases, Module ownership, cables, IP assignments and occupied inventory.
   Report conflicts rather than relocating, deleting or replacing assets.

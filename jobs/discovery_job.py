@@ -18,7 +18,7 @@ from .transport_restconf import RestconfClient, RestconfError
 from .transport_ssh import PanosSshClient, SshError
 
 name = "Device Discovery"
-JOB_VERSION = "0.21.0-dev"
+JOB_VERSION = "0.22.0-dev"
 
 
 def _resolve_panos_ipam_target(kind, identifier, namespace_id):
@@ -565,6 +565,13 @@ class DiscoverDevice(Job):
                 "empty device field",
                 "empty device fields",
             ),
+            (
+                "capacity_fields_updated",
+                "fill",
+                "Filled",
+                "empty VM capacity field",
+                "empty VM capacity fields",
+            ),
             ("interfaces_created", "add", "Added", "interface", "interfaces"),
             ("virtual_chassis_created", "add", "Added", "virtual chassis", "virtual chassis"),
             ("virtual_chassis_updated", "update", "Updated", "virtual chassis", "virtual chassis"),
@@ -692,6 +699,13 @@ class DiscoverDevice(Job):
                     singular if count == 1 else plural,
                 )
         ipam = plan.get("ipam", {})
+        capacity = plan.get("capacity", {})
+        if capacity.get("unresolved"):
+            self.logger.info(
+                "Left %s VM capacity observations unresolved. Review source evidence and "
+                "custom-field requirements under Advanced.",
+                len(capacity["unresolved"]),
+            )
         if ipam.get("unresolved"):
             self.logger.info(
                 "Left %s IPAM observations unresolved. The report explains missing evidence, "

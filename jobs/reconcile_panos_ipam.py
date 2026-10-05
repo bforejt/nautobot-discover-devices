@@ -10,7 +10,7 @@ from copy import deepcopy
 from ipaddress import ip_interface
 
 from .reconcile_ipam import _finish, plan_ipam
-from .transport_ssh import HA_STATE, RUNNING_HA, RUNNING_VPN, RUNNING_VSYS
+from .transport_ssh import HA_STATE, MANAGEMENT_INTERFACE, RUNNING_HA, RUNNING_VPN, RUNNING_VSYS
 
 CONTRACT = "panos-ipam-v1"
 POLICY_CONTRACT = "panos-ipam-policy-v1"
@@ -256,7 +256,7 @@ def _review_row(row, paths):
     return addresses
 
 
-def _ha_reason(discovery):
+def _ha_reason(discovery, sharing=None):
     ha = discovery.get("observations", {}).get("ha", {})
     states = []
     for section, command, path in (
@@ -269,6 +269,12 @@ def _ha_reason(discovery):
             source = {}
         enabled = fact.get("enabled") if isinstance(fact, dict) else None
         if enabled is True:
+            if (
+                isinstance(sharing, dict)
+                and sharing.get("contract") == "panos-ha-sharing-v1"
+                and isinstance(sharing.get("addresses"), list)
+            ):
+                return None
             return "HA address sharing requires an explicit reviewed sharing policy"
         if (
             enabled is False
@@ -327,7 +333,65 @@ def _targets(policy, inventory):
     return targets
 
 
-def plan_panos_ipam(discovery, existing, interface_plan=None):
+def _management_input(value, inventory):
+    """Review the canonical management row at the single shared graph boundary."""
+    if not isinstance(value, dict) or set(value) != {"interface", "target"}:
+        raise ValueError("Management IPAM input requires an exact Interface and target")
+    row, target = value["interface"], value["target"]
+    if (
+        not isinstance(row, dict)
+        or not _label(row.get("name"))
+        or row.get("vrf") is not None
+        or not isinstance(row.get("ipv4"), list)
+        or not isinstance(row.get("ipv6"), list)
+        or not isinstance(target, dict)
+        or set(target) != {"namespace", "vrf"}
+        or target["vrf"] is not None
+        or not isinstance(target["namespace"], dict)
+        or not target["namespace"].get("id")
+    ):
+        raise ValueError("Management IPAM input requires an exact global Namespace selection")
+    namespaces = [
+        namespace
+        for namespace in inventory.get("namespaces", [])
+        if str(namespace["id"]) == str(target["namespace"]["id"])
+    ]
+    if len(namespaces) != 1:
+        raise ValueError("Management Namespace is missing or ambiguous in the native snapshot")
+    for version in (4, 6):
+        for address in row["ipv%d" % version]:
+            source = address.get("source") if isinstance(address, dict) else None
+            method = address.get("method") if isinstance(address, dict) else None
+            if (
+                not isinstance(source, dict)
+                or source.get("command") != MANAGEMENT_INTERFACE
+                or source.get("applied_command") != RUNNING_HA
+                or source.get("path") != "result/info/" + ("ip" if version == 4 else "ipv6")
+                or method
+                not in (
+                    {"configured-static", "observed-dhcp-lease"} if version == 4 else {"configured"}
+                )
+            ):
+                raise ValueError(
+                    "Only canonical reviewed management addresses enter the shared graph"
+                )
+            applied_path = "result/deviceconfig/system/"
+            if method == "observed-dhcp-lease":
+                applied_path += "type/dhcp-client"
+                if source.get("applied_dhcp_client_present") is not True:
+                    raise ValueError("Management DHCP lease lacks explicit applied mode evidence")
+            else:
+                applied_path += "ip-address" if version == 4 else "ipv6-address"
+            if source.get("applied_path") != applied_path:
+                raise ValueError(
+                    "Management address method does not match applied source provenance"
+                )
+    return deepcopy(row), {"namespace": deepcopy(namespaces[0]), "vrf": None}
+
+
+def plan_panos_ipam(
+    discovery, existing, interface_plan=None, *, ha_plan=None, management_input=None
+):
     """Validate explicit PAN evidence, then delegate all static staging to plan_ipam."""
     plan = plan_ipam({"ipam": None}, existing)
     plan["adapter"] = "panos"
@@ -424,8 +488,54 @@ def plan_panos_ipam(discovery, existing, interface_plan=None):
         canonical_panos_ipam_name(row.get("name"))
         for row in (interface_plan or {}).get("interface_creates", [])
     }
+    from .adapters.panos_logical import canonical_row
+
+    reviewed_logical_creates = {}
+    for create in (interface_plan or {}).get("interface_creates", []):
+        source = create.get("source") or {}
+        if source.get("contract") != "panos-logical-interfaces-v1":
+            continue
+        try:
+            fact = canonical_row(source.get("evidence"))
+            if (
+                source == fact["source"]
+                and create.get("name") == fact["name"]
+                and create.get("type") == fact["type"]
+                and type(create.get("enabled")) is bool
+                and create["enabled"] is fact["enabled"]
+            ):
+                reviewed_logical_creates[fact["name"]] = fact
+        except (KeyError, TypeError, ValueError):
+            continue
     normalized, routing_targets = [], {}
-    ha_reason = _ha_reason(discovery)
+    sharing = None
+    if ha_plan is not None:
+        from .reconcile_panos_ha import plan_panos_ha
+
+        # A supplied sharing list is never trusted as a Boolean override. Its
+        # complete pair/UUID/applied-address/native-interface proof must still
+        # produce exactly the proposed sharing list against this same snapshot.
+        reviewed_ha = plan_panos_ha(discovery, existing, identity_verified=True)
+        if (
+            not isinstance(ha_plan, dict)
+            or ha_plan.get("contract") != "panos-native-ha-v1"
+            or reviewed_ha["errors"]
+            or ha_plan.get("sharing") != reviewed_ha["sharing"]
+        ):
+            plan["errors"].append(
+                "PAN-OS HA sharing policy does not match independently reviewed pair provenance"
+            )
+            return _finish(plan)
+        sharing = reviewed_ha["sharing"]
+    ha_reason = _ha_reason(discovery, sharing)
+    shared = (
+        {
+            (str(row["namespace_id"]), row["host"], row["mask_length"], row["interface_name"])
+            for row in sharing["addresses"]
+        }
+        if sharing is not None
+        else set()
+    )
     for row, addresses in reviewed:
         name = row["name"]
         setting = {
@@ -447,11 +557,18 @@ def plan_panos_ipam(discovery, existing, interface_plan=None):
             eligible.get(name) == 1
             or (
                 eligible.get(name, 0) == 0
-                and row["kind"] == "ethernet"
                 and name in approved_creates
+                and (
+                    row["kind"] == "ethernet"
+                    or (
+                        name in reviewed_logical_creates
+                        and row["kind"] == reviewed_logical_creates[name]["kind"]
+                        and row["mode"] == reviewed_logical_creates[name]["mode"]
+                    )
+                )
             )
         ):
-            reason = "IPAM requires an exact existing Interface or approved Ethernet create"
+            reason = "IPAM requires an exact existing Interface or reviewed interface create"
         if reason:
             plan["unresolved"].append({"scope": "interface", "name": name, "reason": reason})
             continue
@@ -491,6 +608,30 @@ def plan_panos_ipam(discovery, existing, interface_plan=None):
                         }
                     )
                 else:
+                    configured = ip_interface(original["address"])
+                    if (
+                        sharing is not None
+                        and (
+                            str(target["namespace"]["id"]),
+                            str(configured.ip),
+                            configured.network.prefixlen,
+                            name,
+                        )
+                        not in shared
+                    ):
+                        plan["unresolved"].append(
+                            {
+                                "scope": "ip_address",
+                                "name": original["address"],
+                                "interface": name,
+                                "reason": (
+                                    "HA address ownership is not independently proven "
+                                    "on both selected peers"
+                                ),
+                                "source": deepcopy(original["source"]),
+                            }
+                        )
+                        continue
                     allowed[version].append(address)
         if not allowed[4] and not allowed[6]:
             continue
@@ -504,6 +645,23 @@ def plan_panos_ipam(discovery, existing, interface_plan=None):
             }
         )
         routing_targets[name] = target
+    if management_input is not None:
+        try:
+            management_row, management_target = _management_input(management_input, inventory)
+        except (ValueError, TypeError, KeyError):
+            plan["errors"].append(
+                "Management IPAM input lacks reviewed source or native target provenance"
+            )
+            return _finish(plan)
+        if management_row["name"] in routing_targets:
+            plan["errors"].append("Management and data-plane Interface identities are ambiguous")
+            return _finish(plan)
+        normalized.append(management_row)
+        routing_targets[management_row["name"]] = management_target
+        plan["sources"].append({"command": MANAGEMENT_INTERFACE, "path": "result/info"})
+    options = {}
+    if management_input is not None:
+        options["allowed_ipv4_methods"] = frozenset({"configured-static", "observed-dhcp-lease"})
     delegated = plan_ipam(
         {
             "ipam": {
@@ -518,6 +676,8 @@ def plan_panos_ipam(discovery, existing, interface_plan=None):
         interface_plan,
         canonical_name=canonical_panos_ipam_name,
         routing_targets=routing_targets,
+        approved_shared_assignments=sharing["addresses"] if sharing is not None else (),
+        **options,
     )
     delegated["adapter"] = "panos"
     delegated["settings"] = plan["settings"] + delegated["settings"]

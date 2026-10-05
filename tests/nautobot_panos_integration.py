@@ -70,6 +70,7 @@ def _vm_discovery(
         IKE_SAS,
         INTERFACES,
         IPSEC_SAS,
+        MANAGEMENT_INTERFACE,
         RUNNING_HA,
         RUNNING_INTERFACES,
         RUNNING_VPN,
@@ -117,10 +118,15 @@ def _vm_discovery(
             ET.SubElement(config, "link-state").text = ("up", "down", "auto")[index]
         ET.SubElement(config, "comment").text = "Synthetic UUID-bound PAN-OS port"
         ET.SubElement(ET.SubElement(config, "layer3"), "mtu").text = "1500"
+    management_response = ET.fromstring(
+        '<response status="success"><result><info><name>Management Interface</name>'
+        "<state_c>auto</state_c><state>unknown</state></info></result></response>"
+    )
     outputs = {
         command: ET.tostring(response, encoding="unicode")
         for command, response in (
             (SYSTEM_INFO, system_response),
+            (MANAGEMENT_INTERFACE, management_response),
             (INTERFACES, interface_response),
             (RUNNING_INTERFACES, applied_response),
             (VM_INTERFACES, vm_response),

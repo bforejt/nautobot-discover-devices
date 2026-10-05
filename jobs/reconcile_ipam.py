@@ -171,7 +171,13 @@ def _parse_ipv6(row, name, plan):
     return addresses
 
 
-def _parse_source(source, plan, canonical_name=canonical_interface_name):
+def _parse_source(
+    source,
+    plan,
+    canonical_name=canonical_interface_name,
+    *,
+    allowed_ipv4_methods=frozenset({"configured-static"}),
+):
     if (
         not isinstance(source, dict)
         or type(source.get("schema_version")) is not int
@@ -235,7 +241,7 @@ def _parse_source(source, plan, canonical_name=canonical_interface_name):
                     or not isinstance(address.get("mask"), str)
                     or type(address.get("prefix_length")) is not int
                     or type(address.get("secondary")) is not bool
-                    or address.get("method") != "configured-static"
+                    or address.get("method") not in allowed_ipv4_methods
                 ):
                     raise ValueError("Missing configured static address and mask")
                 host = IPv4Address(address["address"])
@@ -346,6 +352,8 @@ def plan_ipam(
     *,
     canonical_name=canonical_interface_name,
     routing_targets=None,
+    approved_shared_assignments=(),
+    allowed_ipv4_methods=frozenset({"configured-static"}),
 ):
     """Build a dependency graph without importing models or mutating the snapshot.
 
@@ -367,7 +375,9 @@ def plan_ipam(
     }
     if discovery.get("ipam") is None:
         return _finish(plan)
-    facts, observed_vrfs = _parse_source(discovery["ipam"], plan, canonical_name)
+    facts, observed_vrfs = _parse_source(
+        discovery["ipam"], plan, canonical_name, allowed_ipv4_methods=allowed_ipv4_methods
+    )
     if plan["errors"]:
         return _finish(plan)
     inventory = existing.get("ipam_inventory", {})
@@ -1003,7 +1013,8 @@ def plan_ipam(
                 interface=name,
             )
             continue
-        if ip and ip.get("type", "host") != "host":
+        address_type = "dhcp" if request.get("method") == "observed-dhcp-lease" else "host"
+        if ip and ip.get("type", "host") != address_type:
             unresolved(
                 "ip_address",
                 host,
@@ -1017,7 +1028,24 @@ def plan_ipam(
             if ip and _id(row["ip_address_id"]) == _id(ip["id"])
         ]
         interface_id = _id(request["interface"].get("id"))
-        foreign = [row for row in assignments if _id(row.get("interface_id")) != interface_id]
+        approved = {
+            _id(row["peer_interface_id"])
+            for row in approved_shared_assignments
+            if row["namespace_id"] == namespace_id
+            and row["host"] == host
+            and row["mask_length"] == request["prefix_length"]
+            and row["interface_name"] == name
+        }
+        foreign = [
+            row
+            for row in assignments
+            if row.get("vm_interface_id") is not None
+            or row.get("interface_id") is None
+            or (
+                _id(row.get("interface_id")) != interface_id
+                and _id(row.get("interface_id")) not in approved
+            )
+        ]
         if foreign:
             unresolved(
                 "ip_address",
@@ -1026,6 +1054,11 @@ def plan_ipam(
                 interface=name,
             )
             continue
+        assignments = [
+            row
+            for row in assignments
+            if interface_id is not None and _id(row.get("interface_id")) == interface_id
+        ]
         if (
             assignments
             and request.get("secondary_known", True)
@@ -1127,6 +1160,7 @@ def plan_ipam(
             "host": host,
             "mask_length": request["prefix_length"],
             "address": "%s/%s" % (host, request["prefix_length"]),
+            "type": address_type,
             "namespace_id": namespace_id,
             "parent_key": parent_key,
             "changes": [],

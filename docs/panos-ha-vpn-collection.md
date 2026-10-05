@@ -1,5 +1,10 @@
 # PAN-OS HA and IPsec collection
 
+This document records the collection contract introduced in `0.20.0-dev`.
+[Network inventory processing](panos-network-inventory.md) in `0.23.0-dev`
+consumes these unchanged observations for explicitly selected HA and native VPN
+inventory. The collector itself continues to make no native inventory writes.
+
 Job version `0.20.0-dev` adds HA and IPsec observations to the existing PAN-OS
 adapter. Applied configuration and operational state have separate versioned
 contracts. These facts are report-only: collection imports no Nautobot VPN

@@ -783,7 +783,7 @@ class PanosJobTests(unittest.TestCase):
         from tests.test_panos_ha_vpn_collection import payloads
 
         client = Mock(run=Mock(side_effect=payloads().__getitem__))
-        ha, vpn, _ = panos._collect_ha_vpn(client, 256)
+        ha, vpn, _, _ = panos._collect_ha_vpn(client, 256)
         self.observed["observations"] = {"ha": ha, "vpn": vpn}
         self.job.run(self.device)
         report = self.job.request.meta["discovery_report"]

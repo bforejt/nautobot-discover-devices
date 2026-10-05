@@ -1,5 +1,10 @@
 # PAN-OS static IPAM discovery
 
+This document records the `0.21.0-dev` static IPAM checkpoint. The
+[network inventory increment](panos-network-inventory.md) adds reviewed logical
+creation, separate management addressing and explicitly verified HA ownership
+to this shared IPAM boundary.
+
 Job `0.21.0-dev` adds applied static IPv4/IPv6 processing for PAN-OS. Collection
 remains SSH/XML and read-only. Native processing requires an explicit mapping
 from an observed vsys and virtual router to an existing Nautobot Namespace and

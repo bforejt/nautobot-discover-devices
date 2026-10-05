@@ -9,7 +9,11 @@ from .reconcile_capacity import plan_capacity
 from .reconcile_components import plan_components
 from .reconcile_console import plan_console_ports, reviewed_profile
 from .reconcile_ipam import plan_ipam
+from .reconcile_panos_ha import plan_panos_ha
+from .reconcile_panos_interfaces import plan_panos_interfaces
 from .reconcile_panos_ipam import plan_panos_ipam
+from .reconcile_panos_management import plan_panos_management
+from .reconcile_panos_vpn import plan_panos_vpn
 from .reconcile_route_targets import plan_route_targets
 from .reconcile_stack import plan_stack
 from .reconcile_vlans import plan_vlans
@@ -564,6 +568,25 @@ def build_plan(discovery, existing):
             )
 
     _lag_assignments(domain_discovery, plan, by_name, observed, conflict)
+    plan["panos_interfaces"] = plan_panos_interfaces(
+        discovery, existing, interface_plan=plan, identity_verified=not plan["errors"]
+    )
+    plan["management"] = plan_panos_management(
+        discovery, existing, plan, identity_verified=not plan["errors"]
+    )
+    for domain in (plan["panos_interfaces"], plan["management"]):
+        plan["interface_creates"].extend(domain["creates"])
+        plan["interface_updates"].extend(domain["updates"])
+        for key in ("conflicts", "errors", "warnings"):
+            plan[key].extend(domain[key])
+    observed.update(
+        row["name"] for row in (discovery.get("logical_interfaces") or {}).get("interfaces", [])
+    )
+    if adapter is panos and discovery.get("management"):
+        observed.add(discovery["management"]["interface"]["name"])
+    plan["ha"] = plan_panos_ha(discovery, existing, identity_verified=not plan["errors"])
+    for key in ("conflicts", "errors", "warnings"):
+        plan[key].extend(plan["ha"][key])
     plan["layer2"] = plan_vlans(domain_discovery, existing, interface_plan=plan)
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["layer2"][key])
@@ -576,10 +599,31 @@ def build_plan(discovery, existing):
     for key in ("conflicts", "errors", "warnings"):
         plan[key].extend(plan["console_ports"][key])
     plan["ipam"] = (
-        plan_panos_ipam(discovery, existing, interface_plan=plan)
+        plan_panos_ipam(
+            discovery,
+            existing,
+            interface_plan=plan,
+            ha_plan=plan["ha"],
+            management_input=plan["management"]["ipam_input"],
+        )
         if adapter is panos
         else plan_ipam(domain_discovery, existing, interface_plan=plan)
     )
+    if adapter is panos:
+        approved_management_ids = {
+            str(row["id"]) for row in plan["ipam"]["ip_addresses"] if row["id"]
+        }
+        plan["management"]["primary_updates"] = [
+            row
+            for row in plan["management"]["primary_updates"]
+            if row["after"] in approved_management_ids
+        ]
+        plan["management"]["summary"]["panos_primary_ips_updated"] = len(
+            plan["management"]["primary_updates"]
+        )
+    plan["vpn"] = plan_panos_vpn(discovery, existing)
+    for key in ("conflicts", "errors", "warnings"):
+        plan[key].extend(plan["vpn"][key])
     route_targets = plan_route_targets(domain_discovery, existing, plan["ipam"])
     for key in ("route_targets", "vrf_route_targets"):
         plan["ipam"][key] = route_targets[key]
@@ -627,6 +671,10 @@ def build_plan(discovery, existing):
         **plan["console_ports"]["summary"],
         **plan["ipam"]["summary"],
         **plan["capacity"]["summary"],
+        **plan["panos_interfaces"]["summary"],
+        **plan["management"]["summary"],
+        **plan["ha"]["summary"],
+        **plan["vpn"]["summary"],
         **stack["summary"],
     }
     return plan

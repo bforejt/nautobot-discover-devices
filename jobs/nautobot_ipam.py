@@ -56,6 +56,11 @@ def _namespace_ids(policy):
             if scope is not None
         }
         | {str(row["namespace"]["id"]) for row in policy.get("panos_routing_domains", [])}
+        | (
+            {str(policy["panos_management"]["namespace"]["id"])}
+            if policy.get("panos_management")
+            else set()
+        )
     )
 
 
@@ -141,6 +146,9 @@ def snapshot_ipam(device, policy, *, lock=False, discovery=None):
     route_targets = snapshot_route_targets(vrfs, lock=lock)
     return {
         "supported": True,
+        "ip_address_types": [
+            value for value, label in IPAddress._meta.get_field("type").flatchoices
+        ],
         "policy": copy.deepcopy(policy),
         "device": {
             "id": str(device.pk),
@@ -305,7 +313,9 @@ def ipam_objects(plan, interfaces, device, *, prefix_status, ip_address_status, 
     for spec in plan["ip_addresses"]:
         parent = objects["prefixes"][spec["parent_key"]]
         address = (
-            IPAddress(address=spec["address"], parent=parent, status=status, type="host")
+            IPAddress(
+                address=spec["address"], parent=parent, status=status, type=spec.get("type", "host")
+            )
             if spec["create"]
             else IPAddress.objects.select_related("parent__namespace").get(pk=spec["id"])
         )

@@ -58,6 +58,7 @@ def _collect(name, vm_uuid, *, network=None, vsys=None, ha_state=None):
         IKE_SAS,
         INTERFACES,
         IPSEC_SAS,
+        MANAGEMENT_INTERFACE,
         RUNNING_HA,
         RUNNING_INTERFACES,
         RUNNING_VPN,
@@ -77,6 +78,11 @@ def _collect(name, vm_uuid, *, network=None, vsys=None, ha_state=None):
     interface_result.append(copy.deepcopy(ET.fromstring(network).find("result/network/interface")))
     payloads = {
         SYSTEM_INFO: ET.tostring(system, encoding="unicode"),
+        MANAGEMENT_INTERFACE: (
+            '<response status="success"><result><info>'
+            "<name>Management Interface</name><state_c>unknown</state_c>"
+            "<state>unknown</state></info></result></response>"
+        ),
         INTERFACES: _fixture("panos_vm_empty_interfaces.xml"),
         VM_INTERFACES: _fixture("panos_vm_guest_interfaces.xml"),
         RUNNING_INTERFACES: ET.tostring(interface_response, encoding="unicode"),
@@ -238,9 +244,25 @@ def run(device_id=None):
                     existing.mtu = 9000
                 existing.validated_save()
                 native_interfaces[row["name"]] = existing
-            for name, parent in (("ethernet1/1.100", "ethernet1/1"), ("ae1.200", "ae1")):
-                native_interfaces[name].parent_interface = native_interfaces[parent]
-                native_interfaces[name].validated_save()
+            # Isolate IPAM preservation from the separately tested logical writer,
+            # including applied Layer-2 units that carry no address records.
+            for row in discovery["logical_interfaces"]["interfaces"]:
+                if row["name"] not in native_interfaces:
+                    interface = Interface(
+                        device=target,
+                        name=row["name"],
+                        type=row["type"],
+                        enabled=False,
+                        description="Operator-authored baseline",
+                        mtu=9000,
+                        status=interface_status,
+                    )
+                    interface.validated_save()
+                    native_interfaces[row["name"]] = interface
+                if row["parent_name"]:
+                    interface = native_interfaces[row["name"]]
+                    interface.parent_interface = target.interfaces.get(name=row["parent_name"])
+                    interface.validated_save()
 
             public = Namespace(name="PAN-IPAM-PUBLIC-" + token)
             internal = Namespace(name="PAN-IPAM-INTERNAL-" + token)
@@ -569,7 +591,16 @@ def run(device_id=None):
             extra_network, extra_vsys = _extra_loopback(
                 base_network, base_vsys, 404, "10.255.4.4/32"
             )
-            absent = _collect(name, vm_uuid, network=extra_network, vsys=extra_vsys)
+            unreviewed = ET.fromstring(extra_network)
+            ET.SubElement(
+                unreviewed.find(
+                    'result/network/interface/loopback/units/entry[@name="loopback.404"]'
+                ),
+                "shutdown",
+            )
+            absent = _collect(
+                name, vm_uuid, network=ET.tostring(unreviewed, encoding="unicode"), vsys=extra_vsys
+            )
             absent_plan = no_write_case(absent, "Missing logical Interface apply issued DML")
             assert any(
                 row.get("name") == "loopback.404" for row in absent_plan["ipam"]["unresolved"]
@@ -579,8 +610,23 @@ def run(device_id=None):
                 parent__namespace=public, host="10.255.4.4"
             ).exists()
             checks.append(
-                "configured logical address never invents an Interface or administrative "
-                "enabled state"
+                "unreviewed logical administration keeps both Interface and addressing "
+                "unresolved without DML"
+            )
+            instantiated = _collect(name, vm_uuid, network=extra_network, vsys=extra_vsys)
+            with CaptureQueriesContext(connection) as captured:
+                first_pass = preview(instantiated)
+            _no_dml(captured, "Prospective logical Interface/IPAM preview issued DML")
+            assert [row["name"] for row in first_pass["interface_creates"]] == ["loopback.404"]
+            assert any(row["host"] == "10.255.4.4" for row in first_pass["ipam"]["ip_addresses"])
+            apply(instantiated)
+            created_logical = target.interfaces.get(name="loopback.404")
+            assert created_logical.enabled and created_logical.type == "virtual"
+            assert created_logical.ip_addresses.filter(host="10.255.4.4").exists()
+            no_write_case(instantiated, "Repeated new logical Interface/IPAM apply issued DML")
+            checks.append(
+                "reviewed prospective logical Interface and IPAM validate without writes, "
+                "apply together and repeat without DML"
             )
 
             other_vrf = VRF(name="Operator preserved VRF " + token, namespace=public)

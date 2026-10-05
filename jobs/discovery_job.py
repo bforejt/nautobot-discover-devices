@@ -9,16 +9,19 @@ from nautobot.extras.models import SecretsGroup, Status
 from nautobot.ipam.models import Namespace, VLANGroup
 
 from .adapters import cisco_iosxe, panos
+from .adapters.panos_management import normalize_management_policy
 from .credentials import CredentialsError, resolve_credentials
 from .ipam_policy import normalize_ipam_policy
 from .nautobot_inventory import InventoryError, apply_discovery, snapshot_inventory, validate_plan
+from .panos_ha_policy import normalize_panos_ha_policy
 from .panos_ipam_policy import normalize_panos_ipam_policy
+from .panos_vpn_policy import normalize_panos_vpn_policy
 from .reconcile import build_plan
 from .transport_restconf import RestconfClient, RestconfError
 from .transport_ssh import PanosSshClient, SshError
 
 name = "Device Discovery"
-JOB_VERSION = "0.22.0-dev"
+JOB_VERSION = "0.23.0-dev"
 
 
 def _resolve_panos_ipam_target(kind, identifier, namespace_id):
@@ -54,6 +57,43 @@ def _host(device):
     if device.name:
         return device.name
     raise ValueError("Assign a primary IP or DNS-resolvable name to the Device")
+
+
+def _resolve_panos_ha_target(kind, identifier):
+    from nautobot.dcim import models as dcim_models
+
+    model = Device if kind == "device" else getattr(dcim_models, "DeviceRedundancyGroup", None)
+    if model is None:
+        raise ValueError("Installed Nautobot lacks native DeviceRedundancyGroup support")
+    try:
+        obj = model.objects.get(pk=identifier)
+    except model.DoesNotExist:
+        raise ValueError("An explicitly selected PAN-OS HA object does not exist") from None
+    if kind == "device":
+        if _adapter(obj) is not panos:
+            raise ValueError("The explicitly selected HA peer must have a PAN-OS platform")
+        return {"id": str(obj.pk), "name": obj.name, "model": obj.device_type.model}
+    return {"id": str(obj.pk), "name": obj.name, "failover_strategy": obj.failover_strategy}
+
+
+def _resolve_panos_vpn_target(kind, identifier):
+    if kind == "namespace":
+        return _resolve_panos_ipam_target(kind, identifier, None)
+    from django.contrib.contenttypes.models import ContentType
+
+    try:
+        lookup = {"pk": str(UUID(identifier))}
+    except ValueError:
+        lookup = {"name": identifier}
+    applicable = Status.objects.filter(**lookup)
+    content_type = ContentType.objects.filter(app_label="vpn", model="vpntunnel").first()
+    if content_type is not None:
+        applicable = applicable.filter(content_types=content_type)
+    try:
+        obj = applicable.get()
+    except (Status.DoesNotExist, Status.MultipleObjectsReturned):
+        raise ValueError("Select an unambiguous applicable native VPNTunnel Status") from None
+    return {"id": str(obj.pk), "name": obj.name}
 
 
 def _adapter(device):
@@ -195,6 +235,38 @@ class DiscoverDevice(Job):
             '"namespace":"Lab","vrf":null}]. Blank: report-only PAN-OS IPAM.'
         ),
     )
+    panos_management_policy = TextVar(
+        required=False,
+        default="",
+        label="PAN-OS management inventory policy",
+        description=(
+            "JSON object selecting an existing Namespace. Example: "
+            '{"namespace":"Management","include_dhcp":false,"fill_primary":true}. '
+            "DHCP leases require an explicit opt-in. Populated primary IPs are preserved."
+        ),
+    )
+    panos_ha_peer = TextVar(
+        required=False,
+        default="",
+        label="PAN-OS HA peer selection",
+        description=(
+            "JSON object with existing peer_device UUID, peer_vm_uuid and existing "
+            "redundancy_group UUID. Peer identity and reciprocal HA evidence are read "
+            "directly over SSH. Blank: HA addresses remain report-only."
+        ),
+    )
+    panos_vpn_mappings = TextVar(
+        required=False,
+        default="",
+        label="PAN-OS native VPN mappings",
+        description=(
+            "JSON list with exact tunnel, vpn_name, tunnel_name and profile_name "
+            "selecting an existing VPNProfile. Missing profiles remain unresolved. "
+            "optional applicable status and existing local_namespace, remote_namespace, "
+            "local_protected_namespace and remote_protected_namespace names or UUIDs. "
+            "Blank or unavailable native models: VPN collection stays report-only."
+        ),
+    )
     ipam_override_namespace = ObjectVar(
         model=Namespace,
         required=False,
@@ -273,7 +345,8 @@ class DiscoverDevice(Job):
         name = "Discover Device"
         description = (
             "Verify Cisco IOS XE or PAN-OS identity and fill supported interfaces. "
-            "PAN-OS also reports HA and IPsec configuration and operational evidence. "
+            "PAN-OS supports logical and management inventory, explicitly selected HA "
+            "ownership and native VPN processing where compatible models exist. "
             "Cisco IOS XE also supports console ports, VLANs, "
             "serialized hardware, static IPv4/IPv6 addressing and named VRFs with "
             "supported import/export route targets."
@@ -301,6 +374,9 @@ class DiscoverDevice(Job):
             "vlan_status",
             "ipam_namespace",
             "panos_routing_domains",
+            "panos_management_policy",
+            "panos_ha_peer",
+            "panos_vpn_mappings",
             "ipam_override_namespace",
             "ipam_override_rfc1918",
             "ipam_override_networks",
@@ -340,6 +416,9 @@ class DiscoverDevice(Job):
         expected_vm_uuid="",
         max_vpn_flow_details=256,
         panos_routing_domains="",
+        panos_management_policy="",
+        panos_ha_peer="",
+        panos_vpn_mappings="",
     ):
         device = Device.objects.get(pk=device.pk)
         report = {
@@ -362,8 +441,10 @@ class DiscoverDevice(Job):
         )
         try:
             adapter = _adapter(device)
-            if adapter is not panos and panos_routing_domains:
-                raise ValueError("PAN-OS routing-domain mappings are supported only for PAN-OS")
+            if adapter is not panos and any(
+                (panos_routing_domains, panos_management_policy, panos_ha_peer, panos_vpn_mappings)
+            ):
+                raise ValueError("PAN-OS inventory policies are supported only for PAN-OS")
             panos_policy = (
                 normalize_panos_ipam_policy(
                     panos_routing_domains,
@@ -373,9 +454,32 @@ class DiscoverDevice(Job):
                 if adapter is panos
                 else None
             )
+            management_policy = (
+                normalize_management_policy(
+                    panos_management_policy,
+                    _resolve_panos_ipam_target,
+                    create_missing_prefixes=ipam_create_missing_prefixes,
+                )
+                if adapter is panos
+                else None
+            )
+            ha_policy = (
+                normalize_panos_ha_policy(
+                    panos_ha_peer, _resolve_panos_ha_target, selected_device_id=str(device.pk)
+                )
+                if adapter is panos
+                else None
+            )
+            vpn_policy = (
+                normalize_panos_vpn_policy(panos_vpn_mappings, _resolve_panos_vpn_target)
+                if adapter is panos
+                else None
+            )
             location, location_reason = (
                 _prefix_location(device, ipam_location)
-                if (adapter is not panos and ipam_namespace is not None) or panos_policy is not None
+                if (adapter is not panos and ipam_namespace is not None)
+                or panos_policy is not None
+                or management_policy is not None
                 else (None, None)
             )
             ipam_policy = (
@@ -395,6 +499,18 @@ class DiscoverDevice(Job):
             )
             if adapter is panos and ipam_policy is not None:
                 ipam_policy.update(location=location, location_reason=location_reason)
+            if management_policy is not None:
+                management_policy.update(location=location, location_reason=location_reason)
+                if ipam_policy is None:
+                    ipam_policy = {
+                        "contract": "panos-ipam-policy-v1",
+                        "panos_routing_domains": [],
+                        "default_namespace": management_policy["namespace"],
+                        "create_missing_prefixes": ipam_create_missing_prefixes,
+                        "location": location,
+                        "location_reason": location_reason,
+                    }
+                ipam_policy["panos_management"] = management_policy
             report["ipam_policy"] = ipam_policy
             if type(use_ntc_defaults) is not bool:
                 raise ValueError("Use NTC defaults when guessing must be true or false")
@@ -448,14 +564,38 @@ class DiscoverDevice(Job):
                 report["requests"] = client.trace
             discovery = report["discovery"]
             if adapter is panos:
+                discovery["vpn_policy"] = vpn_policy
+                if ha_policy is not None:
+                    peer = Device.objects.get(pk=ha_policy["peer_device"]["id"])
+                    username, password = resolve_credentials(
+                        peer, override_group=secrets_group, transport="ssh"
+                    )
+                    peer_client = PanosSshClient(
+                        _host(peer), username, password, port=ssh_port, ssh_strict=ssh_strict
+                    )
+                    try:
+                        peer_discovery = panos.collect(
+                            peer_client,
+                            expected_vm_uuid=ha_policy["peer_vm_uuid"],
+                            max_vpn_flow_details=max_vpn_flow_details,
+                        )
+                    finally:
+                        peer_client.close()
+                        report["peer_requests"] = peer_client.trace
+                    discovery["ha_pair"] = {
+                        "contract": "panos-ha-pair-v1",
+                        "policy": ha_policy,
+                        "peer_discovery": peer_discovery,
+                    }
+            if adapter is panos:
                 observations = discovery.get("observations", {})
                 vpn = observations.get("vpn", {})
                 configuration = vpn.get("configuration", {})
                 runtime = vpn.get("runtime", {})
                 self.logger.info(
                     "Collected HA state and %s configured IPsec tunnels with %s flow details. "
-                    "HA/VPN observations are available under Advanced and in the report; "
-                    "they do not change native HA/VPN inventory.",
+                    "HA/VPN evidence and explicitly selected native processing are available "
+                    "under Advanced and in the report.",
                     len(configuration.get("ipsec_tunnels", [])),
                     len(runtime.get("flow_details", [])),
                 )
@@ -686,6 +826,39 @@ class DiscoverDevice(Job):
                 "Prefix VRF assignment",
                 "Prefix VRF assignments",
             ),
+            ("panos_primary_ips_updated", "fill", "Filled", "primary IP", "primary IPs"),
+            (
+                "interface_parents_assigned",
+                "link",
+                "Linked",
+                "logical interface parent",
+                "logical interface parents",
+            ),
+            (
+                "panos_lag_assignments",
+                "link",
+                "Linked",
+                "PAN-OS aggregate membership",
+                "PAN-OS aggregate memberships",
+            ),
+            ("ha_groups_updated", "fill", "Filled", "HA group", "HA groups"),
+            ("ha_devices_updated", "fill", "Filled", "HA membership", "HA memberships"),
+            ("vpn_objects_created", "add", "Added", "VPN object", "VPN objects"),
+            ("vpn_objects_updated", "fill", "Filled", "VPN object", "VPN objects"),
+            (
+                "vpn_policy_assignments_created",
+                "link",
+                "Linked",
+                "VPN policy assignment",
+                "VPN policy assignments",
+            ),
+            (
+                "vpn_prefix_assignments_created",
+                "link",
+                "Linked",
+                "VPN Prefix assignment",
+                "VPN Prefix assignments",
+            ),
         )
         if not any(summary.get(key, 0) for key, *_ in changes):
             self.logger.info("No inventory changes are needed.")
@@ -700,6 +873,19 @@ class DiscoverDevice(Job):
                 )
         ipam = plan.get("ipam", {})
         capacity = plan.get("capacity", {})
+        for domain, label in (
+            ("panos_interfaces", "PAN-OS logical interface"),
+            ("management", "PAN-OS management"),
+            ("ha", "PAN-OS HA"),
+            ("vpn", "PAN-OS VPN"),
+        ):
+            unresolved = plan.get(domain, {}).get("unresolved", [])
+            if unresolved:
+                self.logger.info(
+                    "Left %s %s observations unresolved; review their evidence under Advanced.",
+                    len(unresolved),
+                    label,
+                )
         if capacity.get("unresolved"):
             self.logger.info(
                 "Left %s VM capacity observations unresolved. Review source evidence and "

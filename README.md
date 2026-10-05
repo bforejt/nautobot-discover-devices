@@ -16,12 +16,24 @@ vsys/virtual-router mappings to existing Namespaces and VRFs. The
 [capacity contract](docs/panos-capacity-discovery.md) in `0.22.0-dev` adds
 Palo-only processing of existing Device capacity fields: verified VM core count
 may fill `vcpus`; memory and primary-disk capacity remain unresolved until their
-structured source meanings are established. The
+structured source meanings are established. Version `0.23.0-dev` adds
+[logical and management inventory, HA ownership and native VPN processing](docs/panos-network-inventory.md).
+HA sharing requires an explicitly selected, independently verified existing peer
+and redundancy group. VPN processing requires explicit native mappings and
+compatible models; unavailable models retain report-only behavior. The
 [VM-Series validation contract](docs/panos-vm-validation.md)
 defines explicit UUID binding for PA-VM on KVM and reviewed virtual templates;
 the [first-pass history](docs/panos-discovery.md) records initial lab evidence.
 Physical-appliance capability remains unresolved.
 The job defaults to a preview.
+
+The `0.23.0-dev` increment passed 1,076 offline tests, 241 native rollback
+checks and live strict-SSH preview/apply/repeat on the original HA member,
+passive peer and standalone VPN peer. Three HA IP records have both verified
+Interface assignments, management primary IPs are populated, and the native VPN
+uses real IP/interface endpoint bindings. Complete repeats issued zero inventory
+DML. The installed worker's queued preview preserved inventory and attached the
+same report shown under Advanced. Missing VPN profiles remain unresolved.
 
 This project targets Nautobot 3.2. Native `SoftwareVersion` is used for
 the main Device software field; that model requires Nautobot 2.2 or later.

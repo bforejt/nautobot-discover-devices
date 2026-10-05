@@ -55,8 +55,8 @@ class PanosHaVpnCollectionTests(unittest.TestCase):
         self.assertEqual(runtime["unresolved"], [])
         self.assertFalse(facts["vpn"]["native_writes"])
         commands = [call.args[0] for call in self.client.run.call_args_list]
-        self.assertEqual(len(commands), 12)
-        self.assertEqual(commands[-2], "show vpn flow tunnel-id 1")
+        self.assertEqual(len(commands), 13)
+        self.assertEqual(commands[-3], "show vpn flow tunnel-id 1")
         self.assertTrue(all(ssh.is_read_command(command) for command in commands))
         self.assertEqual(
             result["sources"]["vpn"]["flow_details"], [runtime["flow_details"][0]["source"]]
@@ -146,7 +146,7 @@ class PanosHaVpnCollectionTests(unittest.TestCase):
     def test_arbitrary_observed_ids_scale_without_name_interpolation(self):
         result = self.collect(self.multiple_flows(), max_vpn_flow_details=3)
         commands = [call.args[0] for call in self.client.run.call_args_list]
-        self.assertEqual(commands[-4:-1], [ssh.vpn_flow_detail_command(i) for i in (3, 27, 65535)])
+        self.assertEqual(commands[-5:-2], [ssh.vpn_flow_detail_command(i) for i in (3, 27, 65535)])
         self.assertEqual(len(result["observations"]["vpn"]["runtime"]["flow_details"]), 3)
         self.assertFalse(any("configure" in command for command in commands))
 

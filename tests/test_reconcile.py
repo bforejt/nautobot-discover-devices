@@ -79,6 +79,20 @@ def apply_to_snapshot(plan, before):
 
 
 class ReconciliationTests(unittest.TestCase):
+    def test_cisco_management_observations_do_not_enter_panos_inventory(self):
+        observed = discovery()
+        observed["management"] = {
+            "schema_version": 1,
+            "interfaces": [],
+            "observations": {},
+            "writes_deferred_reason": "Explicit management Namespace is required",
+        }
+        result = reconcile.build_plan(observed, inventory())
+        self.assertFalse(result["errors"])
+        self.assertFalse(result["management"]["creates"])
+        self.assertFalse(result["management"]["primary_updates"])
+        self.assertEqual(len(result["interface_creates"]), 1)
+
     def test_reviewed_management_purpose_corrects_default_false_then_repeats(self):
         from tests.test_console_reconcile import profile
 

@@ -1,9 +1,8 @@
 # PAN-OS discovery handoff
 
-Use this document to start a new task for Palo Alto PAN-OS discovery. Begin with
-the existing testsuite collection work, propose the native Nautobot mappings,
-and implement one reviewed increment at a time. The first increment should
-verify device identity and discover physical interfaces on an existing Device.
+Use this document to continue Palo Alto PAN-OS discovery from the current
+network inventory increment below. Retain the reviewed source contracts,
+explicit existing inventory selections and native preview/apply validation.
 
 The original baseline and opening-task instructions below are historical.
 Current identity/interface work is described in the
@@ -17,7 +16,63 @@ Continue from the checked current repository state rather than repeating the
 original Cisco-only framework migration. Historical proof counts below do not
 describe this new increment's validation.
 
-## Current capacity increment
+## Current network inventory increment
+
+Branch `codex/panos-network-inventory` adds Job `0.23.0-dev`. The user authorized
+logical interfaces, management inventory, HA address ownership and native VPN
+processing; further inventory domains remain deferred. All production discovery
+facts still come from Palo SSH/XML responses. See the
+[network inventory contract](panos-network-inventory.md),
+[logical interface contract](panos-logical-interfaces.md) and
+[native VPN contract](panos-native-vpn.md).
+
+Management uses its separate operational XML record and the already collected
+applied deviceconfig parent. DHCP inventory and primary-IP fill require explicit
+policy. HA ownership requires selected existing peer/group UUIDs and direct
+reciprocal evidence. Native VPN capabilities are detected without version
+branches; missing VPN models remain report-only. Missing native VPNProfile
+objects are deliberately not created because their required behavior flags lack
+reviewed Palo meanings. Logical and management addresses enter one IPAM graph.
+New management primary-IP and VPN endpoint relationships can require a further
+discovery pass after exact native Interface/IP assignments exist.
+
+Validation passed 1,076 offline tests on Python 3.14/3.12 and 241 native checks
+on Nautobot 3.2.6. The native checks cover 150 Cisco, 22 PAN framework, 18 PAN
+IPAM, 15 capacity, 13 logical, 5 management, 7 HA and 11 VPN checks. Native
+fixtures fully rolled back, including injected late failures. Fresh pinned,
+UUID-bound production collection passed on all three PAN-OS 11.2.8 lab VMs
+with thirteen traced reads each and one whole-network parent read. The passive
+member's unavailable IKE response remains explicitly unresolved.
+Earlier proof counts and installation versions below are historical.
+
+The installed lab package and worker run matching `0.23.0-dev` source. Deliberate
+lab setup added peer Devices at the original/Cisco lab Location and the existing
+selected `PAN-OS Lab HA` redundancy group. Management DHCP inventory/primary
+fill and `vsys1` / `lab-vpn-vr` global routing explicitly select Namespace
+`Global`. All three Devices have management primary IPs and logical inventory.
+The normal strict-SSH combined preview issued zero DML; apply populated HA/VPN
+inventory and a following pass completed primary/endpoint bindings. Reverse
+peer discovery assigned the same three HA IP records to both members. Complete
+original/passive/standalone repeats issued zero DML. The native lab VPN has real
+endpoint IP/interface bindings and protected Prefixes. Its selected missing
+Profile remains unresolved. No hypervisor queries establish discovery facts.
+Normal queued worker preview `db44598d-44ca-4c13-8e97-92e8aed5de35` succeeded
+with unchanged inventory across all relevant model fingerprints. Its FileProxy
+attachment exactly matches Advanced; both installed package copies match the
+workspace source hashes.
+
+| Existing selected target | Device UUID | Palo VM UUID | Management primary |
+| --- | --- | --- | --- |
+| `panos-lab` | `ed010564-cfd9-4039-bfad-a40ea4487157` | `56fe4cc8-e0f4-44c1-b0c5-2a5927c77a8b` | `10.40.3.232` |
+| `panos-ha-peer` | `415a260a-ca53-423f-9f45-fd4c6f674592` | `4a6bd357-0b13-4e2c-b8fa-9eeba7dc7caa` | `10.40.3.216` |
+| `panos-vpn-peer` | `a0e78e45-31ee-4dc0-9251-9f48a989fbc7` | `ebc02370-12e7-4a45-bac7-3ab952a05ca8` | `10.40.3.28` |
+
+The explicitly selected native HA group UUID is
+`d5d18adf-c8b9-4ed0-bb6f-c00771bb9b85`. Detailed behavior and private proof paths
+are in the network inventory contract. Discovery creates no peer Device or
+schema. Further domains remain outside this task.
+
+## Capacity increment
 
 Job `0.22.0-dev` adds [Palo-only capacity processing](panos-capacity-discovery.md)
 for the existing Integer Device custom fields `vcpus`, `memory_mb`, `disk_gb`.
@@ -38,7 +93,7 @@ preview issued zero DML; apply saved `panos-lab.vcpus=4` and its one already
 eligible missing virtual Interface; repeat issued zero DML. Memory/storage and
 all other custom-field values were preserved. The lab package is `0.22.0-dev`.
 
-## Current IPAM increment
+## Static IPAM checkpoint (`0.21.0-dev`)
 
 PAN-OS IPAM now collects literal applied IPv4/IPv6 addresses, exact supported
 interface identities, virtual-router membership and vsys imports. The existing
@@ -71,7 +126,7 @@ dual-stack preview/apply/repeat. Preview/repeat issued zero DML; apply processed
 four static hosts and the unconditional outer rollback restored all test
 inventory. The lab Jobs package is installed as `0.21.0-dev`.
 
-## Current HA/VPN increment
+## HA/VPN collection checkpoint (`0.20.0-dev`)
 
 The PAN-OS collector adds six exact HA/VPN reads: applied deviceconfig and
 network parents, HA state, unfiltered IKE/IPsec SA inventories and the flow

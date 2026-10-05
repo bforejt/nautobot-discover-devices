@@ -11,6 +11,7 @@ import time
 
 SYSTEM_INFO = "show system info"
 INTERFACES = "show interface all"
+MANAGEMENT_INTERFACE = "show interface management"
 VM_INTERFACES = "debug show vm-series interfaces all"
 RUNNING_INTERFACES = "show config effective-running xpath devices/entry/network/interface"
 HA_STATE = "show high-availability all"
@@ -21,6 +22,8 @@ IKE_SAS = "show vpn ike-sa"
 IPSEC_SAS = "show vpn ipsec-sa"
 VPN_FLOWS = "show vpn flow"
 SESSION_PREP = ("set cli pager off", "set cli op-command-xml-output on")
+PROMPT_PATTERN = r"(?m:^[A-Za-z0-9_.:@()/\-]+>[ \t]*\r?$)"
+_PROMPT_LINE = re.compile(r"[A-Za-z0-9_.:@()/\-]+>")
 HA_VPN_READ_COMMANDS = (
     RUNNING_HA,
     HA_STATE,
@@ -30,7 +33,7 @@ HA_VPN_READ_COMMANDS = (
     VPN_FLOWS,
 )
 READ_COMMANDS = frozenset(
-    (SYSTEM_INFO, INTERFACES, RUNNING_INTERFACES, VM_INTERFACES, RUNNING_VSYS)
+    (SYSTEM_INFO, INTERFACES, MANAGEMENT_INTERFACE, RUNNING_INTERFACES, VM_INTERFACES, RUNNING_VSYS)
     + HA_VPN_READ_COMMANDS
 )
 _FLOW_DETAIL = re.compile(r"show vpn flow tunnel-id ([1-9][0-9]{0,4})")
@@ -59,6 +62,31 @@ class SshError(RuntimeError):
 def _cancel(exc):
     if type(exc).__name__ == "SoftTimeLimitExceeded":
         raise exc
+
+
+def _panos_connection(params):
+    """Keep driver connection/authentication behavior without implicit CLI reads.
+
+    Netmiko's default Palo preparation issues an untraced system-info read and
+    assumes text display markers. Only our fenced transport may issue commands;
+    prompt acquisition itself sends one RETURN and accepts an operational prompt.
+    The driver remains lazy so pure planning does not require Netmiko.
+    """
+    from netmiko.paloalto.paloalto_panos import PaloAltoPanosSSH
+
+    class FencedPaloAltoSSH(PaloAltoPanosSSH):
+        def session_preparation(self):
+            self.ansi_escape_codes = True
+            self.write_channel(self.RETURN)
+            output = self.read_until_pattern(pattern=PROMPT_PATTERN, read_timeout=60)
+            if not isinstance(output, str) or not output.strip():
+                raise SshError("PAN-OS SSH did not provide a complete operational prompt")
+            prompt = output.strip().splitlines()[-1]
+            if _PROMPT_LINE.fullmatch(prompt) is None:
+                raise SshError("PAN-OS SSH did not provide a complete operational prompt")
+            self.base_prompt = prompt[:-1]
+
+    return FencedPaloAltoSSH(**params)
 
 
 class PanosSshClient:
@@ -98,9 +126,7 @@ class PanosSshClient:
         if self.conn is not None:
             return
         try:
-            from netmiko import ConnectHandler
-
-            self.conn = ConnectHandler(**self._params)
+            self.conn = _panos_connection(self._params)
             for command in SESSION_PREP:
                 self._send(command, timeout=30, presentation=True)
         except ImportError:
@@ -118,7 +144,12 @@ class PanosSshClient:
         start = time.monotonic()
         try:
             return self.conn.send_command(
-                command, read_timeout=timeout, strip_prompt=True, strip_command=True
+                command,
+                read_timeout=timeout,
+                strip_prompt=True,
+                strip_command=True,
+                expect_string=PROMPT_PATTERN,
+                auto_find_prompt=False,
             )
         except Exception as exc:
             _cancel(exc)

@@ -15,6 +15,7 @@ from ..transport_ssh import (
     IKE_SAS,
     INTERFACES,
     IPSEC_SAS,
+    MANAGEMENT_INTERFACE,
     RUNNING_HA,
     RUNNING_INTERFACES,
     RUNNING_VPN,
@@ -464,9 +465,10 @@ def _collect_ha_vpn(client, max_vpn_flow_details):
     from .panos_vpn_config import parse_vpn_configuration
     from .panos_vpn_runtime import parse_ike_sas, parse_ipsec_sas, parse_vpn_flows
 
+    deviceconfig_output = client.run(RUNNING_HA)
     ha = {
         "contract": "panos-ha-v1",
-        "configuration": parse_ha_configuration(client.run(RUNNING_HA), command=RUNNING_HA),
+        "configuration": parse_ha_configuration(deviceconfig_output, command=RUNNING_HA),
         "runtime": parse_ha_state(client.run(HA_STATE), command=HA_STATE),
     }
     network_output = client.run(RUNNING_VPN)
@@ -538,6 +540,7 @@ def _collect_ha_vpn(client, max_vpn_flow_details):
             "native_writes": False,
         },
         network_output,
+        deviceconfig_output,
     )
 
 
@@ -594,7 +597,7 @@ def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None, max_vpn_fl
         collected_observations["vm_interfaces"] = vm_rows
     from .panos_ipam import parse_ipam_configuration
 
-    ha, vpn, network_output = _collect_ha_vpn(client, max_vpn_flow_details)
+    ha, vpn, network_output, deviceconfig_output = _collect_ha_vpn(client, max_vpn_flow_details)
     ipam = parse_ipam_configuration(network_output, client.run(RUNNING_VSYS))
     warnings.extend(row["reason"] for row in vpn["runtime"]["unresolved"])
     collected_observations["ha"] = ha
@@ -623,6 +626,14 @@ def collect(client, *, use_ntc_defaults=False, expected_vm_uuid=None, max_vpn_fl
         "sources": sources,
     }
     from .panos_capacity import parse_capacity
+    from .panos_logical import parse_logical_interfaces
+    from .panos_management import parse_management
 
     discovery["capacity"] = parse_capacity(discovery)
+    discovery["logical_interfaces"] = parse_logical_interfaces(network_output)
+    discovery["management"] = parse_management(
+        client.run(MANAGEMENT_INTERFACE),
+        deviceconfig_output,
+        {**system, "model": identity["model"]},
+    )
     return discovery

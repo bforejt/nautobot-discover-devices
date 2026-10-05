@@ -43,6 +43,25 @@ from .nautobot_ipam import (
     snapshot_ipam,
     validate_ipam_objects,
 )
+from .nautobot_panos_ha import (
+    save_panos_ha_objects,
+    snapshot_panos_ha,
+    stage_panos_ha,
+    validate_panos_ha_objects,
+)
+from .nautobot_panos_interfaces import (
+    panos_interface_objects,
+    save_panos_interfaces,
+    snapshot_panos_interfaces,
+    validate_panos_interfaces,
+)
+from .nautobot_panos_vpn import (
+    panos_vpn_objects,
+    save_panos_vpn_assignments,
+    save_panos_vpn_catalog,
+    snapshot_panos_vpn,
+    validate_panos_vpn_objects,
+)
 from .nautobot_stack import save_stack, snapshot_stack, stack_objects, validate_stack
 from .nautobot_vlans import (
     save_vlan_assignments,
@@ -67,6 +86,9 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None, i
             "device_id": str(interface.device_id) if interface.device_id else None,
             "lag_id": str(interface.lag_id) if interface.lag_id else None,
             "lag": interface.lag.name if interface.lag_id else None,
+            "parent_interface_id": str(getattr(interface, "parent_interface_id", None))
+            if getattr(interface, "parent_interface_id", None)
+            else None,
             "module_id": str(interface.module_id) if interface.module_id else None,
             "vrf_id": str(interface.vrf_id) if interface.vrf_id else None,
             "mode": interface.mode,
@@ -96,6 +118,8 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None, i
             if device.platform_id
             else None,
             "platform_id": str(device.platform_id) if device.platform_id else None,
+            "primary_ip4_id": str(device.primary_ip4_id) if device.primary_ip4_id else None,
+            "primary_ip6_id": str(device.primary_ip6_id) if device.primary_ip6_id else None,
             "software_version": device.software_version.version
             if device.software_version_id
             else None,
@@ -118,6 +142,13 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None, i
         "stack": snapshot_stack(device, lock=lock, discovery=discovery),
         "ipam_inventory": snapshot_ipam(device, ipam_policy, lock=lock, discovery=discovery),
         "capacity_inventory": snapshot_capacity(device, lock=lock, discovery=discovery),
+        "panos_interface_inventory": snapshot_panos_interfaces(
+            device, lock=lock, discovery=discovery
+        ),
+        "ha_inventory": snapshot_panos_ha(device, lock=lock, discovery=discovery),
+        "panos_vpn_inventory": snapshot_panos_vpn(
+            device, (discovery or {}).get("vpn_policy"), lock=lock, discovery=discovery
+        ),
     }
 
 
@@ -183,6 +214,16 @@ def _objects(
         if change["field"] != "software_version":
             setattr(device, change["field"], change["after"])
     stage_capacity(plan, device)
+    for change in plan.get("management", {}).get("primary_updates", []):
+        if (
+            change["field"] not in ("primary_ip4", "primary_ip6")
+            or getattr(device, change["field"] + "_id") is not None
+        ):
+            raise InventoryError("Populated primary IPs must be preserved")
+        from nautobot.ipam.models import IPAddress
+
+        setattr(device, change["field"], IPAddress.objects.get(pk=change["after"]))
+    ha_objects = stage_panos_ha(plan, device)
     memberships, ownerships = [], []
     component_plan = plan["components"]
     devices_by_serial = {}
@@ -214,7 +255,14 @@ def _objects(
     )
     ipam_plan = plan.get("ipam")
     ipam_work = bool(ipam_plan and ipam_plan.get("policy"))
-    if plan["lag_assignments"] or component_plan["interface_assignments"] or vlan_work or ipam_work:
+    objects = {}
+    if (
+        plan["lag_assignments"]
+        or component_plan["interface_assignments"]
+        or vlan_work
+        or ipam_work
+        or plan["adapter"] == "panos"
+    ):
         interfaces = (
             device.all_interfaces if hasattr(device, "all_interfaces") else device.interfaces
         )
@@ -254,7 +302,25 @@ def _objects(
         if console_plan["creates"] or console_plan["updates"]
         else []
     )
-    return version, creates, updates, memberships, components, ownerships, vlans, consoles, ipam
+    pan_interfaces = (
+        panos_interface_objects(plan["panos_interfaces"], objects, device)
+        if plan.get("panos_interfaces", {}).get("contract")
+        else []
+    )
+    vpn_objects = panos_vpn_objects(plan.get("vpn", {}), device, objects, ipam)
+    domains = {"ha": ha_objects, "interfaces": pan_interfaces, "vpn": vpn_objects}
+    return (
+        version,
+        creates,
+        updates,
+        memberships,
+        components,
+        ownerships,
+        vlans,
+        consoles,
+        ipam,
+        domains,
+    )
 
 
 def _validate_interface(interface):
@@ -262,8 +328,8 @@ def _validate_interface(interface):
     if interface.mode != "tagged" and interface.tagged_vlans.exists():
         raise InventoryError("Saving this interface would clear populated tagged VLAN membership")
     excluded = []
-    for field in ("module", "lag", "untagged_vlan"):
-        related = getattr(interface, field)
+    for field in ("module", "lag", "untagged_vlan", "parent_interface"):
+        related = getattr(interface, field, None)
         if related is not None and related._state.adding:
             excluded.append(field)
     interface.full_clean(exclude=excluded)
@@ -317,22 +383,31 @@ def validate_plan(
         status_resolver=_status,
     )
     validate_stack(stack)
-    version, creates, updates, memberships, components, ownerships, vlans, consoles, ipam = (
-        _objects(
-            plan,
-            device,
-            interface_status,
-            software_version_status,
-            module_status,
-            vlan_status,
-            ipam_prefix_status,
-            ipam_ip_address_status,
-            stack=stack,
-        )
+    (
+        version,
+        creates,
+        updates,
+        memberships,
+        components,
+        ownerships,
+        vlans,
+        consoles,
+        ipam,
+        domains,
+    ) = _objects(
+        plan,
+        device,
+        interface_status,
+        software_version_status,
+        module_status,
+        vlan_status,
+        ipam_prefix_status,
+        ipam_ip_address_status,
+        stack=stack,
     )
     if version is not None:
         version.full_clean()
-    if plan["device_updates"] or plan.get("capacity", {}).get("updates"):
+    if _device_work(plan, domains):
         if version is not None and not plan["software_version"]["create"]:
             device.software_version = version
         # A planned new software row has no DB record for foreign-key validation yet.
@@ -343,12 +418,15 @@ def validate_plan(
         )
         if device.virtual_chassis is not None and device.virtual_chassis._state.adding:
             excluded.append("virtual_chassis")
-        if plan.get("capacity", {}).get("preserve_custom_fields") or plan.get("capacity", {}).get(
-            "updates"
+        if (
+            plan["adapter"] == "panos"
+            or plan.get("capacity", {}).get("preserve_custom_fields")
+            or plan.get("capacity", {}).get("updates")
         ):
             clean_capacity_device(device, exclude=excluded)
         else:
             device.full_clean(exclude=excluded)
+    validate_panos_ha_objects(domains["ha"], validate_selected=False)
     if components is not None:
         validate_components(components)
     if vlans is not None:
@@ -372,6 +450,17 @@ def validate_plan(
             _validate_interface(interface)
     if ipam is not None:
         validate_ipam_objects(ipam, device)
+    validate_panos_interfaces(domains["interfaces"], device)
+    validate_panos_vpn_objects(domains["vpn"], device)
+
+
+def _device_work(plan, domains):
+    return bool(
+        plan["device_updates"]
+        or plan.get("capacity", {}).get("updates")
+        or plan.get("management", {}).get("primary_updates")
+        or domains["ha"]["selected_device_changed"]
+    )
 
 
 def apply_discovery(
@@ -389,8 +478,20 @@ def apply_discovery(
 ):
     """Re-read under lock and apply the complete valid change set in one transaction."""
     with transaction.atomic():
-        if ipam_policy is not None:
-            namespace_ids = sorted(ipam_namespace_ids(ipam_policy))
+        namespace_ids = set(ipam_namespace_ids(ipam_policy)) if ipam_policy is not None else set()
+        namespace_ids.update(
+            str(row[key]["id"])
+            for row in (discovery.get("vpn_policy") or {}).get("tunnels", [])
+            for key in (
+                "local_namespace",
+                "remote_namespace",
+                "local_protected_namespace",
+                "remote_protected_namespace",
+            )
+            if row.get(key)
+        )
+        if namespace_ids:
+            namespace_ids = sorted(namespace_ids)
             # Serialize shared Namespace catalogs before the per-Device locks.
             locked = list(
                 Namespace.objects.filter(pk__in=namespace_ids).order_by("pk").select_for_update()
@@ -405,7 +506,23 @@ def apply_discovery(
         Manufacturer.objects.select_for_update().get(pk=context["device_type__manufacturer_id"])
         if context["platform_id"]:
             Platform.objects.select_for_update().get(pk=context["platform_id"])
-        device = Device.objects.select_for_update().get(pk=device.pk)
+        pair_policy = (discovery.get("ha_pair") or {}).get("policy")
+        device_ids = {str(device.pk)}
+        if pair_policy:
+            from nautobot.dcim import models as dcim_models
+
+            group_model = getattr(dcim_models, "DeviceRedundancyGroup", None)
+            if group_model is not None:
+                group_model.objects.select_for_update().get(
+                    pk=pair_policy["redundancy_group"]["id"]
+                )
+            device_ids.add(pair_policy["peer_device"]["id"])
+        locked_devices = list(
+            Device.objects.filter(pk__in=device_ids).order_by("pk").select_for_update()
+        )
+        if len(locked_devices) != len(device_ids):
+            raise InventoryError("An explicitly selected Device no longer exists")
+        device = next(row for row in locked_devices if row.pk == device.pk)
         if (
             device.platform_id != context["platform_id"]
             or device.device_type.manufacturer_id != context["device_type__manufacturer_id"]
@@ -437,28 +554,40 @@ def apply_discovery(
             software_version_status=software_version_status,
             status_resolver=_status,
         )
-        version, creates, updates, memberships, components, ownerships, vlans, consoles, ipam = (
-            _objects(
-                plan,
-                device,
-                interface_status,
-                software_version_status,
-                module_status,
-                vlan_status,
-                ipam_prefix_status,
-                ipam_ip_address_status,
-                stack=stack,
-            )
+        (
+            version,
+            creates,
+            updates,
+            memberships,
+            components,
+            ownerships,
+            vlans,
+            consoles,
+            ipam,
+            domains,
+        ) = _objects(
+            plan,
+            device,
+            interface_status,
+            software_version_status,
+            module_status,
+            vlan_status,
+            ipam_prefix_status,
+            ipam_ip_address_status,
+            stack=stack,
         )
         save_stack(stack)
+        save_panos_ha_objects(domains["ha"])
         if version is not None:
             if version._state.adding:
                 version.validated_save()
             device.software_version = version
-        if plan["device_updates"] or plan.get("capacity", {}).get("updates"):
-            if plan.get("capacity", {}).get("preserve_custom_fields") or plan.get(
-                "capacity", {}
-            ).get("updates"):
+        if _device_work(plan, domains):
+            if (
+                plan["adapter"] == "panos"
+                or plan.get("capacity", {}).get("preserve_custom_fields")
+                or plan.get("capacity", {}).get("updates")
+            ):
                 save_capacity_device(device)
             else:
                 device.validated_save()
@@ -469,6 +598,7 @@ def apply_discovery(
             validate_vlan_objects(vlans, device)
         for interface in creates + updates:
             interface.validated_save()
+        save_panos_interfaces(domains["interfaces"], device)
         for interface, module in ownerships:
             _validate_ownership(interface, module, device)
             interface.module = module
@@ -482,5 +612,7 @@ def apply_discovery(
         if ipam is not None:
             save_ipam_catalog(ipam, device)
             save_ipam_assignments(ipam, device)
+        save_panos_vpn_catalog(domains["vpn"])
+        save_panos_vpn_assignments(domains["vpn"])
         save_console_ports(consoles)
         return plan

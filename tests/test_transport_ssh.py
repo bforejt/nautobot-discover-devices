@@ -14,9 +14,35 @@ class SshTransportTests(unittest.TestCase):
     def setUp(self):
         self.conn = Mock()
         self.conn.send_command.return_value = '<response status="success"><result/></response>'
+        self.conn.read_until_pattern.return_value = "example-user@lab(active)>\n"
         self.connect = Mock(return_value=self.conn)
+        connect = self.connect
+
+        class PaloDriverStub:
+            RETURN = "\n"
+
+            def __init__(self, **params):
+                connection = connect(**params)
+                for name in ("write_channel", "read_until_pattern", "send_command", "disconnect"):
+                    setattr(self, name, getattr(connection, name))
+                # Model Netmiko's native cleanup of a failed preparation while
+                # still exercising the production subclass's real method.
+                try:
+                    self.session_preparation()
+                except Exception:
+                    self.disconnect()
+                    raise
+
+            def session_preparation(self):
+                raise AssertionError("Default Netmiko preparation must not issue implicit reads")
+
         self.patch = patch.dict(
-            sys.modules, {"netmiko": SimpleNamespace(ConnectHandler=self.connect)}
+            sys.modules,
+            {
+                "netmiko": SimpleNamespace(),
+                "netmiko.paloalto": SimpleNamespace(),
+                "netmiko.paloalto.paloalto_panos": SimpleNamespace(PaloAltoPanosSSH=PaloDriverStub),
+            },
         )
         self.patch.start()
         self.addCleanup(self.patch.stop)
@@ -36,6 +62,59 @@ class SshTransportTests(unittest.TestCase):
         self.assertIs(self.connect.call_args.kwargs["system_host_keys"], True)
         self.conn.disconnect.assert_called_once()
 
+    def test_xml_session_setup_has_no_implicit_system_info_or_text_marker_dependency(self):
+        self.conn.read_until_pattern.return_value = "Login notice\nexample-user@lab(passive)>\n"
+        with self.client() as client:
+            self.assertEqual(client.conn.base_prompt, "example-user@lab(passive)")
+            self.assertIs(client.conn.ansi_escape_codes, True)
+            self.assertEqual([row["command"] for row in client.trace], list(ssh.SESSION_PREP))
+            client.run(ssh.SYSTEM_INFO)
+            self.assertEqual(
+                [row["command"] for row in client.trace], list(ssh.SESSION_PREP) + [ssh.SYSTEM_INFO]
+            )
+        self.conn.write_channel.assert_called_once_with("\n")
+        self.conn.read_until_pattern.assert_called_once_with(
+            pattern=ssh.PROMPT_PATTERN, read_timeout=60
+        )
+        self.assertEqual(
+            [call.args[0] for call in self.conn.send_command.call_args_list],
+            list(ssh.SESSION_PREP) + [ssh.SYSTEM_INFO],
+        )
+        for call in self.conn.send_command.call_args_list:
+            self.assertEqual(call.kwargs["expect_string"], ssh.PROMPT_PATTERN)
+            self.assertIs(call.kwargs["auto_find_prompt"], False)
+
+    def test_incomplete_xml_or_configuration_prompts_fail_closed_with_native_cleanup(self):
+        for output in (
+            "",
+            "example-user@lab(active)#",
+            "unexpected display >",
+            "example-user@lab",
+            '<response status="success"><result/></response>',
+        ):
+            with self.subTest(output=output):
+                self.conn.reset_mock()
+                self.conn.read_until_pattern.return_value = output
+                client = self.client()
+                with self.assertRaises(ssh.SshError) as raised:
+                    client.open()
+                if output:
+                    self.assertNotIn(output, str(raised.exception))
+                self.assertIsNone(client.conn)
+                self.assertFalse(client.trace)
+                self.conn.send_command.assert_not_called()
+                self.conn.disconnect.assert_called_once()
+
+    def test_prompt_timeout_is_sanitized_and_closes_partial_driver(self):
+        self.conn.read_until_pattern.side_effect = RuntimeError("example-password raw login data")
+        client = self.client()
+        with self.assertRaises(ssh.SshError) as raised:
+            client.open()
+        self.assertNotIn("example-password", str(raised.exception))
+        self.assertNotIn("raw login data", str(raised.exception))
+        self.assertIsNone(client.conn)
+        self.conn.disconnect.assert_called_once()
+
     def test_only_exact_vm_diagnostic_read_is_allowed_and_xml_session_is_prepared(self):
         self.assertEqual(ssh.VM_INTERFACES, "debug show vm-series interfaces all")
         self.assertEqual(
@@ -44,6 +123,7 @@ class SshTransportTests(unittest.TestCase):
                 (
                     ssh.SYSTEM_INFO,
                     ssh.INTERFACES,
+                    ssh.MANAGEMENT_INTERFACE,
                     ssh.RUNNING_INTERFACES,
                     ssh.VM_INTERFACES,
                     ssh.RUNNING_VSYS,

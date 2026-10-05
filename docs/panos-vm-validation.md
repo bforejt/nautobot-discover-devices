@@ -360,8 +360,94 @@ comparison results and negative plan errors are retained in ignored
 The separate `installed-source.json` records Job version, executable file hashes
 and an empty mismatch list for the deployed source comparison.
 
-The validated live scope is PA-VM 11.2.8 on KVM, three recognized VirtIO guest
-adapters, two explicit configured virtual interfaces, and a third unconfigured
-adapter retained without guessed administration. Native serial remains blank.
-Physical appliance capability, other VM deployments/releases, Panorama/HA
-behavior, general automatic administrative state and IPAM remain unvalidated.
+These inventory runs validated PA-VM 11.2.8 on KVM, three recognized VirtIO
+guest adapters, two explicit configured virtual interfaces, and a third then
+unconfigured adapter retained without guessed administration. Native serial
+remained blank. The later lab setup below changes the adapter roles and provides
+HA/IPsec runtime evidence. Physical appliance capability, other VM deployments
+or releases, Panorama-effective configuration, general automatic administrative
+state and IPAM remain unvalidated.
+
+## HA and IPsec lab evidence, 2026-10-05
+
+The original VM `101` and full clone `102` formed active/passive HA group `42`;
+clone `103` became an independent site-to-site VPN peer. All three are PA-VM
+11.2.8 on KVM with four vCPUs, 8 GiB RAM, a 60 GiB disk and four VirtIO adapters.
+They reported serial `unknown` and `vm-license=none`. Successful HA on these
+specific instances is an observed lab result, without establishing licensing
+entitlement or behavior on other deployments. The original account/API key
+continued to work on all three. Management `net0` stayed on `vmbr0`, with captured
+addresses `10.40.3.232`, `10.40.3.216` and `10.40.3.28` respectively.
+
+| Role | Guest interface and isolated bridge | Applied addresses |
+| --- | --- | --- |
+| HA1 control, VM 101/102 only | `ethernet1/2`, `vmbr201` | VM 101 `198.18.100.1/30`; VM 102 `198.18.100.2/30` |
+| HA2 state synchronization, VM 101/102 only | `ethernet1/3`, `vmbr202` | Ethernet transport; no HA2 IP |
+| VPN transit | `ethernet1/1`, `vmbr101` | Shared HA-pair address `198.18.101.1/29`; VM 103 `198.18.101.3/29` |
+| Protected endpoints | `loopback.1` | HA pair `10.255.101.1/32`; VM 103 `10.255.103.1/32` |
+| Route-based VPN | `tunnel.1` | HA pair `198.18.102.1/30`; VM 103 `198.18.102.2/30` |
+
+The tunnel used IKEv2 with AES-256-CBC, SHA256 and DH group14; ESP used AES256,
+SHA256 and PFS group14. Configuration, routes, explicit selectors and security
+rules were committed as controlled setup. This follows the vendor's
+[HA link roles](https://docs.paloaltonetworks.com/ngfw/administration/high-availability/ha-links-and-backup-links)
+and [site-to-site VPN workflow](https://docs.paloaltonetworks.com/network-security/ipsec-vpn/administration/set-up-site-to-site-vpn).
+Controlled setup used the HTTPS XML API for scoped edits and commit-job
+completion checks. Inventory collection and independent operational captures
+used SSH/XML. This setup adds no commands to the discovery collector.
+
+Independent SSH/XML captures initially showed VM 101 active, VM 102 passive,
+HA1/HA2 up, synchronized running configuration and complete state
+synchronization. Protected loopback pings passed `5/5` in both directions. A
+separate five-packet reverse sample increased observed ESP encapsulation and
+decapsulation counters by five each. During controlled suspension of VM 101,
+VM 102 became active with matching saved IPsec SPIs; a protected `30/30` ping
+sample across the transition reported zero loss. A subsequent VM 102-originated
+protected sample passed `5/5` with matching ESP counter increases. Suspending
+VM 102 returned VM 101 to active; making VM 102 functional restored it to
+passive. Both final peers were healthy, with HA1/HA2 up, running configuration
+synchronized and state synchronization complete. A second protected `30/30`
+sample from VM 103 across this return transition reported zero loss, with IPsec
+SPIs unchanged. Neither transition used manual IKE initiation or SA clearing.
+Ping output was text despite the XML toggle; its literal statistics remain
+setup evidence. These bounded samples do not establish external-client
+forwarding or production failover guarantees.
+
+Local, ignored [HA/IPsec artifacts](../artifacts/panos-ha-vpn/) retain topology,
+scoped configuration and runtime captures, the
+[initial traffic proof](../artifacts/panos-ha-vpn/ssh-ha/initial-proof.json), and
+[failover proof](../artifacts/panos-ha-vpn/failover-validation.json). Credentials
+and configuration secrets remain private and must not be committed.
+
+After the two transition tests, the HA members' IKE listings were empty while
+the synchronized IPsec associations remained active. Palo Alto's
+[HA synchronization reference](https://docs.paloaltonetworks.com/ngfw/administration/high-availability/reference-ha-synchronization)
+distinguishes IKE SAs, which do not synchronize, from IPsec SAs and anti-replay
+sequence numbers, which synchronize over HA2. These are separate observations;
+an empty IKE listing must not be treated as proof that the encrypted datapath is
+down. A separate post-test initiation on active VM 101 established fresh IKEv2
+and IPsec associations with VM 103, with new IPsec SPIs replicated to passive
+VM 102. Protected pings then passed `5/5` in each direction, increasing each
+peer's encapsulated and decapsulated packet counters by five. The
+[fresh negotiation capture](../artifacts/panos-ha-vpn/post-failover-fresh-negotiation.json)
+and [final setup proof](../artifacts/panos-ha-vpn/summary.json) retain this later
+step separately from the unchanged-SPIs failover evidence. Scheduled lifetime
+rekey was not tested.
+
+With the HA/VPN setup applied, the installed Job `0.19.0-dev` previewed selected
+`panos-lab` using normal Secrets lookup, strict SSH and its independently reviewed expected VM
+UUID. All executable hashes matched the workspace. The preview issued zero
+inventory DML, preserved the native snapshot and serial, and proposed one
+virtual Interface create for configured `ethernet1/3` using its exact existing
+DeviceType template. Three conflicts preserved the Device alias and existing
+`ethernet1/2` enabled/description values. `loopback`, `loopback.1`, `tunnel` and
+`tunnel.1` remained excluded observations. No apply ran; the
+[preview report](../artifacts/panos-ha-vpn/job-preview/report.json) and
+[validation proof](../artifacts/panos-ha-vpn/job-preview/validation.json) retain
+all exact rows.
+
+The current collector still reads only identity and interface evidence. It does
+not discover HA configuration/state, IKE/IPsec configuration, peers or security
+associations, and performs no native VPN writes. Capability-aware native VPN
+mapping on Nautobot 3.x, with report-only behavior where Nautobot 2.4 lacks the
+required models, remains future work; that design is not implemented or tested.

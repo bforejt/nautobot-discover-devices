@@ -146,6 +146,83 @@ class CredentialTests(unittest.TestCase):
         with self.assertRaises(credentials.CredentialsError):
             credentials.resolve_credentials(SimpleNamespace(secrets_group=group))
 
+    def test_esxi_http_pair_precedes_rest_and_generic_without_restconf_or_ssh(self):
+        choices = sys.modules["nautobot.extras.choices"].SecretsGroupAccessTypeChoices
+        choices.TYPE_REST = "REST"
+        choices.TYPE_RESTCONF = "RESTCONF"
+        choices.TYPE_SSH = "SSH"
+        group = SimpleNamespace(get_secret_value=Mock(return_value="example-value"))
+        credentials.resolve_credentials(SimpleNamespace(secrets_group=group), transport="esxi")
+        self.assertEqual(
+            [call.kwargs["access_type"] for call in group.get_secret_value.call_args_list],
+            ["HTTP", "HTTP"],
+        )
+
+    def test_esxi_partial_http_pair_falls_back_to_complete_rest_pair(self):
+        choices = sys.modules["nautobot.extras.choices"].SecretsGroupAccessTypeChoices
+        choices.TYPE_REST = "REST"
+        device = SimpleNamespace(secrets_group=None)
+
+        def lookup(access_type, secret_type, obj):
+            self.assertIs(obj, device)
+            if access_type == "HTTP":
+                if secret_type == "Password":
+                    raise MissingAssociation
+                return "wrong-http-user"
+            self.assertEqual(access_type, "REST")
+            return {"Username": "rest-user", "Password": "rest-password"}[secret_type]
+
+        override = SimpleNamespace(get_secret_value=Mock(side_effect=lookup))
+        self.assertEqual(
+            credentials.resolve_credentials(device, override, transport="esxi"),
+            ("rest-user", "rest-password"),
+        )
+
+    def test_esxi_never_combines_credentials_from_different_access_types(self):
+        def lookup(access_type, secret_type, obj):
+            if (access_type, secret_type) == ("HTTP", "Username"):
+                return "http-user"
+            if (access_type, secret_type) == ("Generic", "Password"):
+                return "generic-password"
+            raise MissingAssociation
+
+        group = SimpleNamespace(get_secret_value=Mock(side_effect=lookup))
+        with self.assertRaisesRegex(credentials.CredentialsError, "usable username/password pair"):
+            credentials.resolve_credentials(SimpleNamespace(secrets_group=group), transport="esxi")
+
+    def test_esxi_empty_pair_can_fall_back_to_generic_pair(self):
+        def lookup(access_type, secret_type, obj):
+            if access_type == "HTTP":
+                return " " if secret_type == "Username" else "http-password"
+            return {"Username": "generic-user", "Password": "generic-password"}[secret_type]
+
+        group = SimpleNamespace(get_secret_value=Mock(side_effect=lookup))
+        self.assertEqual(
+            credentials.resolve_credentials(SimpleNamespace(secrets_group=group), transport="esxi"),
+            ("generic-user", "generic-password"),
+        )
+
+    def test_esxi_provider_error_is_sanitized_without_fallback(self):
+        group = SimpleNamespace(get_secret_value=Mock(side_effect=RuntimeError("secret sentinel")))
+        with self.assertRaises(credentials.CredentialsError) as raised:
+            credentials.resolve_credentials(SimpleNamespace(secrets_group=group), transport="esxi")
+        self.assertNotIn("sentinel", str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
+        self.assertEqual(group.get_secret_value.call_count, 1)
+
+    def test_esxi_worker_cancellation_is_not_swallowed(self):
+        class SoftTimeLimitExceeded(Exception):
+            pass
+
+        exceptions = ModuleType("billiard.exceptions")
+        exceptions.SoftTimeLimitExceeded = SoftTimeLimitExceeded
+        group = SimpleNamespace(get_secret_value=Mock(side_effect=SoftTimeLimitExceeded("cancel")))
+        with patch.dict(sys.modules, {"billiard.exceptions": exceptions}):
+            with self.assertRaises(SoftTimeLimitExceeded):
+                credentials.resolve_credentials(
+                    SimpleNamespace(secrets_group=group), transport="esxi"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

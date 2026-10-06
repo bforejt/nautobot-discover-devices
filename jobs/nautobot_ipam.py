@@ -18,6 +18,7 @@ from nautobot.ipam.models import (
     VRFPrefixAssignment,
 )
 
+from .adapters import esxi
 from .adapters.cisco_iosxe import canonical_interface_name
 from .exceptions import InventoryError
 from .nautobot_route_targets import (
@@ -36,6 +37,8 @@ def _canonical(plan, name):
     return (
         canonical_panos_ipam_name(name)
         if plan.get("adapter") == "panos"
+        else esxi.canonical_interface_name(name)
+        if plan.get("adapter") == "esxi"
         else canonical_interface_name(name)
     )
 

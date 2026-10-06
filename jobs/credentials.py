@@ -21,16 +21,18 @@ def resolve_credentials(device, override_group=None, *, transport="restconf"):
     except ImportError:
         cancellation_errors = ()
 
-    if transport not in ("restconf", "ssh"):
+    if transport not in ("restconf", "ssh", "esxi"):
         raise CredentialsError("Unsupported discovery credential transport")
-    names = (
-        ("TYPE_SSH", "TYPE_GENERIC")
-        if transport == "ssh"
-        else ("TYPE_RESTCONF", "TYPE_HTTP", "TYPE_REST", "TYPE_GENERIC")
-    )
-    access_description = (
-        "SSH or Generic" if transport == "ssh" else "RESTCONF, HTTP, REST or Generic"
-    )
+    names = {
+        "ssh": ("TYPE_SSH", "TYPE_GENERIC"),
+        "esxi": ("TYPE_HTTP", "TYPE_REST", "TYPE_GENERIC"),
+        "restconf": ("TYPE_RESTCONF", "TYPE_HTTP", "TYPE_REST", "TYPE_GENERIC"),
+    }[transport]
+    access_description = {
+        "ssh": "SSH or Generic",
+        "esxi": "HTTP, REST or Generic",
+        "restconf": "RESTCONF, HTTP, REST or Generic",
+    }[transport]
     group = override_group if override_group is not None else device.secrets_group
     if group is None:
         raise CredentialsError(
@@ -58,6 +60,41 @@ def resolve_credentials(device, override_group=None, *, transport="restconf"):
                     "check the provider configuration" % (access_type, secret_type)
                 ) from None
         return None
+
+    if transport == "esxi":
+        # A partial HTTP association must never combine with a REST/Generic
+        # password. Resolve a complete pair at each eligible access type.
+        for access_type in access_types:
+            try:
+                username = group.get_secret_value(
+                    access_type=access_type,
+                    secret_type=SecretsGroupSecretTypeChoices.TYPE_USERNAME,
+                    obj=device,
+                )
+                password = group.get_secret_value(
+                    access_type=access_type,
+                    secret_type=SecretsGroupSecretTypeChoices.TYPE_PASSWORD,
+                    obj=device,
+                )
+            except SecretsGroupAssociation.DoesNotExist:
+                continue
+            except cancellation_errors:
+                raise
+            except Exception:
+                raise CredentialsError(
+                    "Secrets Group provider failed resolving %s credentials; "
+                    "check the provider configuration" % access_type
+                ) from None
+            if (
+                isinstance(username, str)
+                and username.strip()
+                and isinstance(password, str)
+                and password
+            ):
+                return username, password
+        raise CredentialsError(
+            "Secrets Group has no usable username/password pair for %s access" % access_description
+        )
 
     username = lookup(SecretsGroupSecretTypeChoices.TYPE_USERNAME)
     password = lookup(SecretsGroupSecretTypeChoices.TYPE_PASSWORD)

@@ -825,6 +825,12 @@ The [PAN-OS IPAM contract](docs/panos-ipam-discovery.md) records the explicit
 routing-domain policy, static IPv4/IPv6 source requirements and native capability
 checks in `0.21.0-dev`.
 
+Standalone [ESXi discovery](docs/esxi-discovery.md) in `0.24.0-dev` uses the direct
+host HTTPS API for independent NFV hosts. It verifies hardware identity, discovers
+eligible host NICs and software, and links explicitly mapped existing guest Devices
+through the existing **Hosted On** relationship. NFV networking, capacity and storage
+remain source-backed report observations.
+
 Run offline regressions without a Nautobot installation or lab credentials:
 
 ```bash

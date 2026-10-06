@@ -15,7 +15,7 @@ def load_discovery_job():
     """Import the job with temporary Nautobot stubs that cannot leak into other tests."""
     job_api = ModuleType("nautobot.apps.jobs")
     job_api.Job = type("Job", (), {})
-    for name in ("BooleanVar", "DryRunVar", "IntegerVar", "ObjectVar", "TextVar"):
+    for name in ("BooleanVar", "ChoiceVar", "DryRunVar", "IntegerVar", "ObjectVar", "TextVar"):
         setattr(job_api, name, lambda **kwargs: SimpleNamespace(**kwargs))
     dcim = ModuleType("nautobot.dcim.models")
     dcim.Device = type("Device", (), {"objects": SimpleNamespace(get=Mock())})
@@ -74,6 +74,7 @@ def discovery():
 
 
 CHANGE_COUNTERS = {
+    "hosted_on_created": (r"hosted on guests?", r"link"),
     "stack_member_software_assigned": (r"stack member software versions?", r"assign"),
     "interfaces_created": (r"interfaces?", r"creat|new|add"),
     "interfaces_updated": (r"interfaces?", r"updat|enrich"),
@@ -739,6 +740,315 @@ class DiscoveryJobTests(unittest.TestCase):
         self.assertEqual(report["error"], "Read failed")
         self.assertEqual(report["requests"], self.client.trace)
         self.client.close.assert_called_once()
+
+
+class EsxiDiscoveryJobTests(unittest.TestCase):
+    HOST_UUID = "f56486b2-7c19-4fd6-9a3f-606c5a9018b7"
+
+    def setUp(self):
+        self.module = load_discovery_job()
+        self.device = SimpleNamespace(
+            pk="esxi-device",
+            name="example-esxi",
+            primary_ip=SimpleNamespace(host="192.0.2.104"),
+            platform=SimpleNamespace(network_driver="esxi", name="VMware ESXi"),
+            device_type=SimpleNamespace(manufacturer=SimpleNamespace(name="QEMU")),
+        )
+        self.module.Device.objects.get.return_value = self.device
+        self.job = self.module.DiscoverDevice()
+        self.job.logger = Mock()
+        self.job.request = SimpleNamespace(meta={"existing": "preserve"})
+        self.job.create_file = Mock()
+        self.observed = {
+            "adapter": "esxi",
+            "schema_version": 1,
+            "identity": {"hostname": self.device.name},
+            "interfaces": [],
+            "observations": {"guests": [{"name": "private-guest-sentinel"}]},
+        }
+        self.client = Mock(trace=[{"method": "RetrievePropertiesEx"}])
+        self.preview_plan = plan()
+        for name, value in {
+            "resolve_credentials": Mock(return_value=("test-user", "test-password")),
+            "EsxiClient": Mock(return_value=self.client),
+            "normalize_esxi_guest_policy": Mock(return_value=None),
+            "RestconfClient": Mock(),
+            "PanosSshClient": Mock(),
+            "build_plan": Mock(return_value=self.preview_plan),
+        }.items():
+            patcher = patch.object(self.module, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(self.module.esxi, "collect", Mock(return_value=self.observed))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.module.snapshot_inventory.return_value = {"device": {"id": self.device.pk}}
+        self.module.apply_discovery.return_value = plan()
+
+    def test_dispatch_uses_explicit_esxi_platform_without_hardware_vendor_requirement(self):
+        for driver in ("esxi", "vmware_esxi"):
+            for manufacturer in ("QEMU", "Dell", "HPE", "Lenovo"):
+                with self.subTest(driver=driver, manufacturer=manufacturer):
+                    self.device.platform.network_driver = driver
+                    self.device.device_type.manufacturer.name = manufacturer
+                    self.assertIs(self.module._adapter(self.device), self.module.esxi)
+        self.device.platform.network_driver = ""
+        for name in ("VMware ESXi", "ESXi"):
+            self.device.platform.name = name
+            self.assertIs(self.module._adapter(self.device), self.module.esxi)
+        self.device.platform.name = "VMware vCenter"
+        with self.assertRaisesRegex(ValueError, "supported"):
+            self.module._adapter(self.device)
+        self.module.resolve_credentials.assert_not_called()
+
+    def test_preview_uses_esxi_https_and_reports_nfv_evidence_without_inventory_writes(self):
+        self.job.run(self.device)
+        self.module.resolve_credentials.assert_called_once_with(
+            self.device, override_group=None, transport="esxi"
+        )
+        self.module.EsxiClient.assert_called_once_with(
+            "192.0.2.104", "test-user", "test-password", port=443, verify=True
+        )
+        self.module.esxi.collect.assert_called_once_with(
+            self.client,
+            use_ntc_defaults=False,
+            expected_host_uuid=None,
+            interface_enabled_policy=None,
+        )
+        self.module.RestconfClient.assert_not_called()
+        self.module.PanosSshClient.assert_not_called()
+        self.module.apply_discovery.assert_not_called()
+        self.client.close.assert_called_once()
+        report = self.job.request.meta["discovery_report"]
+        self.assertEqual(report["transport"], "esxi-soap")
+        self.assertEqual(report["esxi_port"], 443)
+        self.assertEqual(report["esxi_new_interface_state"], "report-only")
+        self.assertEqual(report["requests"], self.client.trace)
+        self.assertIsNone(report["ipam_policy"])
+        self.assertNotIn("restconf_port", report)
+        self.assertEqual(self.job.request.meta["existing"], "preserve")
+        messages = "\n".join(rendered_logs(self.job.logger))
+        for value in ("private-guest-sentinel", "test-user", "test-password"):
+            self.assertNotIn(value, messages)
+        self.assertEqual(json.loads(self.job.create_file.call_args.args[1]), report)
+
+    def test_esxi_collection_summary_keeps_raw_guest_and_storage_names_in_report(self):
+        self.observed["observations"]["datastores"] = [{"name": "private-datastore-sentinel"}]
+        self.job.run(self.device)
+        messages = "\n".join(rendered_logs(self.job.logger))
+        self.assertIn("1 VM observations and 1 datastore observations", messages)
+        self.assertIn("under Advanced", messages)
+        self.assertNotIn("private-guest-sentinel", messages)
+        self.assertNotIn("private-datastore-sentinel", messages)
+        self.assertEqual(
+            self.job.request.meta["discovery_report"]["discovery"]["observations"],
+            self.observed["observations"],
+        )
+
+    def test_explicit_interface_intent_and_uuid_reach_esxi_collector(self):
+        for state, enabled in (("enabled", True), ("disabled", False)):
+            with self.subTest(state=state):
+                self.module.esxi.collect.reset_mock()
+                self.job.run(
+                    self.device,
+                    esxi_port=8443,
+                    verify_tls=False,
+                    expected_esxi_host_uuid=self.HOST_UUID.upper(),
+                    esxi_new_interface_state=state,
+                )
+                self.module.esxi.collect.assert_called_once_with(
+                    self.client,
+                    use_ntc_defaults=False,
+                    expected_host_uuid=self.HOST_UUID,
+                    interface_enabled_policy={
+                        "contract": "esxi-interface-policy-v1",
+                        "new_enabled": enabled,
+                    },
+                )
+                self.assertEqual(
+                    self.job.request.meta["discovery_report"]["expected_esxi_host_uuid"],
+                    self.HOST_UUID,
+                )
+        self.assertEqual(self.module.EsxiClient.call_args.kwargs, {"port": 8443, "verify": False})
+
+    def test_esxi_ntc_option_does_not_enable_guesses(self):
+        self.job.run(self.device, use_ntc_defaults=True)
+        self.assertIs(self.module.esxi.collect.call_args.kwargs["use_ntc_defaults"], False)
+        self.assertIn("applies only to Cisco IOS XE", "\n".join(rendered_logs(self.job.logger)))
+        self.assertNotIn("guessing is enabled", "\n".join(rendered_logs(self.job.logger)))
+
+    def test_esxi_rejects_unsupported_native_domain_controls_before_credentials(self):
+        for options in (
+            {"vlan_group": SimpleNamespace(pk="vlan-group", name="Group")},
+            {"vlan_status": SimpleNamespace(pk="vlan-status")},
+            {"module_status": SimpleNamespace(pk="module-status")},
+            {"ipam_namespace": SimpleNamespace(pk="namespace")},
+            {"ipam_override_namespace": SimpleNamespace(pk="namespace")},
+            {"ipam_override_networks": "192.0.2.0/24"},
+            {"ipam_group_user_vrfs": True},
+            {"ipam_override_rfc1918": False},
+            {"ipam_create_missing_prefixes": False},
+            {"ipam_local_vrf_names": "Custom"},
+            {"ipam_location": SimpleNamespace(pk="location")},
+            {"ipam_prefix_status": SimpleNamespace(pk="prefix-status")},
+            {"ipam_ip_address_status": SimpleNamespace(pk="ip-status")},
+            {"panos_routing_domains": "[]"},
+            {"panos_management_policy": "{}"},
+            {"panos_ha_peer": "{}"},
+            {"panos_vpn_mappings": "{}"},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.job.run(self.device, **options)
+        self.module.resolve_credentials.assert_not_called()
+        self.module.EsxiClient.assert_not_called()
+
+    def test_esxi_invalid_binding_policy_and_port_fail_before_connection(self):
+        for options in (
+            {"expected_esxi_host_uuid": "not-a-uuid"},
+            {"expected_esxi_host_uuid": "00000000-0000-0000-0000-000000000000"},
+            {"expected_esxi_host_uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff"},
+            {"expected_esxi_host_uuid": 104},
+            {"expected_esxi_host_uuid": self.HOST_UUID.replace("-", "")},
+            {"expected_esxi_host_uuid": "{" + self.HOST_UUID + "}"},
+            {"esxi_new_interface_state": True},
+            {"esxi_new_interface_state": "up"},
+            {"esxi_port": True},
+            {"esxi_port": 0},
+            {"esxi_port": 65536},
+            {"verify_tls": "false"},
+            {"expected_vm_uuid": self.HOST_UUID},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.job.run(self.device, **options)
+        self.module.resolve_credentials.assert_not_called()
+        self.module.EsxiClient.assert_not_called()
+
+    def test_esxi_options_cannot_change_cisco_or_panos_collection(self):
+        for driver, manufacturer in (("cisco_iosxe", "Cisco"), ("panos", "Palo Alto Networks")):
+            self.device.platform.network_driver = driver
+            self.device.device_type.manufacturer.name = manufacturer
+            for options in (
+                {"expected_esxi_host_uuid": self.HOST_UUID},
+                {"esxi_new_interface_state": "enabled"},
+                {"esxi_guest_mappings": "[]"},
+            ):
+                with self.subTest(driver=driver, options=options), self.assertRaises(ValueError):
+                    self.job.run(self.device, **options)
+        self.module.resolve_credentials.assert_not_called()
+
+    def test_esxi_guest_mappings_are_resolved_before_credentials_and_attached_for_planning(self):
+        mappings = '[{"vm_uuid":"%s","device":"existing-guest"}]' % self.HOST_UUID
+        policy = {
+            "contract": "esxi-guest-policy-v1",
+            "host_device_id": str(self.device.pk),
+            "relationship": {"key": "hosted_on"},
+            "mappings": [{"vm_uuid": self.HOST_UUID, "device": {"id": "existing-guest"}}],
+        }
+        self.module.normalize_esxi_guest_policy.return_value = policy
+        self.job.run(self.device, esxi_guest_mappings=mappings)
+        self.module.normalize_esxi_guest_policy.assert_called_once_with(
+            mappings,
+            self.module._resolve_esxi_guest_target,
+            selected_device_id=str(self.device.pk),
+        )
+        self.assertEqual(self.observed["guest_policy"], policy)
+        self.assertEqual(self.module.build_plan.call_args.args[0]["guest_policy"], policy)
+        self.assertEqual(self.job.request.meta["discovery_report"]["esxi_guest_policy"], policy)
+        self.assertNotIn("existing-guest", "\n".join(rendered_logs(self.job.logger)))
+
+    def test_esxi_invalid_guest_mapping_does_not_open_connection(self):
+        self.module.normalize_esxi_guest_policy.side_effect = ValueError("Invalid guest mapping")
+        with self.assertRaisesRegex(ValueError, "Invalid guest mapping"):
+            self.job.run(self.device, esxi_guest_mappings="{}")
+        self.module.resolve_credentials.assert_not_called()
+        self.module.EsxiClient.assert_not_called()
+
+    def test_esxi_cleanup_failure_keeps_completed_request_trace(self):
+        self.client.close.side_effect = self.module.EsxiError("ESXi logout failed")
+        with self.assertRaisesRegex(RuntimeError, "ESXi logout failed"):
+            self.job.run(self.device)
+        self.assertEqual(self.job.request.meta["discovery_report"]["requests"], self.client.trace)
+        self.module.apply_discovery.assert_not_called()
+
+    def test_esxi_credentials_failure_is_saved_without_opening_a_client(self):
+        self.module.resolve_credentials.side_effect = self.module.CredentialsError(
+            "ESXi credentials unavailable"
+        )
+        with self.assertRaisesRegex(RuntimeError, "ESXi credentials unavailable"):
+            self.job.run(self.device)
+        report = self.job.request.meta["discovery_report"]
+        self.assertEqual(report["error"], "ESXi credentials unavailable")
+        self.assertNotIn("requests", report)
+        self.module.EsxiClient.assert_not_called()
+
+    def test_esxi_guest_resolver_reads_exact_existing_targets_only(self):
+        relationship = SimpleNamespace(
+            pk="relationship-id",
+            key="hosted_on",
+            type="one-to-many",
+            source_type=SimpleNamespace(app_label="dcim", model="device"),
+            destination_type=SimpleNamespace(app_label="dcim", model="device"),
+        )
+        extras = ModuleType("nautobot.extras.models")
+        extras.Relationship = SimpleNamespace(
+            objects=SimpleNamespace(get=Mock(return_value=relationship)),
+            DoesNotExist=type("MissingRelationship", (Exception,), {}),
+            MultipleObjectsReturned=type("AmbiguousRelationship", (Exception,), {}),
+        )
+        with patch.dict(sys.modules, {"nautobot.extras.models": extras}):
+            result = self.module._resolve_esxi_guest_target("relationship", "hosted_on")
+        extras.Relationship.objects.get.assert_called_once_with(key="hosted_on")
+        self.assertEqual(
+            result,
+            {
+                "id": "relationship-id",
+                "key": "hosted_on",
+                "type": "one-to-many",
+                "source_type": "dcim.device",
+                "destination_type": "dcim.device",
+            },
+        )
+        self.module.Device.objects.get.reset_mock()
+        result = self.module._resolve_esxi_guest_target("device", "explicit-device-id")
+        self.module.Device.objects.get.assert_called_once_with(pk="explicit-device-id")
+        self.assertEqual(result, {"id": self.device.pk, "name": self.device.name})
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            self.module._resolve_esxi_guest_target("relationship", "another_relationship")
+
+    def test_esxi_transport_and_source_failures_use_worker_safe_runtime_errors(self):
+        for failure in (
+            self.module.EsxiError("ESXi read failed"),
+            self.module.esxi.DiscoveryError("ESXi source invalid"),
+        ):
+            with self.subTest(failure=failure):
+                self.client.close.reset_mock()
+                self.module.esxi.collect.side_effect = failure
+                with self.assertRaises(RuntimeError) as raised:
+                    self.job.run(self.device)
+                self.assertIs(type(raised.exception), RuntimeError)
+                self.assertTrue(raised.exception.__suppress_context__)
+                self.client.close.assert_called_once()
+                report = self.job.request.meta["discovery_report"]
+                self.assertEqual(report["error"], str(failure))
+                self.assertEqual(report["requests"], self.client.trace)
+                self.assertFalse(report["applied"])
+        self.module.apply_discovery.assert_not_called()
+
+    def test_esxi_apply_uses_final_native_plan(self):
+        self.job.run(self.device, dryrun=False)
+        self.module.apply_discovery.assert_called_once_with(
+            self.observed,
+            self.device,
+            interface_status=None,
+            software_version_status=None,
+            module_status=None,
+            vlan_group=None,
+            vlan_status=None,
+            ipam_policy=None,
+            ipam_prefix_status=None,
+            ipam_ip_address_status=None,
+        )
+        self.assertTrue(self.job.request.meta["discovery_report"]["applied"])
 
 
 if __name__ == "__main__":

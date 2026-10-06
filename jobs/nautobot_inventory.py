@@ -13,7 +13,7 @@ from nautobot.dcim.models import (
 from nautobot.extras.models import Status
 from nautobot.ipam.models import Namespace
 
-from .adapters import cisco_iosxe, panos
+from .adapters import cisco_iosxe, esxi, panos
 from .exceptions import InventoryError
 from .nautobot_capacity import (
     clean_capacity_device,
@@ -32,6 +32,13 @@ from .nautobot_console import (
     save_console_ports,
     snapshot_console_ports,
     validate_console_ports,
+)
+from .nautobot_esxi_guests import (
+    lock_esxi_guests,
+    save_esxi_guests,
+    snapshot_esxi_guests,
+    stage_esxi_guests,
+    validate_esxi_guests,
 )
 from .nautobot_ipam import (
     _namespace_ids as ipam_namespace_ids,
@@ -142,6 +149,7 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None, i
         "stack": snapshot_stack(device, lock=lock, discovery=discovery),
         "ipam_inventory": snapshot_ipam(device, ipam_policy, lock=lock, discovery=discovery),
         "capacity_inventory": snapshot_capacity(device, lock=lock, discovery=discovery),
+        "esxi_guest_inventory": snapshot_esxi_guests(device, lock=lock, discovery=discovery),
         "panos_interface_inventory": snapshot_panos_interfaces(
             device, lock=lock, discovery=discovery
         ),
@@ -266,11 +274,11 @@ def _objects(
         interfaces = (
             device.all_interfaces if hasattr(device, "all_interfaces") else device.interfaces
         )
-        canonical_interface_name = (
-            panos.canonical_interface_name
-            if plan["adapter"] == "panos"
-            else cisco_iosxe.canonical_interface_name
-        )
+        canonical_interface_name = {
+            "panos": panos,
+            "esxi": esxi,
+            "cisco_iosxe": cisco_iosxe,
+        }[plan["adapter"]].canonical_interface_name
         objects = {canonical_interface_name(row.name): row for row in interfaces}
         objects.update({canonical_interface_name(row.name): row for row in creates + updates})
         for assignment in plan["lag_assignments"]:
@@ -308,7 +316,12 @@ def _objects(
         else []
     )
     vpn_objects = panos_vpn_objects(plan.get("vpn", {}), device, objects, ipam)
-    domains = {"ha": ha_objects, "interfaces": pan_interfaces, "vpn": vpn_objects}
+    domains = {
+        "ha": ha_objects,
+        "interfaces": pan_interfaces,
+        "vpn": vpn_objects,
+        "esxi_guests": stage_esxi_guests(plan, device),
+    }
     return (
         version,
         creates,
@@ -323,7 +336,7 @@ def _objects(
     )
 
 
-def _validate_interface(interface):
+def _validate_interface(interface, *, preserve_custom_fields=False):
     """UUID parents may exist only as cached objects during a preview."""
     if interface.mode != "tagged" and interface.tagged_vlans.exists():
         raise InventoryError("Saving this interface would clear populated tagged VLAN membership")
@@ -332,7 +345,10 @@ def _validate_interface(interface):
         related = getattr(interface, field, None)
         if related is not None and related._state.adding:
             excluded.append(field)
-    interface.full_clean(exclude=excluded)
+    if preserve_custom_fields:
+        clean_capacity_device(interface, exclude=excluded)
+    else:
+        interface.full_clean(exclude=excluded)
 
 
 def _validate_membership(member, lag, device):
@@ -419,7 +435,7 @@ def validate_plan(
         if device.virtual_chassis is not None and device.virtual_chassis._state.adding:
             excluded.append("virtual_chassis")
         if (
-            plan["adapter"] == "panos"
+            plan["adapter"] in ("panos", "esxi")
             or plan.get("capacity", {}).get("preserve_custom_fields")
             or plan.get("capacity", {}).get("updates")
         ):
@@ -433,7 +449,10 @@ def validate_plan(
         validate_vlan_objects(vlans, device)
     validate_console_ports(consoles, device)
     for interface in creates + updates:
-        _validate_interface(interface)
+        _validate_interface(
+            interface,
+            preserve_custom_fields=plan["adapter"] == "esxi" and not interface._state.adding,
+        )
     for interface, module in ownerships:
         _validate_ownership(interface, module, device)
         interface.module = module
@@ -452,6 +471,7 @@ def validate_plan(
         validate_ipam_objects(ipam, device)
     validate_panos_interfaces(domains["interfaces"], device)
     validate_panos_vpn_objects(domains["vpn"], device)
+    validate_esxi_guests(domains["esxi_guests"])
 
 
 def _device_work(plan, domains):
@@ -498,6 +518,7 @@ def apply_discovery(
             )
             if len(locked) != len(namespace_ids):
                 raise InventoryError("A selected IPAM Namespace no longer exists")
+        lock_esxi_guests(discovery)
         context = Device.objects.values("platform_id", "device_type__manufacturer_id").get(
             pk=device.pk
         )
@@ -508,6 +529,8 @@ def apply_discovery(
             Platform.objects.select_for_update().get(pk=context["platform_id"])
         pair_policy = (discovery.get("ha_pair") or {}).get("policy")
         device_ids = {str(device.pk)}
+        if discovery.get("adapter") == "esxi" and discovery.get("guest_policy"):
+            device_ids.update(row["device"]["id"] for row in discovery["guest_policy"]["mappings"])
         if pair_policy:
             from nautobot.dcim import models as dcim_models
 
@@ -584,7 +607,7 @@ def apply_discovery(
             device.software_version = version
         if _device_work(plan, domains):
             if (
-                plan["adapter"] == "panos"
+                plan["adapter"] in ("panos", "esxi")
                 or plan.get("capacity", {}).get("preserve_custom_fields")
                 or plan.get("capacity", {}).get("updates")
             ):
@@ -597,7 +620,10 @@ def apply_discovery(
             save_vlan_catalog(vlans)
             validate_vlan_objects(vlans, device)
         for interface in creates + updates:
-            interface.validated_save()
+            if plan["adapter"] == "esxi" and not interface._state.adding:
+                save_capacity_device(interface)
+            else:
+                interface.validated_save()
         save_panos_interfaces(domains["interfaces"], device)
         for interface, module in ownerships:
             _validate_ownership(interface, module, device)
@@ -614,5 +640,6 @@ def apply_discovery(
             save_ipam_assignments(ipam, device)
         save_panos_vpn_catalog(domains["vpn"])
         save_panos_vpn_assignments(domains["vpn"])
+        save_esxi_guests(domains["esxi_guests"])
         save_console_ports(consoles)
         return plan

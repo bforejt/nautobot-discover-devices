@@ -13,6 +13,12 @@ Device Secrets Group code and are never printed. An optional explicit
 ``expected_vm_uuid`` or ``NAUTOBOT_DISCOVERY_EXPECTED_VM_UUID`` enables the
 reviewed PA-VM KVM identity binding without inventing a serial. The default verifies TLS; set
 ``NAUTOBOT_DISCOVERY_VERIFY_TLS=false`` for a lab self-signed certificate.
+For ESXi, ``expected_esxi_host_uuid`` or ``NAUTOBOT_DISCOVERY_EXPECTED_ESXI_HOST_UUID``
+pins the HostSystem hardware UUID. ``esxi_new_interface_state`` defaults to
+report-only; enabled/disabled explicitly supplies intent for new host interfaces.
+``NAUTOBOT_DISCOVERY_ESXI_PORT`` defaults to 443. Optional
+``esxi_guest_mappings`` or ``NAUTOBOT_DISCOVERY_ESXI_GUEST_MAPPINGS`` selects existing
+guest Devices for the Hosted On relationship by observed VM BIOS UUID.
 """
 
 import json
@@ -53,6 +59,10 @@ def run(
     allow_blocked=None,
     endpoint_host=None,
     expected_vm_uuid=None,
+    expected_esxi_host_uuid=None,
+    esxi_port=None,
+    esxi_new_interface_state=None,
+    esxi_guest_mappings=None,
 ):
     """Collect structured live data and verify a zero-write Job preview."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -61,6 +71,7 @@ def run(
     from nautobot.dcim.models import Device
     from nautobot.ipam.models import Namespace, VLANGroup
 
+    from jobs.adapters.esxi import canonical_host_uuid
     from jobs.discovery_job import DiscoverDevice, _adapter
     from jobs.nautobot_inventory import snapshot_inventory
 
@@ -85,6 +96,24 @@ def run(
         if parsed_uuid.int in (0, (1 << 128) - 1):
             raise ValueError("Expected PAN-OS VM UUID cannot be a sentinel UUID")
         expected_vm_uuid = str(parsed_uuid)
+    expected_esxi_host_uuid = expected_esxi_host_uuid or os.environ.get(
+        "NAUTOBOT_DISCOVERY_EXPECTED_ESXI_HOST_UUID"
+    )
+    if expected_esxi_host_uuid:
+        expected_esxi_host_uuid = canonical_host_uuid(expected_esxi_host_uuid)
+        if expected_esxi_host_uuid is None:
+            raise ValueError("Expected ESXi host UUID must be a nonzero canonical UUID")
+    if esxi_port is None:
+        esxi_port = int(os.environ.get("NAUTOBOT_DISCOVERY_ESXI_PORT", "443"))
+    if type(esxi_port) is not int or not 1 <= esxi_port <= 65535:
+        raise ValueError("ESXi HTTPS port must be an integer between 1 and 65535")
+    esxi_new_interface_state = esxi_new_interface_state or os.environ.get(
+        "NAUTOBOT_DISCOVERY_ESXI_NEW_INTERFACE_STATE", "report-only"
+    )
+    if esxi_new_interface_state not in ("report-only", "enabled", "disabled"):
+        raise ValueError("ESXi new interface state must be report-only, enabled or disabled")
+    if esxi_guest_mappings is None:
+        esxi_guest_mappings = os.environ.get("NAUTOBOT_DISCOVERY_ESXI_GUEST_MAPPINGS", "")
     device = Device.objects.get(pk=device_id)
     expected_adapter = expected_adapter or os.environ.get("NAUTOBOT_DISCOVERY_EXPECTED_ADAPTER")
     adapter_name = _adapter(device).__name__.rsplit(".", 1)[-1]
@@ -134,6 +163,10 @@ def run(
                         ipam_group_user_vrfs=ipam_group_user_vrfs,
                         ipam_local_vrf_names=ipam_local_vrf_names,
                         expected_vm_uuid=expected_vm_uuid,
+                        expected_esxi_host_uuid=expected_esxi_host_uuid,
+                        esxi_port=esxi_port,
+                        esxi_new_interface_state=esxi_new_interface_state,
+                        esxi_guest_mappings=esxi_guest_mappings,
                     )
                 except RuntimeError:
                     failure_report = job.request.meta.get("discovery_report", {})
@@ -164,6 +197,11 @@ def run(
         "adapter": adapter_name,
         "endpoint_host": endpoint_host,
         "expected_vm_uuid": expected_vm_uuid,
+        "expected_esxi_host_uuid": expected_esxi_host_uuid,
+        "esxi_port": esxi_port if adapter_name == "esxi" else None,
+        "esxi_new_interface_state": esxi_new_interface_state if adapter_name == "esxi" else None,
+        "esxi_guest_policy": report.get("esxi_guest_policy"),
+        "esxi_guest_plan": report["plan"].get("esxi_guests", {}),
         "dry_run": True,
         "use_ntc_defaults": use_ntc_defaults,
         "applied": False,

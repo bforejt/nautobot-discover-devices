@@ -3,25 +3,27 @@
 import json
 from uuid import UUID
 
-from nautobot.apps.jobs import BooleanVar, DryRunVar, IntegerVar, Job, ObjectVar, TextVar
+from nautobot.apps.jobs import BooleanVar, ChoiceVar, DryRunVar, IntegerVar, Job, ObjectVar, TextVar
 from nautobot.dcim.models import Device, Location
 from nautobot.extras.models import SecretsGroup, Status
 from nautobot.ipam.models import Namespace, VLANGroup
 
-from .adapters import cisco_iosxe, panos
+from .adapters import cisco_iosxe, esxi, panos
 from .adapters.panos_management import normalize_management_policy
 from .credentials import CredentialsError, resolve_credentials
+from .esxi_guest_policy import normalize_esxi_guest_policy
 from .ipam_policy import normalize_ipam_policy
 from .nautobot_inventory import InventoryError, apply_discovery, snapshot_inventory, validate_plan
 from .panos_ha_policy import normalize_panos_ha_policy
 from .panos_ipam_policy import normalize_panos_ipam_policy
 from .panos_vpn_policy import normalize_panos_vpn_policy
 from .reconcile import build_plan
+from .transport_esxi import EsxiClient, EsxiError
 from .transport_restconf import RestconfClient, RestconfError
 from .transport_ssh import PanosSshClient, SshError
 
 name = "Device Discovery"
-JOB_VERSION = "0.23.0-dev"
+JOB_VERSION = "0.24.0-dev"
 
 
 def _resolve_panos_ipam_target(kind, identifier, namespace_id):
@@ -96,12 +98,43 @@ def _resolve_panos_vpn_target(kind, identifier):
     return {"id": str(obj.pk), "name": obj.name}
 
 
+def _resolve_esxi_guest_target(kind, identifier):
+    """Resolve the existing Hosted On relationship and explicitly selected Devices."""
+    if kind == "device":
+        try:
+            obj = Device.objects.get(pk=identifier)
+        except Device.DoesNotExist:
+            raise ValueError("An explicitly selected ESXi guest Device does not exist") from None
+        return {"id": str(obj.pk), "name": obj.name}
+    if kind != "relationship" or identifier != "hosted_on":
+        raise ValueError("Unsupported ESXi guest mapping target")
+    try:
+        from nautobot.extras.models import Relationship
+    except ImportError:
+        raise ValueError("Installed Nautobot lacks native Relationship support") from None
+    try:
+        obj = Relationship.objects.get(key="hosted_on")
+    except (Relationship.DoesNotExist, Relationship.MultipleObjectsReturned):
+        raise ValueError("The existing Hosted On relationship is missing or ambiguous") from None
+    return {
+        "id": str(obj.pk),
+        "key": obj.key,
+        "type": obj.type,
+        "source_type": "%s.%s" % (obj.source_type.app_label, obj.source_type.model),
+        "destination_type": "%s.%s" % (obj.destination_type.app_label, obj.destination_type.model),
+    }
+
+
 def _adapter(device):
     """Select only reviewed platform/manufacturer pairs before resolving secrets."""
     platform = device.platform
     driver = str(getattr(platform, "network_driver", "") or "").lower()
     platform_name = str(getattr(platform, "name", "") or "").lower()
     normalized_name = platform_name.replace("-", "").replace("_", "").replace(" ", "")
+    if driver in ("esxi", "vmware_esxi") or (
+        not driver and normalized_name in ("esxi", "vmwareesxi")
+    ):
+        return esxi
     manufacturer = device.device_type.manufacturer.name.lower()
     if driver in ("paloalto_panos", "panos") or (
         not driver and normalized_name in ("panos", "paloaltopanos")
@@ -111,7 +144,7 @@ def _adapter(device):
         return panos
     if driver not in ("cisco_ios", "cisco_iosxe") and "iosxe" not in normalized_name:
         raise ValueError(
-            "The selected Device must have a supported Cisco IOS XE or PAN-OS platform"
+            "The selected Device must have a supported Cisco IOS XE, PAN-OS or ESXi platform"
         )
     if "cisco" not in manufacturer:
         raise ValueError("The selected Device must have a Cisco DeviceType")
@@ -153,6 +186,42 @@ class DiscoverDevice(Job):
     )
     verify_tls = BooleanVar(default=True, description="Verify the device HTTPS certificate.")
     restconf_port = IntegerVar(default=443, min_value=1, max_value=65535)
+    esxi_port = IntegerVar(default=443, min_value=1, max_value=65535, label="ESXi HTTPS port")
+    expected_esxi_host_uuid = TextVar(
+        required=False,
+        default="",
+        label="Expected ESXi host UUID",
+        description=(
+            "Explicit hardware UUID for the selected standalone ESXi host. Requires an exact "
+            "match with HostSystem.hardware.systemInfo.uuid. A missing chassis serial remains "
+            "blank; the UUID is never stored as a serial."
+        ),
+    )
+    esxi_guest_mappings = TextVar(
+        required=False,
+        default="",
+        label="ESXi Hosted On guest mappings",
+        description=(
+            "JSON list selecting an observed VM BIOS UUID and an existing guest Device UUID: "
+            '[{"vm_uuid":"00000000-0000-4000-8000-000000000001",'
+            '"device":"00000000-0000-4000-8000-000000000002"}]. '
+            "Uses the existing Hosted On relationship. Blank retains guest evidence in the report."
+        ),
+    )
+    esxi_new_interface_state = ChoiceVar(
+        choices=(
+            ("report-only", "Report only"),
+            ("enabled", "Enabled"),
+            ("disabled", "Disabled"),
+        ),
+        default="report-only",
+        label="ESXi new interface administrative state",
+        description=(
+            "ESXi does not report NIC administrative state. Report only defers new interfaces. "
+            "Enabled or Disabled explicitly supplies intent for newly created host interfaces; "
+            "existing administrative state is preserved."
+        ),
+    )
     ssh_port = IntegerVar(default=22, min_value=1, max_value=65535)
     ssh_strict = BooleanVar(
         default=True,
@@ -344,7 +413,10 @@ class DiscoverDevice(Job):
     class Meta:
         name = "Discover Device"
         description = (
-            "Verify Cisco IOS XE or PAN-OS identity and fill supported interfaces. "
+            "Verify Cisco IOS XE, PAN-OS or standalone ESXi identity and fill supported "
+            "interfaces. "
+            "ESXi can link explicitly selected existing NFV Devices through Hosted On; "
+            "guest sizing, storage and virtual networking remain report-only evidence. "
             "PAN-OS supports logical and management inventory, explicitly selected HA "
             "ownership and native VPN processing where compatible models exist. "
             "Cisco IOS XE also supports console ports, VLANs, "
@@ -362,6 +434,10 @@ class DiscoverDevice(Job):
             "use_ntc_defaults",
             "verify_tls",
             "restconf_port",
+            "esxi_port",
+            "expected_esxi_host_uuid",
+            "esxi_new_interface_state",
+            "esxi_guest_mappings",
             "ssh_port",
             "ssh_strict",
             "expected_vm_uuid",
@@ -419,6 +495,10 @@ class DiscoverDevice(Job):
         panos_management_policy="",
         panos_ha_peer="",
         panos_vpn_mappings="",
+        esxi_port=443,
+        expected_esxi_host_uuid="",
+        esxi_new_interface_state="report-only",
+        esxi_guest_mappings="",
     ):
         device = Device.objects.get(pk=device.pk)
         report = {
@@ -441,6 +521,75 @@ class DiscoverDevice(Job):
         )
         try:
             adapter = _adapter(device)
+            if adapter is esxi:
+                if any(
+                    (
+                        vlan_group is not None,
+                        vlan_status is not None,
+                        module_status is not None,
+                        ipam_namespace is not None,
+                        ipam_override_namespace is not None,
+                        ipam_override_networks,
+                        ipam_group_user_vrfs,
+                        ipam_local_vrf_names != "Mgmt-vrf",
+                        ipam_location is not None,
+                        ipam_prefix_status is not None,
+                        ipam_ip_address_status is not None,
+                        ipam_override_rfc1918 is not True,
+                        ipam_create_missing_prefixes is not True,
+                    )
+                ):
+                    raise ValueError(
+                        "ESXi host discovery does not support IPAM, VLAN or module writes"
+                    )
+                if type(verify_tls) is not bool:
+                    raise ValueError("Verify ESXi HTTPS certificate must be true or false")
+                if type(esxi_port) is not int or not 1 <= esxi_port <= 65535:
+                    raise ValueError("ESXi HTTPS port must be an integer between 1 and 65535")
+                report.update(esxi_port=esxi_port)
+                for field in ("restconf_port", "ssh_port", "ssh_strict"):
+                    report.pop(field, None)
+            if esxi_new_interface_state not in ("report-only", "enabled", "disabled"):
+                raise ValueError(
+                    "ESXi new interface state must be report-only, enabled or disabled"
+                )
+            if adapter is not esxi and esxi_new_interface_state != "report-only":
+                raise ValueError("ESXi new interface state is supported only for ESXi discovery")
+            interface_enabled_policy = (
+                {
+                    "contract": "esxi-interface-policy-v1",
+                    "new_enabled": esxi_new_interface_state == "enabled",
+                }
+                if adapter is esxi and esxi_new_interface_state != "report-only"
+                else None
+            )
+            if expected_esxi_host_uuid is None or (
+                isinstance(expected_esxi_host_uuid, str) and not expected_esxi_host_uuid.strip()
+            ):
+                expected_esxi_host_uuid = None
+            else:
+                if adapter is not esxi:
+                    raise ValueError("Expected ESXi host UUID is supported only for ESXi discovery")
+                expected_esxi_host_uuid = esxi.canonical_host_uuid(expected_esxi_host_uuid)
+                if expected_esxi_host_uuid is None:
+                    raise ValueError("Expected ESXi host UUID must be a nonzero canonical UUID")
+            if adapter is not esxi and esxi_guest_mappings:
+                raise ValueError(
+                    "ESXi Hosted On guest mappings are supported only for ESXi discovery"
+                )
+            guest_policy = (
+                normalize_esxi_guest_policy(
+                    esxi_guest_mappings,
+                    _resolve_esxi_guest_target,
+                    selected_device_id=str(device.pk),
+                )
+                if adapter is esxi
+                else None
+            )
+            report["expected_esxi_host_uuid"] = expected_esxi_host_uuid
+            if adapter is esxi:
+                report["esxi_guest_policy"] = guest_policy
+                report["esxi_new_interface_state"] = esxi_new_interface_state
             if adapter is not panos and any(
                 (panos_routing_domains, panos_management_policy, panos_ha_peer, panos_vpn_mappings)
             ):
@@ -477,7 +626,7 @@ class DiscoverDevice(Job):
             )
             location, location_reason = (
                 _prefix_location(device, ipam_location)
-                if (adapter is not panos and ipam_namespace is not None)
+                if (adapter is cisco_iosxe and ipam_namespace is not None)
                 or panos_policy is not None
                 or management_policy is not None
                 else (None, None)
@@ -485,6 +634,8 @@ class DiscoverDevice(Job):
             ipam_policy = (
                 panos_policy
                 if adapter is panos
+                else None
+                if adapter is esxi
                 else normalize_ipam_policy(
                     ipam_namespace,
                     ipam_override_namespace,
@@ -525,12 +676,14 @@ class DiscoverDevice(Job):
                 if expected_vm_uuid is None:
                     raise ValueError("Expected PAN-OS VM UUID must be a nonzero canonical UUID")
             report["expected_vm_uuid"] = expected_vm_uuid
-            report["transport"] = "ssh" if adapter is panos else "restconf"
+            report["transport"] = (
+                "ssh" if adapter is panos else "esxi-soap" if adapter is esxi else "restconf"
+            )
             if use_ntc_defaults:
                 self.logger.info(
-                    "PAN-OS discovery retains strict evidence rules; the NTC defaults option "
-                    "applies only to Cisco IOS XE."
-                    if adapter is panos
+                    "%s discovery retains strict evidence rules; the NTC defaults option "
+                    "applies only to Cisco IOS XE." % ("PAN-OS" if adapter is panos else "ESXi")
+                    if adapter is not cisco_iosxe
                     else "NTC default guessing is enabled. Any inferred assignments are identified "
                     "as guesses in the discovery report."
                 )
@@ -548,21 +701,37 @@ class DiscoverDevice(Job):
                 client = PanosSshClient(
                     _host(device), username, password, port=ssh_port, ssh_strict=ssh_strict
                 )
+            elif adapter is esxi:
+                username, password = resolve_credentials(
+                    device, override_group=secrets_group, transport="esxi"
+                )
+                client = EsxiClient(
+                    _host(device), username, password, port=esxi_port, verify=verify_tls
+                )
             else:
                 username, password = resolve_credentials(device, override_group=secrets_group)
                 client = RestconfClient(
                     _host(device), username, password, port=restconf_port, verify=verify_tls
                 )
             try:
-                collect_options = {"use_ntc_defaults": use_ntc_defaults}
+                collect_options = {
+                    "use_ntc_defaults": use_ntc_defaults if adapter is not esxi else False
+                }
                 if adapter is panos:
                     collect_options["expected_vm_uuid"] = expected_vm_uuid
                     collect_options["max_vpn_flow_details"] = max_vpn_flow_details
+                elif adapter is esxi:
+                    collect_options["expected_host_uuid"] = expected_esxi_host_uuid
+                    collect_options["interface_enabled_policy"] = interface_enabled_policy
                 report["discovery"] = adapter.collect(client, **collect_options)
             finally:
-                client.close()
-                report["requests"] = client.trace
+                try:
+                    client.close()
+                finally:
+                    report["requests"] = client.trace
             discovery = report["discovery"]
+            if adapter is esxi:
+                discovery["guest_policy"] = guest_policy
             if adapter is panos:
                 discovery["vpn_policy"] = vpn_policy
                 if ha_policy is not None:
@@ -615,12 +784,24 @@ class DiscoverDevice(Job):
                     "Available hardware and configuration evidence remains under Advanced.",
                     len(management["unresolved"]),
                 )
-            self.logger.info(
-                "Read %s interfaces and %s identified hardware modules from %s.",
-                len(discovery.get("interfaces", [])),
-                len(discovery.get("components", {}).get("items", [])),
-                device.name,
-            )
+            if adapter is esxi:
+                observations = discovery.get("observations", {})
+                self.logger.info(
+                    "Collected %s host interfaces, %s VM observations and %s datastore "
+                    "observations from %s. Full network and storage evidence is available "
+                    "under Advanced.",
+                    len(discovery.get("interfaces", [])),
+                    len(observations.get("guests", [])),
+                    len(observations.get("datastores", [])),
+                    device.name,
+                )
+            else:
+                self.logger.info(
+                    "Read %s interfaces and %s identified hardware modules from %s.",
+                    len(discovery.get("interfaces", [])),
+                    len(discovery.get("components", {}).get("items", [])),
+                    device.name,
+                )
             self.logger.info("Comparing discovered details with Nautobot inventory.")
             report["plan"] = build_plan(
                 report["discovery"],
@@ -672,6 +853,8 @@ class DiscoverDevice(Job):
                 exc,
                 (
                     RestconfError,
+                    EsxiError,
+                    esxi.DiscoveryError,
                     SshError,
                     CredentialsError,
                     cisco_iosxe.DiscoveryError,
@@ -713,6 +896,7 @@ class DiscoverDevice(Job):
                 "empty VM capacity fields",
             ),
             ("interfaces_created", "add", "Added", "interface", "interfaces"),
+            ("hosted_on_created", "link", "Linked", "Hosted On guest", "Hosted On guests"),
             ("virtual_chassis_created", "add", "Added", "virtual chassis", "virtual chassis"),
             ("virtual_chassis_updated", "update", "Updated", "virtual chassis", "virtual chassis"),
             ("stack_members_created", "add", "Added", "stack member", "stack members"),

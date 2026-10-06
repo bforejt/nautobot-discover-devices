@@ -3,11 +3,13 @@
 import re
 from collections import defaultdict
 
-from .adapters import cisco_iosxe, panos
+from .adapters import cisco_iosxe, esxi, panos
 from .adapters.cisco_iosxe import canonical_interface_name, canonical_software_version
 from .reconcile_capacity import plan_capacity
 from .reconcile_components import plan_components
 from .reconcile_console import plan_console_ports, reviewed_profile
+from .reconcile_esxi import esxi_new_interface_policy, prepare_esxi, validate_esxi_identity
+from .reconcile_esxi_guests import plan_esxi_guests
 from .reconcile_ipam import plan_ipam
 from .reconcile_panos_ha import plan_panos_ha
 from .reconcile_panos_interfaces import plan_panos_interfaces
@@ -308,12 +310,15 @@ def build_plan(discovery, existing):
     """
     adapter_name = discovery.get("adapter")
     if (
-        adapter_name not in ("cisco_iosxe", "panos")
+        adapter_name not in ("cisco_iosxe", "panos", "esxi")
         or discovery.get("schema_version") != 1
-        or (adapter_name == "panos" and type(discovery.get("schema_version")) is not int)
+        or (adapter_name in ("panos", "esxi") and type(discovery.get("schema_version")) is not int)
     ):
         raise ValueError("Unsupported discovery adapter or schema version")
-    adapter = panos if adapter_name == "panos" else cisco_iosxe
+    adapter = {"panos": panos, "esxi": esxi, "cisco_iosxe": cisco_iosxe}[adapter_name]
+    esxi_errors = []
+    if adapter is esxi:
+        discovery, esxi_errors = prepare_esxi(discovery)
     canonical_interface_name = adapter.canonical_interface_name
     canonical_software_version = adapter.canonical_software_version
 
@@ -337,7 +342,7 @@ def build_plan(discovery, existing):
         "software_version": None,
         "stack": stack,
         "conflicts": list(stack["conflicts"]),
-        "errors": list(stack["errors"]),
+        "errors": list(stack["errors"]) + esxi_errors,
         "warnings": list(discovery.get("warnings", [])) + stack["warnings"],
         "missing_interfaces": [],
         "excluded_interfaces": list(discovery.get("excluded_interfaces", [])),
@@ -366,8 +371,10 @@ def build_plan(discovery, existing):
         )
 
     vm_identity = _panos_vm_identity(discovery, device, plan) if adapter is panos else False
+    if adapter is esxi:
+        vm_identity = validate_esxi_identity(discovery, device, plan)
     required_identity = ["serial", "model", "hostname", "software_version"]
-    if vm_identity and _blank(device.get("serial")):
+    if vm_identity and (_blank(device.get("serial")) or adapter is esxi):
         required_identity.remove("serial")
     for field in required_identity:
         if _blank(identity.get(field)):
@@ -399,7 +406,7 @@ def build_plan(discovery, existing):
         if not device.get("platform_id"):
             plan["errors"].append(
                 "Assign the Device's %s platform before loading software"
-                % ("PAN-OS" if adapter is panos else "IOS XE")
+                % ("PAN-OS" if adapter is panos else "ESXi" if adapter is esxi else "IOS XE")
             )
         version = canonical_software_version(identity["software_version"])
         if version is None:
@@ -463,6 +470,8 @@ def build_plan(discovery, existing):
         capability_unknown = not values["type"] and (
             panos.observed_physical_ethernet(fact, name)
             if adapter is panos
+            else esxi.observed_physical_ethernet(fact, name)
+            if adapter is esxi
             else _observed_physical_ethernet(fact, name)
         )
         if capability_unknown:
@@ -481,6 +490,8 @@ def build_plan(discovery, existing):
                     "Reviewed PAN-OS physical Ethernet evidence; maximum physical capability "
                     "unknown; Nautobot Other is an explicit unknown capability placeholder"
                     if adapter is panos
+                    else "Reviewed ESXi physical Ethernet evidence; maximum capability unknown"
+                    if adapter is esxi
                     else UNKNOWN_ETHERNET_TYPE_SOURCE
                 )
             plan["warnings"].append(
@@ -525,6 +536,11 @@ def build_plan(discovery, existing):
             )
             values["duplex"] = None
         if not by_name[name]:
+            enabled_source = (
+                esxi_new_interface_policy(discovery, values, name, plan)
+                if adapter is esxi
+                else None
+            )
             if not values["type"] or values["enabled"] is None:
                 reason = (
                     "unsupported physical type" if not values["type"] else "unknown admin state"
@@ -533,6 +549,8 @@ def build_plan(discovery, existing):
                 plan["excluded_interfaces"].append({"name": name, "reason": reason})
                 continue
             spec = {"name": name, **values, "type_source": type_source}
+            if enabled_source is not None:
+                spec["enabled_source"] = enabled_source
             if capability_unknown:
                 spec["capability_unknown"] = True
             if values["mgmt_only"] is True:
@@ -652,6 +670,12 @@ def build_plan(discovery, existing):
         if name not in observed
         for row in rows
     ]
+    if adapter is esxi:
+        plan["esxi_guests"] = plan_esxi_guests(
+            discovery, existing, identity_verified=not plan["errors"]
+        )
+        for key in ("conflicts", "errors", "warnings"):
+            plan[key].extend(plan["esxi_guests"][key])
     plan["summary"] = {
         "device_fields_updated": len(plan["device_updates"]),
         "interfaces_created": len(plan["interface_creates"]),
@@ -677,6 +701,8 @@ def build_plan(discovery, existing):
         **plan["vpn"]["summary"],
         **stack["summary"],
     }
+    if adapter is esxi:
+        plan["summary"].update(plan["esxi_guests"]["summary"])
     return plan
 
 

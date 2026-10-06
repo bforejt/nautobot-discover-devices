@@ -1,5 +1,13 @@
 # PAN-OS discovery first pass
 
+This document preserves the first-pass checkpoint delivered in PR #15, with
+Job version `0.18.0-dev`, before dataplane adapters were added to the lab.
+Its blocked identity, empty inventory and installed-version statements describe
+that checkpoint. Follow the [current VM-Series validation contract](panos-vm-validation.md)
+for the optional PA-VM/KVM UUID binding, reviewed virtual templates and subsequent
+live results. The collection and conservative field mappings below remain the
+base contract; the current increment does not infer physical capability.
+
 This increment establishes SSH/XML collection and a conservative inventory
 contract for an existing selected Device. Keep every observed hardware row,
 including down, unaddressed and unconfigured ports, and preserve separately
@@ -15,9 +23,10 @@ successful `show interface all` returned a successful response with explicit
 empty `hw` and `ifnet` containers. This proves an empty operational view at that
 moment; it does not prove that the guest has no unconfigured network adapters.
 The system also reported `vm-license` as `none`. No physical appliance or
-licensed non-empty dataplane inventory has yet been validated live. Its reported
-serial was unavailable and is normalized to missing identity. The live plan is
-therefore blocked; no live inventory apply or confirmed chassis serial is claimed.
+licensed non-empty dataplane inventory had been validated live. Its reported
+serial was unavailable and is normalized to missing identity. The first-pass
+live plan was therefore blocked; that checkpoint established neither live inventory apply nor
+a confirmed chassis serial.
 
 The older testsuite identity fixture reports a sanitized PA-5250 running
 `11.1.4-h7`. That fixture proves parser behavior, not live PA-5250 support.
@@ -33,13 +42,19 @@ set cli pager off
 set cli op-command-xml-output on
 ```
 
-The fixed collection reads are:
+The first-pass collection used these three fixed reads:
 
 ```text
 show system info
 show interface all
 show config effective-running xpath devices/entry/network/interface
 ```
+
+The current [VM-Series increment](panos-vm-validation.md) retains these reads
+and additionally requires structured `debug show vm-series interfaces all`
+for exact PA-VM/family-vm/KVM targets. That fourth source preserves recognized
+guest adapters omitted from healthy operational hardware views. Physical
+targets keep the three-read collection.
 
 The
 [PAN-OS 11.2 operational hierarchy](https://docs.paloaltonetworks.com/ngfw/pan-os-cli-quick-start/cli-command-hierarchy/pan-os-11-2-cli-ops-command-hierarchy)
@@ -180,10 +195,13 @@ exact-template creation, idempotence and rollback after related writes. The oute
 rollback leaves zero persistent changes. These checks do not establish a live
 serial or successful live firewall inventory apply. The full offline check totals are recorded with delivery validation below.
 
-Remaining live evidence includes usable selected firewall identity,
-a licensed non-empty dataplane or a physical appliance, complete configured and
+At the first-pass checkpoint, remaining live evidence included usable selected
+firewall identity, non-empty dataplane inventory, complete configured and
 unconfigured port enumeration, applicable explicit administrative state and
-reviewed physical capability. PA-VM rows remain report-only; configured fields
+reviewed physical capability. Licensing and adapter attachment are separate
+facts. The [VM-Series increment](panos-vm-validation.md) defines a UUID binding
+when a serial is absent and reviewed templates for virtual adapters. Without a
+reviewed native type, PA-VM rows remain report-only; configured fields
 may enrich an eligible existing interface without replacing its native type.
 A DeviceType template can supply a native type only through the existing
 unambiguous template contract, never through a negotiated-rate inference.
@@ -191,7 +209,7 @@ Capture sanitized fixtures with exact commands. Extend models/releases through r
 profiles, preserving unknown facts without new release/name heuristics.
 
 
-## Delivery validation, 2026-10-05
+## First-pass delivery validation, 2026-10-05
 
 The branch starts from merged `main` at `b1a2904` and reports Job version
 `0.18.0-dev`. Required checks passed: 745 offline tests, Ruff 0.11.13 lint and
@@ -203,10 +221,11 @@ The user approved creation of `panos-lab` at the Cisco lab's `lab` Location.
 The baseline is Palo Alto Networks / PA-VM / PAN-OS (`paloalto_panos`), with a
 Firewall role and SSH Secrets Group. Device UUID is
 `ed010564-cfd9-4039-bfad-a40ea4487157`. Serial, software and interfaces remain
-blank. Native primary IP requires an actual interface assignment, so validation
-uses an explicit process-only endpoint override rather than inventing an
-interface. The new source ran in an isolated Nautobot directory; installed Job
-`0.17.0-dev` remains unchanged and the worker was not restarted.
+blank at this checkpoint. Native primary IP requires an actual interface
+assignment, so validation uses an explicit process-only endpoint override
+rather than inventing an interface. The new source ran in an isolated Nautobot
+directory; installed Job `0.17.0-dev` remained unchanged at the first-pass
+checkpoint and the worker was not restarted.
 
 Live collection through the actual Job source succeeded using the three fenced
 reads. Native preview then blocked exactly on the missing serial and verified
@@ -234,8 +253,9 @@ preview["run"](
 ```
 
 `allow_blocked` retains an expected failed validation report and asserts zero
-writes; it does not turn a blocked plan into an applicable one. Live serial
-fill, successful apply/repeat and complete physical/guest port inventory remain
-unvalidated. Obtain a usable serial and non-empty licensed VM dataplane or a
-physical firewall, then review exact type/template and administrative evidence
-before widening the first-pass support claim.
+writes; it does not turn a blocked plan into an applicable one. At this
+checkpoint, live serial fill, successful apply/repeat and complete physical/guest
+port inventory remained unvalidated. The [current VM-Series contract](panos-vm-validation.md)
+allows independently verified UUID binding with native serial left blank; it
+does not require licensing to enumerate attached adapters. Physical firewalls
+still require their serial and independent capability evidence.

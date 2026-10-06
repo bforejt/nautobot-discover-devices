@@ -10,9 +10,10 @@ import time
 
 SYSTEM_INFO = "show system info"
 INTERFACES = "show interface all"
+VM_INTERFACES = "debug show vm-series interfaces all"
 RUNNING_INTERFACES = "show config effective-running xpath devices/entry/network/interface"
 SESSION_PREP = ("set cli pager off", "set cli op-command-xml-output on")
-READ_COMMANDS = frozenset((SYSTEM_INFO, INTERFACES, RUNNING_INTERFACES))
+READ_COMMANDS = frozenset((SYSTEM_INFO, INTERFACES, RUNNING_INTERFACES, VM_INTERFACES))
 
 
 class SshError(RuntimeError):

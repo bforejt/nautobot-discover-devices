@@ -51,6 +51,68 @@ def _fact(name, **values):
     return fact
 
 
+def _vm_discovery(
+    name, vm_uuid, *, expected_vm_uuid=None, ports=(100, 101, 102, 103), version="99.99.3-h1"
+):
+    """Collect production adapter facts from explicit synthetic structured evidence."""
+    import xml.etree.ElementTree as ET
+    from types import SimpleNamespace
+
+    from jobs.adapters import panos
+    from jobs.transport_ssh import INTERFACES, RUNNING_INTERFACES, SYSTEM_INFO, VM_INTERFACES
+
+    system_response = ET.Element("response", status="success")
+    system = ET.SubElement(ET.SubElement(system_response, "result"), "system")
+    for field, value in {
+        "hostname": name,
+        "model": "PA-VM",
+        "serial": "unknown",
+        "sw-version": version,
+        "family": "vm",
+        "vm-mode": "KVM",
+        "vm-license": "none",
+        "vm-uuid": vm_uuid,
+    }.items():
+        ET.SubElement(system, field).text = value
+    interface_response = ET.Element("response", status="success")
+    result = ET.SubElement(interface_response, "result")
+    ET.SubElement(result, "hw")
+    ET.SubElement(result, "ifnet")
+    vm_response = ET.Element("response", status="success")
+    vm_result = ET.SubElement(vm_response, "result")
+    applied_response = ET.Element("response", status="success")
+    applied = ET.SubElement(
+        ET.SubElement(ET.SubElement(applied_response, "result"), "interface"), "ethernet"
+    )
+    for index, number in enumerate(ports):
+        name = "ethernet1/%d" % number
+        row = ET.SubElement(vm_result, "entry")
+        for field, value in {
+            "Interface_name": "Ethernet1/%d" % number,
+            "Base-OS_port": "eth%d" % (index + 1),
+            "Base-OS_BUS": "0000:00:%02x.0" % (0x13 + index),
+            "Base-OS_MAC": "02:00:00:00:01:%02x" % (index + 1),
+        }.items():
+            ET.SubElement(row, field).text = value
+        config = ET.SubElement(applied, "entry", name=name)
+        if index < 3:
+            ET.SubElement(config, "link-state").text = ("up", "down", "auto")[index]
+        ET.SubElement(config, "comment").text = "Synthetic UUID-bound PAN-OS port"
+        ET.SubElement(ET.SubElement(config, "layer3"), "mtu").text = "1500"
+    outputs = {
+        command: ET.tostring(response, encoding="unicode")
+        for command, response in (
+            (SYSTEM_INFO, system_response),
+            (INTERFACES, interface_response),
+            (RUNNING_INTERFACES, applied_response),
+            (VM_INTERFACES, vm_response),
+        )
+    }
+    return panos.collect(
+        SimpleNamespace(run=outputs.__getitem__), expected_vm_uuid=expected_vm_uuid
+    )
+
+
 def run(device_id=None):
     """Verify strict previews, native apply, preservation, repeats and rollback."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -327,6 +389,204 @@ def run(device_id=None):
                 "late PAN-OS save failure rolls back preceding device, software and "
                 "interface writes"
             )
+
+            # A deliberately explicit VM UUID contract: the production adapter
+            # parses synthetic XML, so the planner is tested against its actual
+            # provenance shape. Exact virtual templates supply native type.
+            vm_type = DeviceType.objects.filter(manufacturer=manufacturer, model="PA-VM").first()
+            if vm_type is None:
+                vm_type = DeviceType(manufacturer=manufacturer, model="PA-VM")
+                vm_type.validated_save()
+            vm_target = Device(
+                name="panos-vm-native-" + token,
+                serial="",
+                device_type=vm_type,
+                platform=platform,
+                role=anchor.role,
+                location=anchor.location,
+                status=anchor.status,
+            )
+            vm_target.validated_save()
+            for number in range(100, 106):
+                vm_name = "ethernet1/%d" % number
+                assert not vm_type.interface_templates.filter(name=vm_name).exists()
+                InterfaceTemplate(
+                    device_type=vm_type, name=vm_name, type="virtual"
+                ).validated_save()
+            vm_uuid = str(uuid.uuid4())
+            vm_discovery = _vm_discovery(vm_target.name, vm_uuid, expected_vm_uuid=vm_uuid)
+            assert vm_discovery["identity"]["serial"] is None
+            assert vm_discovery["identity_binding"]["observed_uuid"] == vm_uuid
+            assert all(
+                row["source"]["contract"] == "panos-vm-interface-v1"
+                for row in vm_discovery["interfaces"]
+            )
+            assert all(row["mac_address"] is None for row in vm_discovery["interfaces"])
+
+            def rejected_vm(discovery, message):
+                before_rejected = snapshot_inventory(vm_target, discovery=discovery)
+                with CaptureQueriesContext(connection) as captured:
+                    try:
+                        apply_discovery(discovery, vm_target, interface_status=interface_status)
+                    except InventoryError:
+                        pass
+                    else:
+                        raise AssertionError(message)
+                _no_dml(captured, message + " issued inventory DML")
+                assert snapshot_inventory(vm_target, discovery=discovery) == before_rejected
+
+            unbound = _vm_discovery(vm_target.name, vm_uuid)
+            rejected_vm(unbound, "PAN-OS VM missing explicit UUID binding was accepted")
+            checks.append(
+                "blank-serial VM apply without explicit UUID binding is blocked before DML"
+            )
+            mismatched = _vm_discovery(vm_target.name, vm_uuid, expected_vm_uuid=str(uuid.uuid4()))
+            rejected_vm(mismatched, "PAN-OS VM mismatched explicit UUID was accepted")
+            checks.append("mismatched expected and observed VM UUID blocks every native write")
+            for mutate in (
+                lambda row: row["observations"]["system"].update({"vm-uuid": str(uuid.uuid4())}),
+                lambda row: row["sources"]["identity"].update({"command": "show system software"}),
+                lambda row: row["identity_binding"].update({"contract": "unreviewed"}),
+            ):
+                invalid_binding = copy.deepcopy(vm_discovery)
+                mutate(invalid_binding)
+                rejected_vm(invalid_binding, "PAN-OS VM invalid UUID provenance was accepted")
+            checks.append(
+                "VM UUID exemption requires matching raw system, command and contract provenance"
+            )
+            invalid_profile = copy.deepcopy(vm_discovery)
+            invalid_profile["observations"]["system"]["vm-mode"] = "ESXi"
+            invalid_profile["identity_binding"]["vm_mode"] = "ESXi"
+            rejected_vm(invalid_profile, "PAN-OS VM unreviewed platform profile was accepted")
+            checks.append(
+                "VM UUID serial exemption remains limited to the reviewed PA-VM KVM profile"
+            )
+            Device.objects.filter(pk=vm_target.pk).update(serial="Operator VM serial")
+            vm_target.refresh_from_db()
+            rejected_vm(vm_discovery, "PAN-OS VM populated selected serial bypassed identity gate")
+            Device.objects.filter(pk=vm_target.pk).update(serial="")
+            vm_target.refresh_from_db()
+            checks.append("UUID binding never bypasses the populated selected serial requirement")
+
+            for field, value in (
+                ("enumeration_command", "debug show vm-series interfaces"),
+                ("enumeration_path", "result/hw/entry"),
+                ("raw_name", "Ethernet1/999"),
+                ("base_os_port", "eth999"),
+                ("base_os_bus", "0000:00:12.0"),
+            ):
+                invalid_vm_source = copy.deepcopy(vm_discovery)
+                invalid_vm_source["interfaces"][0]["source"][field] = value
+                rejected_vm(
+                    invalid_vm_source, "PAN-OS VM tampered enumeration " + field + " was accepted"
+                )
+            for mutate in (
+                lambda row: row["sources"]["vm_interfaces"].update(
+                    {"command": "debug show vm-series interfaces"}
+                ),
+                lambda row: row["observations"]["vm_interfaces"].append(
+                    copy.deepcopy(row["observations"]["vm_interfaces"][0])
+                ),
+                lambda row: row["observations"].update({"vm_interfaces": []}),
+            ):
+                invalid_vm_source = copy.deepcopy(vm_discovery)
+                mutate(invalid_vm_source)
+                rejected_vm(
+                    invalid_vm_source, "PAN-OS VM invalid enumeration observations were accepted"
+                )
+            checks.append(
+                "VM interface command, path, raw name, base port and bus "
+                "must match unique observations before any native DML"
+            )
+
+            before_vm = snapshot_inventory(vm_target, discovery=vm_discovery)
+            with CaptureQueriesContext(connection) as captured:
+                vm_plan = build_plan(vm_discovery, before_vm)
+                validate_plan(vm_plan, vm_target, interface_status=interface_status)
+            _no_dml(captured, "UUID-bound PAN-OS VM preview issued inventory DML")
+            assert not vm_plan["errors"] and not vm_plan["summary"]["blocked"]
+            assert vm_plan["identity_binding"]["expected_uuid"] == vm_uuid
+            assert {row["name"] for row in vm_plan["interface_creates"]} == {
+                "ethernet1/100",
+                "ethernet1/101",
+            }
+            assert all(row["type"] == "virtual" for row in vm_plan["interface_creates"])
+            assert snapshot_inventory(vm_target, discovery=vm_discovery) == before_vm
+            checks.append(
+                "UUID-bound VM preview validates exact virtual templates "
+                "and defers auto or absent admin"
+            )
+            vm_applied = apply_discovery(vm_discovery, vm_target, interface_status=interface_status)
+            vm_target.refresh_from_db()
+            assert vm_applied["summary"]["interfaces_created"] == 2
+            assert vm_target.interfaces.get(name="ethernet1/100").enabled is True
+            assert vm_target.interfaces.get(name="ethernet1/101").enabled is False
+            assert not vm_target.interfaces.filter(
+                name__in=("ethernet1/102", "ethernet1/103")
+            ).exists()
+            assert vm_target.serial == ""
+            assert vm_target.software_version.version == "99.99.3-h1"
+            assert vm_target.platform_id == platform.pk and vm_target.device_type_id == vm_type.pk
+            checks.append(
+                "UUID-bound VM apply creates virtual ports and software "
+                "while preserving blank serial"
+            )
+            after_vm = snapshot_inventory(vm_target, discovery=vm_discovery)
+            with CaptureQueriesContext(connection) as captured:
+                repeated_vm = apply_discovery(
+                    vm_discovery, vm_target, interface_status=interface_status
+                )
+            _no_dml(captured, "Repeated UUID-bound PAN-OS VM apply issued inventory DML")
+            assert repeated_vm["summary"]["interfaces_created"] == 0
+            assert repeated_vm["summary"]["interfaces_updated"] == 0
+            assert repeated_vm["summary"]["device_fields_updated"] == 0
+            assert snapshot_inventory(vm_target, discovery=vm_discovery) == after_vm
+            checks.append("fresh UUID-bound VM repeat issues zero inventory DML")
+
+            Device.objects.filter(pk=vm_target.pk).update(software_version=None)
+            vm_target.refresh_from_db()
+            vm_failing = _vm_discovery(
+                vm_target.name,
+                vm_uuid,
+                expected_vm_uuid=vm_uuid,
+                ports=(104, 105),
+                version="99.99.4-h1",
+            )
+            vm_before_failure = snapshot_inventory(vm_target, discovery=vm_failing)
+            vm_version_count = SoftwareVersion.objects.count()
+            vm_interface_count = Interface.objects.count()
+            vm_writes_seen = []
+
+            def vm_fail_late(interface, *args, **kwargs):
+                if interface.name == "ethernet1/105":
+                    assert vm_target.interfaces.filter(name="ethernet1/104").exists()
+                    saved_vm = Device.objects.get(pk=vm_target.pk)
+                    assert saved_vm.serial == "" and saved_vm.software_version_id is not None
+                    assert SoftwareVersion.objects.filter(
+                        platform=platform, version="99.99.4-h1"
+                    ).exists()
+                    vm_writes_seen.append(True)
+                    raise ValidationError({"name": "Intentional UUID-bound VM final save failure"})
+                return original_save(interface, *args, **kwargs)
+
+            with patch.object(Interface, "validated_save", vm_fail_late):
+                try:
+                    apply_discovery(vm_failing, vm_target, interface_status=interface_status)
+                except ValidationError:
+                    pass
+                else:
+                    raise AssertionError("UUID-bound VM late interface failure did not occur")
+            assert vm_writes_seen, "VM rollback scenario did not first save related inventory"
+            assert (
+                snapshot_inventory(Device.objects.get(pk=vm_target.pk), discovery=vm_failing)
+                == vm_before_failure
+            )
+            assert SoftwareVersion.objects.count() == vm_version_count
+            assert Interface.objects.count() == vm_interface_count
+            checks.append(
+                "UUID-bound VM late save failure rolls back software and preceding interface writes"
+            )
+
         finally:
             transaction.set_rollback(True)
 

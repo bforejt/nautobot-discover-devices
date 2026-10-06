@@ -16,7 +16,7 @@ from .transport_restconf import RestconfClient, RestconfError
 from .transport_ssh import PanosSshClient, SshError
 
 name = "Device Discovery"
-JOB_VERSION = "0.18.0-dev"
+JOB_VERSION = "0.19.0-dev"
 
 
 def _host(device):
@@ -93,6 +93,16 @@ class DiscoverDevice(Job):
         default=True,
         label="Verify SSH host key",
         description="Verify the PAN-OS SSH host key against the worker's known hosts.",
+    )
+    expected_vm_uuid = TextVar(
+        required=False,
+        default="",
+        label="Expected PAN-OS VM UUID",
+        description=(
+            "Explicit identity for the selected PAN-OS PA-VM on KVM. Requires an exact match "
+            "with the firewall's reported VM UUID. A blank Device serial may remain blank "
+            "when this identity is verified; populated serials remain protected."
+        ),
     )
     secrets_group = ObjectVar(
         model=SecretsGroup,
@@ -234,6 +244,7 @@ class DiscoverDevice(Job):
             "restconf_port",
             "ssh_port",
             "ssh_strict",
+            "expected_vm_uuid",
             "secrets_group",
             "interface_status",
             "software_version_status",
@@ -277,6 +288,7 @@ class DiscoverDevice(Job):
         ipam_ip_address_status=None,
         ssh_port=22,
         ssh_strict=True,
+        expected_vm_uuid="",
     ):
         device = Device.objects.get(pk=device.pk)
         report = {
@@ -289,6 +301,7 @@ class DiscoverDevice(Job):
             "restconf_port": restconf_port,
             "ssh_port": ssh_port,
             "ssh_strict": ssh_strict,
+            "expected_vm_uuid": expected_vm_uuid,
             "applied": False,
             "vlan_group_id": str(vlan_group.pk) if vlan_group else None,
             "vlan_group_name": vlan_group.name if vlan_group else None,
@@ -317,6 +330,17 @@ class DiscoverDevice(Job):
             if type(use_ntc_defaults) is not bool:
                 raise ValueError("Use NTC defaults when guessing must be true or false")
             adapter = _adapter(device)
+            if expected_vm_uuid is None or (
+                isinstance(expected_vm_uuid, str) and not expected_vm_uuid.strip()
+            ):
+                expected_vm_uuid = None
+            else:
+                if adapter is not panos:
+                    raise ValueError("Expected VM UUID is supported only for PAN-OS discovery")
+                expected_vm_uuid = panos.canonical_vm_uuid(expected_vm_uuid)
+                if expected_vm_uuid is None:
+                    raise ValueError("Expected PAN-OS VM UUID must be a nonzero canonical UUID")
+            report["expected_vm_uuid"] = expected_vm_uuid
             report["transport"] = "ssh" if adapter is panos else "restconf"
             if use_ntc_defaults:
                 self.logger.info(
@@ -341,7 +365,10 @@ class DiscoverDevice(Job):
                     _host(device), username, password, port=restconf_port, verify=verify_tls
                 )
             try:
-                report["discovery"] = adapter.collect(client, use_ntc_defaults=use_ntc_defaults)
+                collect_options = {"use_ntc_defaults": use_ntc_defaults}
+                if adapter is panos:
+                    collect_options["expected_vm_uuid"] = expected_vm_uuid
+                report["discovery"] = adapter.collect(client, **collect_options)
             finally:
                 client.close()
                 report["requests"] = client.trace

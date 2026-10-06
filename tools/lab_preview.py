@@ -9,7 +9,9 @@ before opening a device connection. An explicit ``endpoint_host`` or
 ``NAUTOBOT_DISCOVERY_ENDPOINT_HOST`` selects a literal IP only for this process
 when native primary-IP validation requires an unobserved Interface. Credentials
 are resolved by the normal
-Device Secrets Group code and are never printed. The default verifies TLS; set
+Device Secrets Group code and are never printed. An optional explicit
+``expected_vm_uuid`` or ``NAUTOBOT_DISCOVERY_EXPECTED_VM_UUID`` enables the
+reviewed PA-VM KVM identity binding without inventing a serial. The default verifies TLS; set
 ``NAUTOBOT_DISCOVERY_VERIFY_TLS=false`` for a lab self-signed certificate.
 """
 
@@ -23,6 +25,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import UUID
 
 WRITE_SQL = re.compile(r"^\s*(?:INSERT|UPDATE|DELETE|REPLACE|TRUNCATE)\b", re.IGNORECASE)
 
@@ -49,6 +52,7 @@ def run(
     ssh_strict=None,
     allow_blocked=None,
     endpoint_host=None,
+    expected_vm_uuid=None,
 ):
     """Collect structured live data and verify a zero-write Job preview."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -75,6 +79,12 @@ def run(
     endpoint_host = endpoint_host or os.environ.get("NAUTOBOT_DISCOVERY_ENDPOINT_HOST")
     if endpoint_host:
         endpoint_host = str(ip_address(endpoint_host))
+    expected_vm_uuid = expected_vm_uuid or os.environ.get("NAUTOBOT_DISCOVERY_EXPECTED_VM_UUID")
+    if expected_vm_uuid:
+        parsed_uuid = UUID(str(expected_vm_uuid))
+        if parsed_uuid.int in (0, (1 << 128) - 1):
+            raise ValueError("Expected PAN-OS VM UUID cannot be a sentinel UUID")
+        expected_vm_uuid = str(parsed_uuid)
     device = Device.objects.get(pk=device_id)
     expected_adapter = expected_adapter or os.environ.get("NAUTOBOT_DISCOVERY_EXPECTED_ADAPTER")
     adapter_name = _adapter(device).__name__.rsplit(".", 1)[-1]
@@ -123,6 +133,7 @@ def run(
                         ipam_override_networks=ipam_override_networks,
                         ipam_group_user_vrfs=ipam_group_user_vrfs,
                         ipam_local_vrf_names=ipam_local_vrf_names,
+                        expected_vm_uuid=expected_vm_uuid,
                     )
                 except RuntimeError:
                     failure_report = job.request.meta.get("discovery_report", {})
@@ -152,6 +163,7 @@ def run(
         "device_id": str(device.pk),
         "adapter": adapter_name,
         "endpoint_host": endpoint_host,
+        "expected_vm_uuid": expected_vm_uuid,
         "dry_run": True,
         "use_ntc_defaults": use_ntc_defaults,
         "applied": False,

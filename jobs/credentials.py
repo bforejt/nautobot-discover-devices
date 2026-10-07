@@ -21,15 +21,19 @@ def resolve_credentials(device, override_group=None, *, transport="restconf"):
     except ImportError:
         cancellation_errors = ()
 
-    if transport not in ("restconf", "ssh", "esxi"):
+    if transport not in ("restconf", "ssh", "esxi", "proxmox", "proxmox_ssh"):
         raise CredentialsError("Unsupported discovery credential transport")
     names = {
         "ssh": ("TYPE_SSH", "TYPE_GENERIC"),
+        "proxmox": ("TYPE_HTTP", "TYPE_REST"),
+        "proxmox_ssh": ("TYPE_SSH",),
         "esxi": ("TYPE_HTTP", "TYPE_REST", "TYPE_GENERIC"),
         "restconf": ("TYPE_RESTCONF", "TYPE_HTTP", "TYPE_REST", "TYPE_GENERIC"),
     }[transport]
     access_description = {
         "ssh": "SSH or Generic",
+        "proxmox": "HTTP or REST",
+        "proxmox_ssh": "SSH",
         "esxi": "HTTP, REST or Generic",
         "restconf": "RESTCONF, HTTP, REST or Generic",
     }[transport]
@@ -61,7 +65,7 @@ def resolve_credentials(device, override_group=None, *, transport="restconf"):
                 ) from None
         return None
 
-    if transport == "esxi":
+    if transport in ("esxi", "proxmox", "proxmox_ssh"):
         # A partial HTTP association must never combine with a REST/Generic
         # password. Resolve a complete pair at each eligible access type.
         for access_type in access_types:

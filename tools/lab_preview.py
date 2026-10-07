@@ -63,6 +63,11 @@ def run(
     esxi_port=None,
     esxi_new_interface_state=None,
     esxi_guest_mappings=None,
+    proxmox_port=None,
+    expected_proxmox_node=None,
+    expected_proxmox_host_uuid=None,
+    proxmox_ssh_host_key=None,
+    proxmox_guest_mappings="",
 ):
     """Collect structured live data and verify a zero-write Job preview."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -114,6 +119,20 @@ def run(
         raise ValueError("ESXi new interface state must be report-only, enabled or disabled")
     if esxi_guest_mappings is None:
         esxi_guest_mappings = os.environ.get("NAUTOBOT_DISCOVERY_ESXI_GUEST_MAPPINGS", "")
+    if proxmox_port is None:
+        proxmox_port = int(os.environ.get("NAUTOBOT_DISCOVERY_PROXMOX_PORT", "8006"))
+    expected_proxmox_node = expected_proxmox_node or os.environ.get(
+        "NAUTOBOT_DISCOVERY_EXPECTED_PROXMOX_NODE"
+    )
+    expected_proxmox_host_uuid = expected_proxmox_host_uuid or os.environ.get(
+        "NAUTOBOT_DISCOVERY_EXPECTED_PROXMOX_HOST_UUID"
+    )
+    proxmox_ssh_host_key = proxmox_ssh_host_key or os.environ.get(
+        "NAUTOBOT_DISCOVERY_PROXMOX_SSH_HOST_KEY"
+    )
+    proxmox_guest_mappings = proxmox_guest_mappings or os.environ.get(
+        "NAUTOBOT_DISCOVERY_PROXMOX_GUEST_MAPPINGS", ""
+    )
     device = Device.objects.get(pk=device_id)
     expected_adapter = expected_adapter or os.environ.get("NAUTOBOT_DISCOVERY_EXPECTED_ADAPTER")
     adapter_name = _adapter(device).__name__.rsplit(".", 1)[-1]
@@ -167,6 +186,11 @@ def run(
                         esxi_port=esxi_port,
                         esxi_new_interface_state=esxi_new_interface_state,
                         esxi_guest_mappings=esxi_guest_mappings,
+                        proxmox_port=proxmox_port,
+                        expected_proxmox_node=expected_proxmox_node or "",
+                        expected_proxmox_host_uuid=expected_proxmox_host_uuid or "",
+                        proxmox_ssh_host_key=proxmox_ssh_host_key or "",
+                        proxmox_guest_mappings=proxmox_guest_mappings,
                     )
                 except RuntimeError:
                     failure_report = job.request.meta.get("discovery_report", {})
@@ -201,6 +225,8 @@ def run(
         "esxi_port": esxi_port if adapter_name == "esxi" else None,
         "esxi_new_interface_state": esxi_new_interface_state if adapter_name == "esxi" else None,
         "esxi_guest_policy": report.get("esxi_guest_policy"),
+        "proxmox_guest_policy": report.get("proxmox_guest_policy"),
+        "proxmox_guest_plan": report["plan"].get("proxmox_guests", {}),
         "esxi_guest_plan": report["plan"].get("esxi_guests", {}),
         "dry_run": True,
         "use_ntc_defaults": use_ntc_defaults,

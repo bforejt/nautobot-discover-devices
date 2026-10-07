@@ -13,7 +13,7 @@ from nautobot.dcim.models import (
 from nautobot.extras.models import Status
 from nautobot.ipam.models import Namespace
 
-from .adapters import cisco_iosxe, esxi, panos
+from .adapters import cisco_iosxe, esxi, panos, proxmox
 from .exceptions import InventoryError
 from .nautobot_capacity import (
     clean_capacity_device,
@@ -68,6 +68,13 @@ from .nautobot_panos_vpn import (
     save_panos_vpn_catalog,
     snapshot_panos_vpn,
     validate_panos_vpn_objects,
+)
+from .nautobot_proxmox_guests import (
+    lock_proxmox_guests,
+    save_proxmox_guests,
+    snapshot_proxmox_guests,
+    stage_proxmox_guests,
+    validate_proxmox_guests,
 )
 from .nautobot_stack import save_stack, snapshot_stack, stack_objects, validate_stack
 from .nautobot_vlans import (
@@ -150,6 +157,7 @@ def snapshot_inventory(device, *, lock=False, discovery=None, vlan_group=None, i
         "ipam_inventory": snapshot_ipam(device, ipam_policy, lock=lock, discovery=discovery),
         "capacity_inventory": snapshot_capacity(device, lock=lock, discovery=discovery),
         "esxi_guest_inventory": snapshot_esxi_guests(device, lock=lock, discovery=discovery),
+        "proxmox_guest_inventory": snapshot_proxmox_guests(device, lock=lock, discovery=discovery),
         "panos_interface_inventory": snapshot_panos_interfaces(
             device, lock=lock, discovery=discovery
         ),
@@ -277,6 +285,7 @@ def _objects(
         canonical_interface_name = {
             "panos": panos,
             "esxi": esxi,
+            "proxmox": proxmox,
             "cisco_iosxe": cisco_iosxe,
         }[plan["adapter"]].canonical_interface_name
         objects = {canonical_interface_name(row.name): row for row in interfaces}
@@ -321,6 +330,7 @@ def _objects(
         "interfaces": pan_interfaces,
         "vpn": vpn_objects,
         "esxi_guests": stage_esxi_guests(plan, device),
+        "proxmox_guests": stage_proxmox_guests(plan, device),
     }
     return (
         version,
@@ -435,7 +445,7 @@ def validate_plan(
         if device.virtual_chassis is not None and device.virtual_chassis._state.adding:
             excluded.append("virtual_chassis")
         if (
-            plan["adapter"] in ("panos", "esxi")
+            plan["adapter"] in ("panos", "esxi", "proxmox")
             or plan.get("capacity", {}).get("preserve_custom_fields")
             or plan.get("capacity", {}).get("updates")
         ):
@@ -451,7 +461,8 @@ def validate_plan(
     for interface in creates + updates:
         _validate_interface(
             interface,
-            preserve_custom_fields=plan["adapter"] == "esxi" and not interface._state.adding,
+            preserve_custom_fields=plan["adapter"] in ("esxi", "proxmox")
+            and not interface._state.adding,
         )
     for interface, module in ownerships:
         _validate_ownership(interface, module, device)
@@ -472,6 +483,7 @@ def validate_plan(
     validate_panos_interfaces(domains["interfaces"], device)
     validate_panos_vpn_objects(domains["vpn"], device)
     validate_esxi_guests(domains["esxi_guests"])
+    validate_proxmox_guests(domains["proxmox_guests"])
 
 
 def _device_work(plan, domains):
@@ -519,6 +531,7 @@ def apply_discovery(
             if len(locked) != len(namespace_ids):
                 raise InventoryError("A selected IPAM Namespace no longer exists")
         lock_esxi_guests(discovery)
+        lock_proxmox_guests(discovery)
         context = Device.objects.values("platform_id", "device_type__manufacturer_id").get(
             pk=device.pk
         )
@@ -529,7 +542,7 @@ def apply_discovery(
             Platform.objects.select_for_update().get(pk=context["platform_id"])
         pair_policy = (discovery.get("ha_pair") or {}).get("policy")
         device_ids = {str(device.pk)}
-        if discovery.get("adapter") == "esxi" and discovery.get("guest_policy"):
+        if discovery.get("adapter") in ("esxi", "proxmox") and discovery.get("guest_policy"):
             device_ids.update(row["device"]["id"] for row in discovery["guest_policy"]["mappings"])
         if pair_policy:
             from nautobot.dcim import models as dcim_models
@@ -607,7 +620,7 @@ def apply_discovery(
             device.software_version = version
         if _device_work(plan, domains):
             if (
-                plan["adapter"] in ("panos", "esxi")
+                plan["adapter"] in ("panos", "esxi", "proxmox")
                 or plan.get("capacity", {}).get("preserve_custom_fields")
                 or plan.get("capacity", {}).get("updates")
             ):
@@ -620,7 +633,7 @@ def apply_discovery(
             save_vlan_catalog(vlans)
             validate_vlan_objects(vlans, device)
         for interface in creates + updates:
-            if plan["adapter"] == "esxi" and not interface._state.adding:
+            if plan["adapter"] in ("esxi", "proxmox") and not interface._state.adding:
                 save_capacity_device(interface)
             else:
                 interface.validated_save()
@@ -641,5 +654,6 @@ def apply_discovery(
         save_panos_vpn_catalog(domains["vpn"])
         save_panos_vpn_assignments(domains["vpn"])
         save_esxi_guests(domains["esxi_guests"])
+        save_proxmox_guests(domains["proxmox_guests"])
         save_console_ports(consoles)
         return plan

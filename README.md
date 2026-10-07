@@ -25,7 +25,12 @@ compatible models; unavailable models retain report-only behavior. The
 defines explicit UUID binding for PA-VM on KVM and reviewed virtual templates;
 the [first-pass history](docs/panos-discovery.md) records initial lab evidence.
 Physical-appliance capability remains unresolved.
-The job defaults to a preview.
+Version `0.25.0-dev` adds [Proxmox VE discovery](docs/proxmox-discovery.md) with
+token-authenticated HTTPS JSON and independently credentialed Linux JSON reads.
+It verifies the API-local host, fills eligible physical NICs and software, and
+links explicitly mapped QEMU guests to existing Devices through **Hosted On**.
+Linux networking, QEMU/LXC allocation and devices, cluster and storage remain
+source-backed observations. The job defaults to a preview.
 
 The `0.23.0-dev` increment passed 1,076 offline tests, 241 native rollback
 checks and live strict-SSH preview/apply/repeat on the original HA member,
@@ -93,6 +98,7 @@ Provide this repository through Nautobot's Git Repositories datasource with
 `Device Discovery / Discover Device` in Nautobot's Jobs administration. The
 `jobs/__init__.py` entry point registers the job. Workers need Nautobot and
 `requests`; PAN-OS workers also need `netmiko` (which supplies Paramiko).
+Proxmox workers need `paramiko` for direct, host-key-verified Linux SSH reads.
 Repository synchronization does not install Python packages.
 
 Before running, select an existing Device with:
@@ -830,6 +836,13 @@ host HTTPS API for independent NFV hosts. It verifies hardware identity, discove
 eligible host NICs and software, and links explicitly mapped existing guest Devices
 through the existing **Hosted On** relationship. NFV networking, capacity and storage
 remain source-backed report observations.
+
+[Proxmox discovery](docs/proxmox-discovery.md) follows the same NFV host scope.
+It adds current Linux NIC administrative state and MTU, retains applied/runtime
+and staged configuration separately, and requires exact hardware/PCI/driver
+joins before physical NIC writes. QEMU Hosted On mappings require a unique
+current SMBIOS UUID and verified local registration; LXC and templates remain
+report-only. Credentials use separate HTTP token and SSH associations.
 
 Run offline regressions without a Nautobot installation or lab credentials:
 

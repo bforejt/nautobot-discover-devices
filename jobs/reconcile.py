@@ -3,7 +3,7 @@
 import re
 from collections import defaultdict
 
-from .adapters import cisco_iosxe, esxi, panos
+from .adapters import cisco_iosxe, esxi, panos, proxmox
 from .adapters.cisco_iosxe import canonical_interface_name, canonical_software_version
 from .reconcile_capacity import plan_capacity
 from .reconcile_components import plan_components
@@ -16,6 +16,8 @@ from .reconcile_panos_interfaces import plan_panos_interfaces
 from .reconcile_panos_ipam import plan_panos_ipam
 from .reconcile_panos_management import plan_panos_management
 from .reconcile_panos_vpn import plan_panos_vpn
+from .reconcile_proxmox import prepare_proxmox, validate_proxmox_identity
+from .reconcile_proxmox_guests import plan_proxmox_guests
 from .reconcile_route_targets import plan_route_targets
 from .reconcile_stack import plan_stack
 from .reconcile_vlans import plan_vlans
@@ -310,15 +312,22 @@ def build_plan(discovery, existing):
     """
     adapter_name = discovery.get("adapter")
     if (
-        adapter_name not in ("cisco_iosxe", "panos", "esxi")
+        adapter_name not in ("cisco_iosxe", "panos", "esxi", "proxmox")
         or discovery.get("schema_version") != 1
-        or (adapter_name in ("panos", "esxi") and type(discovery.get("schema_version")) is not int)
+        or (
+            adapter_name in ("panos", "esxi", "proxmox")
+            and type(discovery.get("schema_version")) is not int
+        )
     ):
         raise ValueError("Unsupported discovery adapter or schema version")
-    adapter = {"panos": panos, "esxi": esxi, "cisco_iosxe": cisco_iosxe}[adapter_name]
+    adapter = {"panos": panos, "esxi": esxi, "proxmox": proxmox, "cisco_iosxe": cisco_iosxe}[
+        adapter_name
+    ]
     esxi_errors = []
     if adapter is esxi:
         discovery, esxi_errors = prepare_esxi(discovery)
+    elif adapter is proxmox:
+        discovery, esxi_errors = prepare_proxmox(discovery)
     canonical_interface_name = adapter.canonical_interface_name
     canonical_software_version = adapter.canonical_software_version
 
@@ -373,8 +382,10 @@ def build_plan(discovery, existing):
     vm_identity = _panos_vm_identity(discovery, device, plan) if adapter is panos else False
     if adapter is esxi:
         vm_identity = validate_esxi_identity(discovery, device, plan)
+    elif adapter is proxmox:
+        vm_identity = validate_proxmox_identity(discovery, device, plan)
     required_identity = ["serial", "model", "hostname", "software_version"]
-    if vm_identity and (_blank(device.get("serial")) or adapter is esxi):
+    if vm_identity and (_blank(device.get("serial")) or adapter in (esxi, proxmox)):
         required_identity.remove("serial")
     for field in required_identity:
         if _blank(identity.get(field)):
@@ -406,7 +417,15 @@ def build_plan(discovery, existing):
         if not device.get("platform_id"):
             plan["errors"].append(
                 "Assign the Device's %s platform before loading software"
-                % ("PAN-OS" if adapter is panos else "ESXi" if adapter is esxi else "IOS XE")
+                % (
+                    "PAN-OS"
+                    if adapter is panos
+                    else "ESXi"
+                    if adapter is esxi
+                    else "Proxmox"
+                    if adapter is proxmox
+                    else "IOS XE"
+                )
             )
         version = canonical_software_version(identity["software_version"])
         if version is None:
@@ -472,6 +491,8 @@ def build_plan(discovery, existing):
             if adapter is panos
             else esxi.observed_physical_ethernet(fact, name)
             if adapter is esxi
+            else proxmox.observed_physical_ethernet(fact, name)
+            if adapter is proxmox
             else _observed_physical_ethernet(fact, name)
         )
         if capability_unknown:
@@ -492,6 +513,8 @@ def build_plan(discovery, existing):
                     if adapter is panos
                     else "Reviewed ESXi physical Ethernet evidence; maximum capability unknown"
                     if adapter is esxi
+                    else "Reviewed Proxmox physical Ethernet evidence; maximum capability unknown"
+                    if adapter is proxmox
                     else UNKNOWN_ETHERNET_TYPE_SOURCE
                 )
             plan["warnings"].append(
@@ -676,6 +699,12 @@ def build_plan(discovery, existing):
         )
         for key in ("conflicts", "errors", "warnings"):
             plan[key].extend(plan["esxi_guests"][key])
+    if adapter is proxmox:
+        plan["proxmox_guests"] = plan_proxmox_guests(
+            discovery, existing, identity_verified=not plan["errors"]
+        )
+        for key in ("conflicts", "errors", "warnings"):
+            plan[key].extend(plan["proxmox_guests"][key])
     plan["summary"] = {
         "device_fields_updated": len(plan["device_updates"]),
         "interfaces_created": len(plan["interface_creates"]),
@@ -703,6 +732,8 @@ def build_plan(discovery, existing):
     }
     if adapter is esxi:
         plan["summary"].update(plan["esxi_guests"]["summary"])
+    if adapter is proxmox:
+        plan["summary"].update(plan["proxmox_guests"]["summary"])
     return plan
 
 

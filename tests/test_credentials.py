@@ -224,5 +224,80 @@ class CredentialTests(unittest.TestCase):
                 )
 
 
+class ProxmoxCredentialTests(unittest.TestCase):
+    setUp = CredentialTests.setUp
+
+    def test_http_token_and_linux_ssh_pairs_are_selected_independently(self):
+        choices = sys.modules["nautobot.extras.choices"].SecretsGroupAccessTypeChoices
+        choices.TYPE_SSH = "SSH"
+        choices.TYPE_RESTCONF = "RESTCONF"
+        choices.TYPE_REST = "REST"
+        values = {
+            "HTTP": {"Username": "reader@pve!discovery", "Password": "api-token"},
+            "SSH": {"Username": "linux-user", "Password": "linux-password"},
+        }
+        group = SimpleNamespace(
+            get_secret_value=Mock(
+                side_effect=lambda access_type, secret_type, obj: values[access_type][secret_type]
+            )
+        )
+        device = SimpleNamespace(secrets_group=group)
+        self.assertEqual(
+            credentials.resolve_credentials(device, transport="proxmox"),
+            ("reader@pve!discovery", "api-token"),
+        )
+        self.assertEqual(
+            credentials.resolve_credentials(device, transport="proxmox_ssh"),
+            ("linux-user", "linux-password"),
+        )
+        self.assertEqual(
+            [call.kwargs["access_type"] for call in group.get_secret_value.call_args_list],
+            ["HTTP", "HTTP", "SSH", "SSH"],
+        )
+
+    def test_partial_http_pair_cannot_borrow_rest_password(self):
+        choices = sys.modules["nautobot.extras.choices"].SecretsGroupAccessTypeChoices
+        choices.TYPE_REST = "REST"
+
+        def lookup(access_type, secret_type, obj):
+            if access_type == "HTTP" and secret_type == "Username":
+                return "partial@pve!token"
+            if access_type == "HTTP":
+                raise MissingAssociation
+            return {"Username": "complete@pve!token", "Password": "paired-rest-secret"}[secret_type]
+
+        group = SimpleNamespace(get_secret_value=Mock(side_effect=lookup))
+        self.assertEqual(
+            credentials.resolve_credentials(
+                SimpleNamespace(secrets_group=group), transport="proxmox"
+            ),
+            ("complete@pve!token", "paired-rest-secret"),
+        )
+
+    def test_generic_or_api_password_is_never_an_ssh_fallback(self):
+        choices = sys.modules["nautobot.extras.choices"].SecretsGroupAccessTypeChoices
+        choices.TYPE_SSH = "SSH"
+        group = SimpleNamespace(get_secret_value=Mock(side_effect=MissingAssociation))
+        for transport in ("proxmox", "proxmox_ssh"):
+            with self.assertRaises(credentials.CredentialsError):
+                credentials.resolve_credentials(
+                    SimpleNamespace(secrets_group=group), transport=transport
+                )
+        self.assertEqual(
+            [call.kwargs["access_type"] for call in group.get_secret_value.call_args_list],
+            ["HTTP", "SSH"],
+        )
+
+    def test_provider_error_remains_sanitized_without_trying_another_pair(self):
+        group = SimpleNamespace(get_secret_value=Mock(side_effect=RuntimeError("private-token")))
+        with self.assertRaises(credentials.CredentialsError) as raised:
+            credentials.resolve_credentials(
+                SimpleNamespace(secrets_group=group), transport="proxmox"
+            )
+        self.assertNotIn("private-token", str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
+        self.assertEqual(group.get_secret_value.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

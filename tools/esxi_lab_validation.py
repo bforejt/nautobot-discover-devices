@@ -43,6 +43,7 @@ def run(
     )
 
     from jobs.adapters import esxi
+    from jobs.discovery_job import JOB_VERSION
     from jobs.nautobot_inventory import apply_discovery, snapshot_inventory
     from tools.lab_preview import run as preview
 
@@ -132,7 +133,7 @@ def run(
                 preview_path.unlink()
                 if brief["database_write_statements"] != 0:
                     raise AssertionError("Live Job preview issued database writes")
-                if initial["job_version"] != "0.24.0-dev" or initial["plan"]["errors"]:
+                if initial["job_version"] != JOB_VERSION or initial["plan"]["errors"]:
                     raise AssertionError("Live ESXi Job preview did not validate")
                 if password in json.dumps(initial):
                     raise AssertionError("Credential value entered the live report")

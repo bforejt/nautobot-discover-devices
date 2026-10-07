@@ -114,6 +114,80 @@ class RestconfTransportTests(unittest.TestCase):
             "https://[2001:db8::1]:443/restconf/data/example:leaf",
         )
 
+    def test_fleet_response_budget_stops_stream_and_closes_without_decoding(self):
+        reply = Mock(status_code=200)
+        reply.iter_content.return_value = iter([b'{"example:', b'leaf":"too large"}'])
+        self.session.get.return_value = reply
+        client = transport.RestconfClient("192.0.2.1", "user", "secret", max_response_bytes=12)
+        with self.assertRaisesRegex(transport.RestconfError, "byte budget"):
+            client.get("/data/example:leaf")
+        reply.close.assert_called_once()
+        reply.json.assert_not_called()
+        self.assertTrue(self.session.get.call_args.kwargs["stream"])
+        self.assertNotIn("too large", str(client.trace))
+
+    def test_bounded_response_decodes_complete_json(self):
+        reply = Mock(status_code=200)
+        reply.iter_content.return_value = iter([b'{"example:leaf":', b'"value"}'])
+        self.session.get.return_value = reply
+        client = transport.RestconfClient("192.0.2.1", "user", "secret", max_response_bytes=1024)
+        self.assertEqual(client.get("/data/example:leaf"), {"example:leaf": "value"})
+        reply.close.assert_called_once()
+        self.assertEqual(client.trace[0]["response_bytes"], 24)
+
+    def test_stream_failure_is_sanitized_and_closes_response(self):
+        reply = Mock(status_code=200)
+        reply.iter_content.side_effect = requests.RequestException("secret raw body")
+        self.session.get.return_value = reply
+        client = transport.RestconfClient("192.0.2.1", "user", "secret", max_response_bytes=1024)
+        with self.assertRaisesRegex(transport.RestconfError, "stream failed") as raised:
+            client.get("/data/example:leaf")
+        reply.close.assert_called_once()
+        self.assertNotIn("secret", str(raised.exception))
+
+    def test_only_explicit_fields_rejection_permits_filter_retry(self):
+        client = transport.RestconfClient("192.0.2.1", "user", "secret")
+        for payload, rejected in (
+            (
+                {
+                    "ietf-restconf:errors": {
+                        "error": [
+                            {
+                                "error-tag": "invalid-value",
+                                "error-message": "unsupported fields parameter",
+                            }
+                        ]
+                    }
+                },
+                True,
+            ),
+            (
+                {
+                    "ietf-restconf:errors": {
+                        "error": [
+                            {
+                                "error-tag": "invalid-value",
+                                "error-message": "unrelated invalid input",
+                            }
+                        ]
+                    }
+                },
+                False,
+            ),
+            ({"error": "fields were invalid"}, False),
+        ):
+            with self.subTest(payload=payload):
+                self.session.get.return_value = response(status=400, payload=payload)
+                with self.assertRaises(transport.RestconfError) as raised:
+                    client.get("/data/example:leaf?fields=name")
+                self.assertEqual(raised.exception.filter_rejected, rejected)
+                self.assertNotIn("unsupported fields", str(raised.exception))
+
+    def test_invalid_budget_is_rejected_before_session_creation(self):
+        for value in (True, 0, -1, 2.5, 128 * 1024 * 1024 + 1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                transport.RestconfClient("192.0.2.1", "user", "secret", max_response_bytes=value)
+
 
 if __name__ == "__main__":
     unittest.main()

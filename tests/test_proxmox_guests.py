@@ -109,6 +109,7 @@ class ProxmoxGuestPlannerTests(unittest.TestCase):
         raw["api"]["lxc"] = raw["api"]["qemu"]
         raw["api"]["qemu"] = []
         raw["guests"][0]["kind"] = "lxc"
+        raw["ssh"]["host"]["guest_registry"]["ids"]["100"]["type"] = "lxc"
         raw["guests"][0]["config"]["hostname"] = "VNF"
         raw["guests"][0]["current_config"]["hostname"] = "VNF"
         result = plan(source(raw))
@@ -116,16 +117,28 @@ class ProxmoxGuestPlannerTests(unittest.TestCase):
         self.assertEqual(result["creates"], [])
 
     def test_successful_permission_filtered_guest_lists_do_not_prove_complete_ownership(self):
+        for parent_grant in (0, 1):
+            raw = inventory()
+            raw["api"]["permissions"]["/vms"]["VM.Audit"] = parent_grant
+            raw["ssh"]["host"]["guest_registry"]["ids"]["101"] = {
+                "node": NODE,
+                "type": "qemu",
+                "version": 1,
+            }
+            with (
+                self.subTest(parent_grant=parent_grant),
+                self.assertRaisesRegex(proxmox.DiscoveryError, "authoritative local registrations"),
+            ):
+                source(raw)
+
+    def test_exact_authoritative_registry_proves_coverage_without_parent_propagation(self):
         raw = inventory()
         raw["api"]["permissions"]["/vms"]["VM.Audit"] = 0
         observed = source(raw)
-        self.assertEqual(
-            observed["source"]["inventory"]["completeness"]["guests"], "permission-scoped"
-        )
-        self.assertTrue(plan(observed)["errors"])
-        self.assertEqual(plan(observed)["creates"], [])
-        observed["guest_policy"] = None
-        self.assertFalse(plan(observed)["errors"])
+        self.assertIs(observed["source"]["inventory"]["completeness"]["guests"], True)
+        result = plan(observed)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(len(result["creates"]), 1)
 
     def test_existing_exact_ownership_preserves_its_uuid_and_repeat_has_no_writes(self):
         before = existing()

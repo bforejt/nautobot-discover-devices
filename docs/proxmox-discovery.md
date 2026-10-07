@@ -64,6 +64,13 @@ complete reads, permission-limited views and unavailable named attributes.
 | PVE software | Exact `/version` and `/nodes/{node}/version` `version/release/repoid` agreement | Native SoftwareVersion under the existing Platform uses exact pve-manager version, for example `9.2.2`. Kernel, Debian and package observations never substitute. |
 | CPU, memory, storage | Node status and reviewed lshw/sysfs/storage JSON | Report-only. Physical cores, logical CPUs, configured guest vCPUs, installed RAM, allocated guest RAM, storage capacity and usage remain distinct. |
 
+Some lshw releases append the system SKU to the product name. Discovery accepts
+exact `product_name + " (" + sku + ")"` only when the named DMI `product_sku`
+and/or lshw `configuration.sku` establish that same SKU. Conflicting SKU evidence
+or arbitrary suffixes fail identity validation; the native model remains the
+undecorated DMI product. This follows the
+[lshw SMBIOS reader](https://raw.githubusercontent.com/lyonel/lshw/master/src/core/dmi.cc).
+
 The [official node API implementation](https://raw.githubusercontent.com/proxmox/pve-manager/master/PVE/API2/Nodes.pm)
 distinguishes the installed pve-manager version, PVE release, build repository
 identity and kernel. Discovery preserves those reported values; it does not
@@ -87,6 +94,16 @@ hardware PCI IDs. Unmatched hardware ports and transient links remain explicit
 excluded/unresolved observations. Names and interface indices are not guessed
 or translated; `ifindex` is a runtime reference. Existing interface names,
 UUIDs, types, cable ownership and assignments are preserved.
+
+The lshw JSON capability keys can carry either `true` or a nonempty description,
+as defined by its [JSON serializer](https://raw.githubusercontent.com/lyonel/lshw/master/src/core/hw.cc).
+Description content is retained rather than parsed. False, null, numeric and
+empty values do not prove capability. Linux switch IDs and reviewed PF/VF/SF
+representor names defer physical inventory even when a driver exposes a PCI
+parent: a [representor](https://docs.kernel.org/networking/representors.html)
+is a virtual switch endpoint. The sysfs `bonding_masters` control file is not a
+netdevice and is skipped; failures reading actual netdevice attributes remain
+explicit.
 
 | NIC field | Reviewed behavior |
 | --- | --- |
@@ -182,8 +199,18 @@ The adapter requests exact permission scopes through `/access/permissions`:
 | --- | --- |
 | `/nodes/{local-node}` | `Sys.Audit` must be present. `0` is valid exact non-propagating permission, not absence. |
 | `/vms/{visible-vmid}` | `VM.Audit` must be present for each guest detail. Both guest families are collected without a running-only filter. |
-| `/vms` | `VM.Audit=1` proves propagation across the guest scope and permits complete guest coverage for explicit mappings. Without it the visible view stays `permission-scoped`. |
+| `/vms` | Parent grants are observed but cannot prove complete descendant visibility: deeper ACLs can replace inherited grants, including with `NoAccess`. |
+| Local guest registry | The fixed Linux reader parses genuine `/etc/pve/.vmlist` JSON independently. Exact local `(kind, VMID)` sets must match both API family lists; hidden, additional, foreign-node or mismatched-kind evidence blocks collection. |
 | Storage listing | Remains explicitly permission-scoped; successful/empty output does not prove complete global absence. |
+| Network configuration | Remains permission-scoped: the API can filter bridges by SDN grants despite a successful `Sys.Audit` read. Complete netlink sources remain independent. |
+
+The [pmxcfs contract](https://raw.githubusercontent.com/proxmox/pve-docs/master/pmxcfs.adoc)
+defines `.vmlist` as the cluster VM list. The
+[JSON producer](https://raw.githubusercontent.com/proxmox/pve-cluster/master/src/pmxcfs/status.c)
+defines its version, ID, node and guest-kind fields, including omission of `ids`
+for a genuinely empty registry. Remote-node records remain observations and
+never trigger peer discovery. Duplicate keys, malformed JSON and unavailable
+authoritative registry evidence cannot become healthy empty inventory.
 
 GET success is not substituted for permission proof. HTTP errors, omitted
 required scopes, malformed JSON, duplicate source identities, SSH nonzero exits,
@@ -217,35 +244,68 @@ Implementation: [transport](../jobs/transport_proxmox.py),
 
 ## Validation checkpoint
 
-The live API target reports node `pve`, PVE `9.2.2`,
-release `9.2`, build repository ID `b9984c6d90a4bd80`, seven QEMU registrations
-including two templates, no visible LXC registrations, and two visible storage
-entries. The new production HTTPS transport also passed 36 live GETs, including current/merged
-configuration, pending state and runtime for all seven QEMU registrations. The
-allowlisted API projections passed against the actual returned shapes. Network
-pending state was retained separately and credential values stayed out of the
-private API evidence artifact. These API observations alone do not establish SSH/hardware binding,
-native validation or support for other releases.
+Validated on **2026-10-07** against Proxmox VE **9.2.2**, release `9.2`,
+repository ID `b9984c6d90a4bd80`, and Nautobot **3.2.6**.
 
-The adapter regression suite covers exact endpoint identity, source
-reconstruction, permission `0` semantics, guest visibility, current/pending
-separation, secret exclusion, physical classification, nested hosts, missing
-joins and native field boundaries. Framework and guest-policy tests cover the
-shared preservation and mapping contracts. Configured Nautobot **3.2.6** passed **36 Proxmox native checks**: 18 host
-checks and 18 Hosted On checks. These cover identity/source guards, physical
-interface mapping, exact custom-field preservation, explicit BIOS UUID
-relationships, preview/repeat zero inventory writes, competing ownership and
-late-write rollback. Both harnesses completed unconditional outer rollback
-with zero persistent changes. Existing ESXi host/guest native regression
-harnesses also passed **30 checks** with zero persistent changes. The complete
-offline suite passed **1,321 tests**.
+| Live fact | Verified scope |
+| --- | --- |
+| Endpoint and node | `10.40.3.253`; API-local and independently read SSH node `pve`. |
+| Hardware | Intel(R) Client Systems `NUC8i3BEK`; SKU `BOXNUC8i3BEK`; system serial `G6BE91500LQ9`; BIOS UUID `1f261432-e23e-6911-841c-94c691a36f58`. DMI and lshw agree after exact SKU corroboration. |
+| Host NIC | One wired `nic1`, PCI `0000:00:1f.6`, driver `e1000e`, live admin up, MTU 1500 and 1,000,000 Kbps. Native maximum capability remains `Other`; current duplex does not become configured duplex. Wireless `wlp0s20f3` and transient software links remain excluded observations. |
+| Guests | Seven QEMU registrations, including two templates; no LXC registrations in the matching authoritative local registry. Five non-template guests remain observations. |
+| Storage and network | Two storage entries, current links/addresses and bridge VLANs, plus separately scoped API configuration/pending state. |
+| Privileges | Exact node `Sys.Audit` and per-guest `VM.Audit` reads succeed; root SSH can read all required DMI/sysfs/registry fields and genuine JSON tools. Parent grants do not establish guest completeness. |
 
-The live checkpoint remains API-only because usable Linux SSH credentials were
-unavailable. API success alone does not validate DMI/lshw identity binding,
-physical NIC joins, a real Job preview/apply/repeat, or the live guest
-relationship path. Those checks remain explicit outstanding work; the
-implemented discovery requires SSH and fails before writes when it cannot
-complete those sources.
+The lab lacked `lshw`; it was installed as an authorized development prerequisite.
+Discovery itself never installs tools or changes the host. No reboot was needed.
+HTTPS certificate verification was explicitly disabled for the self-signed lab
+certificate; SSH used the independently checked SHA256 host-key pin. Production
+HTTPS verification remains enabled by default.
+
+Full collection completed **50 bounded reads** and passed source reconstruction.
+The real Job exercised normal separate HTTP/SSH Secrets Group associations and
+actual environment-variable providers. Preview issued **zero inventory DML**.
+Applying its collected report created one eligible host Interface, assigned
+software `9.2.2`, and created two explicit live QEMU Hosted On links to temporary
+existing guest Devices. Repeat preserved Interface/association UUIDs and issued
+**zero inventory DML**. All fixture inventory, native apply, catalogs, Secret
+references and relationships completed unconditional outer rollback with
+**zero persistent changes**. The Lenovo `se350-lab-1` supplied only existing
+role/location/status context; Intel facts were never applied to that Device.
+
+Native fixture validation passed **41 checks**: 20 host and 21 Hosted On checks.
+Replay of the actual live source added one host check, yielding **42 checks**.
+These cover source/identity conflicts, authoritative registry discrepancies,
+exact custom-field and operator-intent preservation, missing values, competing
+ownership, zero-write previews/repeats and late-write rollback. Existing ESXi
+native regression harnesses also passed 30 checks. The complete offline suite
+passed **1,335 tests**; repository Ruff, formatting, compilation and whitespace
+checks passed.
+
+The durable [live Job harness](../tools/proxmox_lab_validation.py) accepts explicit
+BIOS UUIDs for optional temporary guest mapping proof. The
+[queued preview harness](../tools/proxmox_worker_validation.py) uses separate
+worker-readable Secret references, validates Advanced and attachment evidence,
+and removes its temporary inventory while retaining JobResult/FileProxy audit
+records. The tested package was installed with all **70 Python source hashes**
+matching; the existing Discover Device Job identity and enabled state were
+preserved, and refreshed web/worker processes loaded `0.25.0-dev`.
+
+The real Celery queued preview completed successfully as JobResult
+`358dc186-3fa0-49eb-a4e7-f8a22ab07375`. It performed all 50 reads, verified
+seven authoritative registrations, planned exactly two explicit guest links,
+and produced a JSON FileProxy identical to the Advanced report. Exact native
+row hashes remained unchanged during preview. All temporary host/guest/catalog
+inventory, Secret references and four private worker credential files were
+removed; the JobResult/FileProxy remain as audit evidence. Web and worker health
+checks passed. A missing provider-file run also failed with sanitized errors,
+restored its fixture baseline, and prompted a readability preflight in the
+queued harness before any fixture creation or enqueue.
+
+This proves the named lab host/release and real nonempty QEMU path. LXC,
+multiple physical ports, SR-IOV/switch representors, nested hosts, incomplete
+permissions and adverse lifecycle cases have fixture coverage rather than broad
+live hardware/release claims.
 
 ```bash
 python3 -m unittest discover -s tests -t .

@@ -114,6 +114,12 @@ def _inventory(host, guest_uuids, *, nic=False, build="8.4.1"):
             }
         )
         permissions["/vms/%s" % vmid] = {"VM.Audit": 1}
+    host_source["guest_registry"] = {
+        "version": 1,
+        "ids": {
+            str(row["vmid"]): {"node": node, "type": row["kind"], "version": 1} for row in guests
+        },
+    }
     return {
         "node": node,
         "api": {
@@ -387,6 +393,23 @@ def run(device_id=None):
             checks.append("existing foreign host ownership blocks reparenting without DML")
 
             cases = []
+            hidden_guest = observed((2,))
+            hidden_guest["source"]["inventory"]["ssh"]["host"]["guest_registry"]["ids"]["999"] = {
+                "node": host.name,
+                "type": "qemu",
+                "version": 1,
+            }
+            cases.append(("registered guest hidden from API source", hidden_guest))
+            absent_registration = observed((2,))
+            absent_registration["source"]["inventory"]["ssh"]["host"]["guest_registry"]["ids"].pop(
+                "101"
+            )
+            cases.append(("visible guest absent from host registry", absent_registration))
+            wrong_registry_kind = observed((2,))
+            wrong_registry_kind["source"]["inventory"]["ssh"]["host"]["guest_registry"]["ids"][
+                "101"
+            ]["type"] = "lxc"
+            cases.append(("registry guest kind disagrees with API source", wrong_registry_kind))
             missing = observed((2,))
             missing["guest_policy"]["mappings"][0]["device"]["id"] = str(uuid.uuid4())
             cases.append(("missing existing guest Device", missing))

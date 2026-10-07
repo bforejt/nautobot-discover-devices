@@ -75,6 +75,10 @@ def inventory():
         "ssh": {
             "host": {
                 "hostname": NODE,
+                "guest_registry": {
+                    "version": 1,
+                    "ids": {"100": {"node": NODE, "type": "qemu", "version": 1}},
+                },
                 "dmi": {
                     "sys_vendor": "Lenovo",
                     "product_name": "ThinkSystem SE350",
@@ -275,6 +279,41 @@ class ProxmoxTests(unittest.TestCase):
         self.assertEqual(data["identity_binding"]["node"], NODE)
         self.assertEqual(proxmox.reconstruct(data), data)
 
+    def test_lshw_sku_decoration_requires_exact_named_source_corroboration(self):
+        sku = "Lenovo_MT_7Z46_BU_Think_FM_ThinkSystem SE350"
+        for source in ("dmi", "hardware", "both"):
+            raw = inventory()
+            raw["ssh"]["hardware"]["product"] += " (" + sku + ")"
+            if source in {"dmi", "both"}:
+                raw["ssh"]["host"]["dmi"]["product_sku"] = sku
+            if source in {"hardware", "both"}:
+                raw["ssh"]["hardware"]["configuration"]["sku"] = sku
+            with self.subTest(source=source):
+                data = self.collect(raw)
+                self.assertEqual(data["identity"]["model"], "ThinkSystem SE350")
+                self.assertEqual(
+                    data["source"]["inventory"]["ssh"]["hardware"]["product"],
+                    "ThinkSystem SE350 (" + sku + ")",
+                )
+                self.assertEqual(proxmox.reconstruct(data), data)
+
+    def test_lshw_sku_unknown_suffix_and_conflicts_do_not_relax_host_binding(self):
+        for dmi_sku, hardware_sku, product in (
+            (None, None, "ThinkSystem SE350 (SKU)"),
+            ("SKU", "OTHER", "ThinkSystem SE350 (SKU)"),
+            ("SKU", "SKU", "ThinkSystem SE350 (OTHER)"),
+            ("SKU", "SKU", "Other host (SKU)"),
+            ("SKU", "SKU", "ThinkSystem SE350 (SKU) (OTHER)"),
+            ("SKU", "SKU", "ThinkSystem SE350 (SKU"),
+            ("unknown", "unknown", "ThinkSystem SE350 (unknown)"),
+        ):
+            raw = inventory()
+            raw["ssh"]["host"]["dmi"]["product_sku"] = dmi_sku
+            raw["ssh"]["hardware"]["configuration"]["sku"] = hardware_sku
+            raw["ssh"]["hardware"]["product"] = product
+            with self.subTest(product=product), self.assertRaises(proxmox.DiscoveryError):
+                self.collect(raw)
+
     def test_native_nic_requires_complete_exact_join_and_netlink_values(self):
         data = self.collect()
         row = data["interfaces"][0]
@@ -359,6 +398,77 @@ class ProxmoxTests(unittest.TestCase):
             with self.assertRaises(proxmox.DiscoveryError):
                 self.collect(raw)
 
+    def test_named_lshw_capability_description_is_affirmative_structured_evidence(self):
+        raw = inventory()
+        raw["ssh"]["hardware"]["children"][0]["capabilities"].update(
+            ethernet="Ethernet interface", physical="Physical interface"
+        )
+        data = self.collect(raw)
+        self.assertEqual([row["name"] for row in data["interfaces"]], ["eno1"])
+        self.assertEqual(
+            data["source"]["inventory"]["ssh"]["hardware"]["children"][0]["capabilities"][
+                "ethernet"
+            ],
+            "Ethernet interface",
+        )
+        self.assertEqual(proxmox.reconstruct(data), data)
+
+    def test_nonaffirmative_lshw_capability_payload_never_proves_ethernet(self):
+        for value in (False, None, "", 0, 1):
+            raw = inventory()
+            raw["ssh"]["hardware"]["children"][0]["capabilities"]["ethernet"] = value
+            with self.subTest(value=value):
+                data = self.collect(raw)
+                self.assertEqual(data["interfaces"], [])
+        self.assertFalse(proxmox._affirmative_hardware_capability(" "))
+
+    def test_switch_ports_and_representors_cannot_supply_native_physical_facts(self):
+        for port_name, switch_id in (
+            ("p0", "01234567"),
+            (None, "01234567"),
+            ("pf0", None),
+            ("pf0vf1", None),
+            ("pf0sf2", None),
+            ("p0pf1vf2", None),
+            ("c1pf0vf3", None),
+            ("c1p0pf0sf4", None),
+        ):
+            raw = inventory()
+            # Deliberately retain otherwise valid PCI/lshw/driver joins. They
+            # cannot establish a physical socket for a virtual switch endpoint.
+            raw["ssh"]["host"]["net"][0].update(phys_port_name=port_name, phys_switch_id=switch_id)
+            with self.subTest(port_name=port_name, switch_id=switch_id):
+                data = self.collect(raw)
+                self.assertEqual(data["interfaces"], [])
+                self.assertEqual(
+                    [row for row in data["excluded_interfaces"] if row["name"] == "eno1"],
+                    [
+                        {
+                            "name": "eno1",
+                            "reason": "unreviewed switch port or network function representor",
+                        }
+                    ],
+                )
+                retained = data["observations"]["host"]["sysfs"]["net"][0]
+                self.assertEqual(retained["phys_port_name"], port_name)
+                self.assertEqual(retained["phys_switch_id"], switch_id)
+                self.assertEqual(proxmox.reconstruct(data), data)
+                from tests.test_proxmox_framework import snapshot
+
+                plan = load("reconcile").build_plan(data, snapshot())
+                self.assertEqual(plan["errors"], [])
+                self.assertEqual(plan["interface_creates"], [])
+                self.assertEqual(plan["interface_updates"], [])
+                self.assertEqual(plan["summary"]["unknown_interface_capabilities"], 0)
+
+    def test_ordinary_physical_port_names_keep_exact_physical_joins(self):
+        for switch_id in (None, ""):
+            raw = inventory()
+            raw["ssh"]["host"]["net"][0].update(phys_port_name="p0", phys_switch_id=switch_id)
+            data = self.collect(raw)
+            self.assertEqual([row["name"] for row in data["interfaces"]], ["eno1"])
+            self.assertEqual(data["interfaces"][0]["speed"], 1000000)
+
     def test_system_serial_never_falls_back_to_board_uuid_or_nic(self):
         raw = inventory()
         raw["ssh"]["host"]["dmi"]["product_serial"] = "unknown"
@@ -396,6 +506,27 @@ class ProxmoxTests(unittest.TestCase):
             change(raw)
             with self.assertRaises(proxmox.DiscoveryError):
                 self.collect(raw)
+
+    def test_api_network_visibility_remains_scoped_with_complete_live_nics(self):
+        raw = inventory()
+        # Sys.Audit proves host read access, but SDN.Audit/Use may filter the
+        # bridge configuration table independently of successful Linux reads.
+        raw["api"]["node_network"] = []
+        data = self.collect(raw)
+        self.assertEqual([row["name"] for row in data["interfaces"]], ["eno1"])
+        self.assertIs(data["observations"]["completeness"]["network"], True)
+        self.assertEqual(
+            data["source"]["inventory"]["completeness"]["network_configuration"],
+            "permission-scoped",
+        )
+        self.assertEqual(
+            data["observations"]["network"]["configuration_visibility"], "permission-scoped"
+        )
+        self.assertEqual(data["observations"]["network"]["configuration"], [])
+        self.assertEqual(proxmox.reconstruct(data), data)
+        data["source"]["inventory"]["completeness"]["network_configuration"] = True
+        with self.assertRaises(proxmox.DiscoveryError):
+            proxmox.reconstruct(data)
 
     def test_guest_current_pending_runtime_and_storage_are_report_only(self):
         raw = inventory()
@@ -449,9 +580,7 @@ class ProxmoxTests(unittest.TestCase):
                 self.collect(raw)
         raw = inventory()
         raw["api"]["permissions"]["/vms"]["VM.Audit"] = 0
-        self.assertEqual(
-            self.collect(raw)["observations"]["completeness"]["guests"], "permission-scoped"
-        )
+        self.assertIs(self.collect(raw)["observations"]["completeness"]["guests"], True)
 
     def test_guest_uuid_duplicates_missing_and_lxc_remain_unresolved(self):
         for smbios in (
@@ -471,6 +600,7 @@ class ProxmoxTests(unittest.TestCase):
         raw["api"]["qemu"] = []
         raw["api"]["lxc"] = [row["summary"]]
         raw["guests"] = [row]
+        raw["ssh"]["host"]["guest_registry"]["ids"]["100"]["type"] = "lxc"
         self.assertIsNone(self.collect(raw)["observations"]["guests"][0]["identity"]["guest_uuid"])
 
     def test_forged_normalized_native_facts_or_unreviewed_source_fail(self):
@@ -541,16 +671,72 @@ class ProxmoxTests(unittest.TestCase):
         self.assertNotIn("capacity", data)
         self.assertNotIn("custom_fields", data)
 
-    def test_empty_scoped_guest_and_storage_views_are_explicit(self):
+    def test_empty_authoritative_guest_and_scoped_storage_views_are_explicit(self):
         raw = inventory()
         raw["guests"] = []
         raw["api"]["qemu"] = []
         raw["api"]["storage"] = []
         raw["api"]["permissions"]["/vms"] = {}
+        raw["ssh"]["host"]["guest_registry"] = {"version": 1}
         data = self.collect(raw)
         self.assertEqual(data["observations"]["guests"], [])
-        self.assertEqual(data["observations"]["completeness"]["guests"], "permission-scoped")
+        self.assertIs(data["observations"]["completeness"]["guests"], True)
         self.assertEqual(data["observations"]["completeness"]["storage"], "permission-scoped")
+
+    def test_authoritative_local_guest_registration_mismatches_fail_collection(self):
+        for change in (
+            lambda r: r["ssh"]["host"]["guest_registry"]["ids"].update(
+                {"101": {"node": NODE, "type": "qemu", "version": 1}}
+            ),
+            lambda r: r["ssh"]["host"]["guest_registry"]["ids"].clear(),
+            lambda r: r["ssh"]["host"]["guest_registry"]["ids"]["100"].update(node="peer"),
+            lambda r: r["ssh"]["host"]["guest_registry"]["ids"]["100"].update(type="lxc"),
+        ):
+            raw = inventory()
+            change(raw)
+            with (
+                self.subTest(change=change),
+                self.assertRaisesRegex(proxmox.DiscoveryError, "authoritative local registrations"),
+            ):
+                self.collect(raw)
+
+    def test_authoritative_registry_keeps_peers_without_querying_their_sources(self):
+        raw = inventory()
+        raw["ssh"]["host"]["guest_registry"]["ids"]["101"] = {
+            "node": "peer",
+            "type": "lxc",
+            "version": 2,
+        }
+        raw["api"]["permissions"]["/vms"] = {}
+        client = Client(raw)
+        data = proxmox.collect(client)
+        self.assertIs(data["observations"]["completeness"]["guests"], True)
+        self.assertEqual(
+            data["observations"]["host"]["sysfs"]["guest_registry"]["ids"]["101"]["node"], "peer"
+        )
+        self.assertFalse(
+            any("/nodes/peer" in call[0] or "/vms/101" in call[0] for call in client.calls)
+        )
+        self.assertEqual(proxmox.reconstruct(data), data)
+
+    def test_authoritative_registry_requires_bounded_native_typed_identities(self):
+        invalid = (
+            None,
+            {},
+            {"version": True},
+            {"version": "1"},
+            {"version": -1},
+            {"version": 1, "ids": []},
+            {"version": 1, "ids": {"0100": {"node": NODE, "type": "qemu", "version": 1}}},
+            {"version": 1, "ids": {"100": {"node": "../peer", "type": "qemu", "version": 1}}},
+            {"version": 1, "ids": {"100": {"node": NODE, "type": "other", "version": 1}}},
+            {"version": 1, "ids": {"100": {"node": NODE, "type": "qemu", "version": True}}},
+        )
+        for registry in invalid:
+            raw = inventory()
+            raw["ssh"]["host"]["guest_registry"] = registry
+            with self.subTest(registry=registry), self.assertRaises(proxmox.DiscoveryError):
+                self.collect(raw)
 
     def test_reconstruction_requires_guest_local_registration_and_grant_proofs(self):
         data = self.collect()
@@ -560,7 +746,7 @@ class ProxmoxTests(unittest.TestCase):
             lambda i: i["guests"][0]["status"].update(node="peer"),
             lambda i: i["api"]["qemu"].append(copy.deepcopy(i["api"]["qemu"][0])),
             lambda i: i["api"]["qemu"].clear(),
-            lambda i: i["api"]["permissions"]["/vms"].update({"VM.Audit": 0}),
+            lambda i: i["ssh"]["host"]["guest_registry"]["ids"]["100"].update(type="lxc"),
         )
         for change in changes:
             forged = copy.deepcopy(data)

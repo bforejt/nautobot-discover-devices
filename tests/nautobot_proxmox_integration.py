@@ -102,6 +102,7 @@ def _source(name, vendor, model, serial, *, ports=(0, 1, 2), version="9.2.2"):
         "ssh": {
             "host": {
                 "hostname": name,
+                "guest_registry": {"version": 1, "ids": {}},
                 "dmi": {
                     "sys_vendor": vendor,
                     "product_name": model,
@@ -472,7 +473,16 @@ def run(device_id=None, *, live_source_path=None):
             assert target.interfaces.get(name="eno3").enabled is True
             checks.append("complete live UP flags create an enabled native physical interface")
 
-            for reason in ("model", "serial", "vendor", "uuid-binding", "source", "missing-serial"):
+            for reason in (
+                "model",
+                "serial",
+                "vendor",
+                "uuid-binding",
+                "source",
+                "missing-serial",
+                "hidden-registration",
+                "missing-guest-registry",
+            ):
                 bad_raw = copy.deepcopy(raw)
                 hardware, dmi = bad_raw["ssh"]["hardware"], bad_raw["ssh"]["host"]["dmi"]
                 if reason == "model":
@@ -488,6 +498,14 @@ def run(device_id=None, *, live_source_path=None):
                     bad["identity_binding"]["expected_uuid"] = str(uuid.uuid4())
                 elif reason == "source":
                     bad["source"]["inventory"]["api"]["version"]["version"] = "9.2.3"
+                elif reason == "hidden-registration":
+                    bad["source"]["inventory"]["ssh"]["host"]["guest_registry"]["ids"]["999"] = {
+                        "node": target.name,
+                        "type": "qemu",
+                        "version": 1,
+                    }
+                elif reason == "missing-guest-registry":
+                    bad["source"]["inventory"]["ssh"]["host"].pop("guest_registry")
                 before_bad = snapshot_inventory(target, discovery=bad)
                 with CaptureQueriesContext(connection) as captured:
                     try:

@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import io
 import json
 import sys
 import unittest
@@ -423,6 +424,95 @@ class ProxmoxTransportTests(unittest.TestCase):
         self.assertNotIn("/etc/network", sources.HOST_SCRIPT)
         self.assertNotIn("subprocess", sources.HOST_SCRIPT)
         compile(sources.HOST_SCRIPT, "fixed-reader", "exec")
+
+    def test_fixed_host_reader_skips_network_class_control_files(self):
+        opened = []
+
+        def source_open(path, mode="r", **_options):
+            opened.append(path)
+            if path.startswith("/sys/class/net/bonding_masters"):
+                raise NotADirectoryError
+            return (
+                io.BytesIO(b'{"version":1}')
+                if path == "/etc/pve/.vmlist"
+                else io.StringIO("fixture")
+            )
+
+        def source_glob(pattern):
+            return (
+                ["/sys/class/net/bonding_masters", "/sys/class/net/eno1"]
+                if pattern == "/sys/class/net/*"
+                else []
+            )
+
+        capture = io.StringIO()
+        with (
+            patch("builtins.open", source_open),
+            patch("glob.glob", side_effect=source_glob),
+            patch("os.path.isdir", side_effect=lambda path: path == "/sys/class/net/eno1"),
+            patch("os.path.islink", return_value=False),
+            patch("sys.stdout", capture),
+        ):
+            exec(sources.HOST_SCRIPT, {})
+        result = json.loads(capture.getvalue())
+        self.assertEqual(result["errors"], [])
+        self.assertEqual([row["name"] for row in result["net"]], ["eno1"])
+        self.assertFalse(any("bonding_masters" in path for path in opened))
+
+    def test_fixed_registry_reader_rejects_duplicate_truncated_and_oversized_json(self):
+        payloads = (
+            b'{"version":1,"ids":{"100":{},"100":{"secret":"DO_NOT_PRINT"}}}',
+            b'{"version":1,"version":2}',
+            b'{"version":1',
+            b'{"version":NaN}',
+            b"\xff",
+            b" " * (4 * 1024 * 1024 + 1),
+        )
+        for payload in payloads:
+
+            def source_open(path, mode="r", _payload=payload, **_options):
+                return (
+                    io.BytesIO(_payload) if path == "/etc/pve/.vmlist" else io.StringIO("fixture")
+                )
+
+            capture = io.StringIO()
+            with (
+                self.subTest(payload=payload[:64]),
+                patch("builtins.open", source_open),
+                patch("glob.glob", return_value=[]),
+                patch("sys.stdout", capture),
+            ):
+                exec(sources.HOST_SCRIPT, {})
+            result = json.loads(capture.getvalue())
+            self.assertIsNone(result["guest_registry"])
+            self.assertTrue(result["errors"])
+            self.assertNotIn("DO_NOT_PRINT", capture.getvalue())
+
+    def test_fixed_registry_reader_returns_native_json_and_requires_the_file(self):
+        registry = {"version": 1, "ids": {"100": {"node": NODE, "type": "qemu", "version": 1}}}
+
+        def source_open(path, mode="r", **_options):
+            return (
+                io.BytesIO(json.dumps(registry).encode())
+                if path == "/etc/pve/.vmlist"
+                else io.StringIO("fixture")
+            )
+
+        capture = io.StringIO()
+        with (
+            patch("builtins.open", source_open),
+            patch("glob.glob", return_value=[]),
+            patch("sys.stdout", capture),
+        ):
+            exec(sources.HOST_SCRIPT, {})
+        result = json.loads(capture.getvalue())
+        self.assertEqual(result["guest_registry"], registry)
+        self.assertEqual(result["errors"], [])
+        capture = io.StringIO()
+        with patch("builtins.open", side_effect=FileNotFoundError), patch("sys.stdout", capture):
+            exec(sources.HOST_SCRIPT, {})
+        self.assertIsNone(json.loads(capture.getvalue())["guest_registry"])
+        self.assertTrue(json.loads(capture.getvalue())["errors"])
 
     def test_ssh_drains_stdout_and_stderr_through_eof_without_raw_diagnostics(self):
         self.channel = Channel(b'[{"ifname":"eno1"}]', SECRET.encode())

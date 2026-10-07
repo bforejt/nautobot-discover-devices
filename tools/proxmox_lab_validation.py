@@ -9,7 +9,10 @@ In configured Nautobot, call ``run()`` with explicit function arguments, or set
 NAUTOBOT_DISCOVERY_DEVICE_ID and NAUTOBOT_PROXMOX_HOST, TOKEN_ID, TOKEN_SECRET,
 SSH_USERNAME, SSH_PASSWORD and NODE (each with the NAUTOBOT_PROXMOX_ prefix).
 Optional EXPECTED_HOST_UUID, HOST_KEY_SHA256, SOURCE_PATH and REPORT_PATH share
-that prefix. VERIFY_TLS defaults to true; false is an explicit lab exception.
+that prefix. GUEST_VM_UUIDS accepts a JSON list of explicitly selected observed
+QEMU BIOS UUIDs; GUEST_ANCHOR_DEVICE_ID selects an existing NFV Device whose
+catalog and intent are copied into temporary guest Devices. No existing guest
+Device is changed. VERIFY_TLS defaults to true; false is an explicit lab exception.
 Keep credentials out of shell command arguments and captured terminal output.
 """
 
@@ -73,6 +76,8 @@ def run(
     port=8006,
     source_path=None,
     report_path=None,
+    guest_vm_uuids=(),
+    guest_anchor_device_id=None,
 ):
     """Collect live data, preview the real Job, apply/repeat, then roll back all DML."""
     from django.db import connection, transaction
@@ -90,6 +95,7 @@ def run(
         SecretsGroupSecretTypeChoices,
     )
     from nautobot.extras.models import (
+        CustomField,
         Relationship,
         RelationshipAssociation,
         Secret,
@@ -100,6 +106,7 @@ def run(
     from jobs.adapters import proxmox
     from jobs.discovery_job import JOB_VERSION
     from jobs.nautobot_inventory import apply_discovery, snapshot_inventory
+    from jobs.proxmox_guest_policy import canonical_uuid
     from jobs.transport_proxmox import ProxmoxClient
     from tools.lab_preview import run as preview
 
@@ -107,6 +114,11 @@ def run(
         raise ValueError("Lab Job TLS verification must be an explicit boolean")
     if not isinstance(expected_node, str) or not expected_node:
         raise ValueError("Select the expected Proxmox API-local node explicitly")
+    if not isinstance(guest_vm_uuids, (list, tuple)) or len(guest_vm_uuids) > 4096:
+        raise ValueError("Explicit Proxmox lab guest UUIDs must be a list of at most 4096 UUIDs")
+    guest_vm_uuids = tuple(canonical_uuid(value) for value in guest_vm_uuids)
+    if None in guest_vm_uuids or len(set(guest_vm_uuids)) != len(guest_vm_uuids):
+        raise ValueError("Explicit Proxmox lab guest UUIDs must be unique non-sentinel BIOS UUIDs")
     models = (
         Device,
         DeviceType,
@@ -114,6 +126,7 @@ def run(
         Manufacturer,
         Platform,
         SoftwareVersion,
+        CustomField,
         Relationship,
         RelationshipAssociation,
         Secret,
@@ -121,10 +134,22 @@ def run(
         SecretsGroupAssociation,
     )
     before_counts = {model._meta.label: model.objects.count() for model in models}
-    anchor = Device.objects.select_related("location", "role", "status").get(pk=anchor_device_id)
+    anchor = Device.objects.select_related(
+        "device_type", "platform", "location", "role", "status"
+    ).get(pk=anchor_device_id)
+    guest_anchor = (
+        Device.objects.select_related("device_type", "platform", "location", "role", "status").get(
+            pk=guest_anchor_device_id
+        )
+        if guest_anchor_device_id
+        else anchor
+    )
+    guest_anchor_before = snapshot_inventory(guest_anchor)
+    guest_anchor_custom = copy.deepcopy(guest_anchor._custom_field_data)
     anchor_before = snapshot_inventory(anchor)
     anchor_custom = copy.deepcopy(anchor._custom_field_data)
     relationships_before = list(RelationshipAssociation.objects.order_by("pk").values())
+    relationship_definitions_before = list(Relationship.objects.order_by("pk").values())
     with ProxmoxClient(
         host,
         token_id,
@@ -146,6 +171,18 @@ def run(
         raise AssertionError("Live host must supply corroborated manufacturer and model")
     if not identity.get("serial") and not expected_host_uuid:
         raise AssertionError("A host without chassis serial requires an explicit DMI UUID binding")
+    for vm_uuid in guest_vm_uuids:
+        observed = [
+            row
+            for row in source["observations"]["guests"]
+            if row.get("identity", {}).get("guest_uuid") == vm_uuid
+        ]
+        if (
+            len(observed) != 1
+            or observed[0].get("kind") != "qemu"
+            or observed[0].get("identity", {}).get("unique") is not True
+        ):
+            raise AssertionError("Explicit lab guest UUID lacks unique source-backed QEMU identity")
     if source_path:
         _write_private(source_path, source)
     token = uuid4().hex[:12]
@@ -212,6 +249,26 @@ def run(
                 )
                 device.validated_save()
                 device_before = snapshot_inventory(device)
+                guest_mappings, guests_before = [], {}
+                for index, vm_uuid in enumerate(guest_vm_uuids):
+                    guest = Device(
+                        name="proxmox-live-guest-" + token + "-" + str(index),
+                        device_type=guest_anchor.device_type,
+                        platform=guest_anchor.platform,
+                        location=guest_anchor.location,
+                        role=guest_anchor.role,
+                        status=guest_anchor.status,
+                        serial="",
+                    )
+                    guest._custom_field_data = copy.deepcopy(guest_anchor_custom)
+                    guest.validated_save()
+                    guest_mappings.append({"vm_uuid": vm_uuid, "device": str(guest.pk)})
+                    guests_before[str(guest.pk)] = snapshot_inventory(guest)
+                mapped_ids = set(guests_before)
+                mappings_json = json.dumps(guest_mappings) if guest_mappings else ""
+                associations_before_preview = list(
+                    RelationshipAssociation.objects.order_by("pk").values()
+                )
                 with tempfile.NamedTemporaryFile(
                     prefix="proxmox-live-preview-", suffix=".json", delete=False
                 ) as temporary:
@@ -226,6 +283,7 @@ def run(
                         expected_proxmox_node=expected_node,
                         expected_proxmox_host_uuid=expected_host_uuid,
                         proxmox_ssh_host_key=host_key_sha256,
+                        proxmox_guest_mappings=mappings_json,
                         report_path=str(preview_path),
                     )
                     initial = json.loads(preview_path.read_text(encoding="utf-8"))
@@ -241,12 +299,40 @@ def run(
                     raise AssertionError("API/SSH host identity changed between collection and Job")
                 if snapshot_inventory(Device.objects.get(pk=device.pk)) != device_before:
                     raise AssertionError("Live Job preview changed native inventory")
+                if (
+                    list(RelationshipAssociation.objects.order_by("pk").values())
+                    != associations_before_preview
+                ):
+                    raise AssertionError("Live Job preview changed existing native relationships")
+                if guest_mappings and (
+                    initial["plan"]["proxmox_guests"]["summary"]["hosted_on_created"]
+                    != len(guest_mappings)
+                ):
+                    raise AssertionError("Live Job preview did not plan every explicit guest link")
                 _assert_credentials_absent(
                     initial, token_id, token_secret, ssh_username, ssh_password
                 )
                 applied = apply_discovery(initial["discovery"], device)
                 device.refresh_from_db()
                 after = snapshot_inventory(device, discovery=initial["discovery"])
+                hosted_on = after["proxmox_guest_inventory"]["associations"]
+                if guest_mappings:
+                    relationship_id = initial["proxmox_guest_policy"]["relationship"]["id"]
+                    if (
+                        len(hosted_on) != len(guest_mappings)
+                        or {row["destination_id"] for row in hosted_on} != mapped_ids
+                        or any(
+                            row["source_id"] != str(device.pk)
+                            or row["source_type"] != "dcim.device"
+                            or row["destination_type"] != "dcim.device"
+                            or row["relationship_id"] != relationship_id
+                            for row in hosted_on
+                        )
+                        or applied["summary"]["hosted_on_created"] != len(guest_mappings)
+                    ):
+                        raise AssertionError(
+                            "Live Proxmox apply did not create exact guest ownership"
+                        )
                 with CaptureQueriesContext(connection) as captured:
                     repeated = apply_discovery(initial["discovery"], device)
                 if any(WRITE_SQL.match(row["sql"]) for row in captured.captured_queries):
@@ -258,6 +344,24 @@ def run(
                     != after
                 ):
                     raise AssertionError("Unchanged Proxmox repeat changed native inventory")
+                if guest_mappings and repeated["summary"]["hosted_on_created"] != 0:
+                    raise AssertionError("Unchanged live Proxmox repeat recreated guest ownership")
+                for guest_id, baseline in guests_before.items():
+                    guest = Device.objects.get(pk=guest_id)
+                    if (
+                        snapshot_inventory(guest) != baseline
+                        or guest._custom_field_data != guest_anchor_custom
+                    ):
+                        raise AssertionError(
+                            "Guest mapping changed temporary guest inventory or intent"
+                        )
+                if (
+                    list(Relationship.objects.order_by("pk").values())
+                    != relationship_definitions_before
+                ):
+                    raise AssertionError(
+                        "Live Proxmox mapping changed existing relationship schema"
+                    )
                 if (
                     device.name != "proxmox-live-validation-" + token
                     or device.platform_id != platform.pk
@@ -274,6 +378,9 @@ def run(
                     "software_version": after["device"]["software_version"],
                     "interfaces": [row["name"] for row in after["interfaces"]],
                     "visible_guests": len(initial["discovery"]["observations"]["guests"]),
+                    "guest_vm_uuids": list(guest_vm_uuids),
+                    "hosted_on_created": len(hosted_on),
+                    "hosted_on_associations": hosted_on,
                     "preview_inventory_dml": 0,
                     "repeat_inventory_dml": 0,
                     "apply_summary": applied["summary"],
@@ -295,10 +402,14 @@ def run(
     if before_counts != {model._meta.label: model.objects.count() for model in models}:
         raise AssertionError("Live lab validation left persistent inventory or Secret records")
     restored_anchor = Device.objects.get(pk=anchor.pk)
+    restored_guest_anchor = Device.objects.get(pk=guest_anchor.pk)
     if (
         snapshot_inventory(restored_anchor) != anchor_before
         or restored_anchor._custom_field_data != anchor_custom
         or list(RelationshipAssociation.objects.order_by("pk").values()) != relationships_before
+        or list(Relationship.objects.order_by("pk").values()) != relationship_definitions_before
+        or snapshot_inventory(restored_guest_anchor) != guest_anchor_before
+        or restored_guest_anchor._custom_field_data != guest_anchor_custom
     ):
         raise AssertionError("Live validation changed the anchor or existing native relationships")
     if report_path:
@@ -333,6 +444,8 @@ if __name__ == "__main__":
                 report_path=os.environ.get("NAUTOBOT_PROXMOX_REPORT_PATH"),
                 verify_tls=tls_setting == "true",
                 port=int(os.environ.get("NAUTOBOT_PROXMOX_PORT", "8006")),
+                guest_vm_uuids=json.loads(os.environ.get("NAUTOBOT_PROXMOX_GUEST_VM_UUIDS", "[]")),
+                guest_anchor_device_id=os.environ.get("NAUTOBOT_PROXMOX_GUEST_ANCHOR_DEVICE_ID"),
             ),
             indent=2,
             sort_keys=True,

@@ -15,7 +15,7 @@ import re
 import socket
 
 out = {"hostname": socket.gethostname(), "dmi": {}, "net": [], "pci": [],
-       "errors": [], "unavailable": []}
+       "guest_registry": None, "errors": [], "unavailable": []}
 read_count = 0
 
 def read(path):
@@ -37,6 +37,29 @@ def read(path):
             out["errors"].append({"path": path, "error": type(error).__name__})
         return None
 
+def unique_object(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+def invalid_constant(value):
+    raise ValueError("non-finite JSON constant")
+
+def read_registry():
+    global read_count
+    read_count += 1
+    if read_count > 65536:
+        raise ValueError("attribute read budget exceeded")
+    with open("/etc/pve/.vmlist", "rb") as stream:
+        raw = stream.read(4 * 1024 * 1024 + 1)
+    if len(raw) > 4 * 1024 * 1024:
+        raise ValueError("guest registry size budget exceeded")
+    return json.loads(raw.decode("utf-8", errors="strict"),
+                      object_pairs_hook=unique_object, parse_constant=invalid_constant)
+
 def paths(pattern):
     values = sorted(glob.glob(pattern))
     if len(values) > 4096:
@@ -47,7 +70,8 @@ def link(path):
     return os.path.realpath(path) if os.path.islink(path) else None
 
 try:
-    for field in ("sys_vendor", "product_name", "product_version", "product_serial",
+    out["guest_registry"] = read_registry()
+    for field in ("sys_vendor", "product_name", "product_version", "product_sku", "product_serial",
                   "product_uuid", "chassis_vendor", "chassis_type", "chassis_serial",
                   "board_vendor", "board_name", "board_serial"):
         out["dmi"][field] = read("/sys/class/dmi/id/" + field)
@@ -63,6 +87,9 @@ try:
             row[field] = read(path + "/" + field)
         out["pci"].append(row)
     for path in paths("/sys/class/net/*"):
+        # bonding_masters is a class control file, not a netdevice directory.
+        if not os.path.isdir(path):
+            continue
         name = os.path.basename(path)
         if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", name):
             raise ValueError("invalid netdevice identifier")

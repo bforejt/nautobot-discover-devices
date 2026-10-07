@@ -18,6 +18,7 @@ INTERFACE_CONTRACT = "proxmox-pnic-v1"
 _NODE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})")
 _IFACE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,14}")
 _PCI = re.compile(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]")
+_REPRESENTOR_PORT = re.compile(r"(?:c[0-9]+)?(?:p[0-9]+)?pf[0-9]+(?:(?:vf|sf)[0-9]+)?")
 _UUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 _MAC = re.compile(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}")
 _RELEASE = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[0-9]+)?")
@@ -264,6 +265,7 @@ _DMI = _fields(
     "sys_vendor",
     "product_name",
     "product_version",
+    "product_sku",
     "product_serial",
     "chassis_vendor",
     "chassis_type",
@@ -343,6 +345,7 @@ _HARDWARE_CONFIG = _fields(
     "enabledcores",
     "threads",
     "uuid",
+    "sku",
     "chassis",
 )
 _HARDWARE_CAPS = _fields(
@@ -681,6 +684,43 @@ def _permissions(value):
     return result
 
 
+def _guest_registry(value):
+    """Keep pmxcfs's authoritative native JSON guest registrations, including peers.
+
+    status.c cfs_create_vmlist_msg deliberately omits ids when the registry is
+    empty. Required version evidence distinguishes that state from missing data.
+    """
+    if (
+        not isinstance(value, dict)
+        or type(value.get("version")) is not int
+        or not 0 <= value["version"] <= (1 << 32) - 1
+    ):
+        raise DiscoveryError("Proxmox authoritative guest registry is missing or malformed")
+    result = {"version": value["version"]}
+    if "ids" not in value:
+        return result
+    ids = value["ids"]
+    if not isinstance(ids, dict) or len(ids) > 65535:
+        raise DiscoveryError("Proxmox authoritative guest registry exceeds its object budget")
+    result["ids"] = {}
+    for vmid, row in ids.items():
+        if (
+            not isinstance(vmid, str)
+            or re.fullmatch(r"[1-9][0-9]{2,8}", vmid) is None
+            or not isinstance(row, dict)
+            or row.get("type") not in {"qemu", "lxc"}
+            or not isinstance(row.get("node"), str)
+            or _NODE.fullmatch(row["node"]) is None
+            or type(row.get("version")) is not int
+            or not 0 <= row["version"] <= (1 << 32) - 1
+        ):
+            raise DiscoveryError(
+                "Proxmox authoritative guest registry has invalid registration identities"
+            )
+        result["ids"][vmid] = {key: row[key] for key in ("node", "type", "version")}
+    return result
+
+
 def _sanitize(inventory):
     if (
         not isinstance(inventory, dict)
@@ -743,6 +783,7 @@ def _sanitize(inventory):
             "unavailable": [_fields("path", "errno")],
         },
     )
+    safe_host["guest_registry"] = _guest_registry(host.get("guest_registry"))
     safe_ssh = {
         "host": safe_host,
         "hardware": _hardware(ssh.get("hardware")),
@@ -782,10 +823,15 @@ def _sanitize(inventory):
         "api": safe_api,
         "ssh": safe_ssh,
         "guests": sorted(guests, key=lambda row: (row["kind"], row["vmid"])),
-        "completeness": _select(
-            complete,
-            _fields("host", "interfaces", "network", "guests", "storage", "permission_scoped"),
-        ),
+        "completeness": {
+            **_select(
+                complete,
+                _fields("host", "interfaces", "network", "guests", "storage", "permission_scoped"),
+            ),
+            # /network filters bridges by separate SDN grants even when GET
+            # succeeds. Complete Linux reads do not prove API table coverage.
+            "network_configuration": "permission-scoped",
+        },
     }
 
 
@@ -831,6 +877,23 @@ def _corroborate(first, second, label, canonical=_identity):
     return first if first is not None else second
 
 
+def _host_model(dmi, system):
+    """Corroborate lshw's exact SMBIOS SKU decoration with named source evidence.
+
+    lshw src/core/dmi.cc appends " (" + configuration.sku + ")" to the
+    SMBIOS product. Preserve both original source values; the DMI product_name
+    remains the native model, and arbitrary suffixes are never stripped.
+    """
+    model, hardware_model = _identity(dmi.get("product_name")), _identity(system.get("product"))
+    sku = _corroborate(
+        dmi.get("product_sku"), (system.get("configuration") or {}).get("sku"), "system SKU"
+    )
+    if model is not None and hardware_model is not None and hardware_model != model:
+        if sku is None or hardware_model != model + " (" + sku + ")":
+            raise DiscoveryError("Proxmox source has conflicting host model evidence")
+    return model if model is not None else hardware_model
+
+
 def _host_identity(inventory):
     node, api, ssh = inventory["node"], inventory["api"], inventory["ssh"]
     if _local_node(api["cluster_status"]) != node or ssh["host"].get("hostname") != node:
@@ -852,7 +915,7 @@ def _host_identity(inventory):
     if other_uuid is not None and other_uuid != host_uuid:
         raise DiscoveryError("Proxmox lshw and DMI UUID evidence disagree")
     vendor = _corroborate(dmi.get("sys_vendor"), system.get("vendor"), "manufacturer")
-    model = _corroborate(dmi.get("product_name"), system.get("product"), "host model")
+    model = _host_model(dmi, system)
     serial = _corroborate(dmi.get("product_serial"), system.get("serial"), "system serial")
     serial = _corroborate(serial, dmi.get("chassis_serial"), "chassis serial")
     for field in ("version", "release", "repoid"):
@@ -905,6 +968,12 @@ def _mac(value):
         if value in {"00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"} or int(value[:2], 16) & 1
         else value
     )
+
+
+def _affirmative_hardware_capability(value):
+    # lshw hw.cc serializes an affirmative capability as True or its nonempty
+    # description. The named key is evidence; never parse translated prose.
+    return value is True or (isinstance(value, str) and _text(value) is not None)
 
 
 def _interfaces(inventory):
@@ -976,6 +1045,19 @@ def _interfaces(inventory):
             ):
                 reason = "wireless or unresolved wireless classification"
             elif (
+                kernel.get("phys_switch_id") is not None
+                and (
+                    not isinstance(kernel["phys_switch_id"], str)
+                    or bool(kernel["phys_switch_id"].strip())
+                )
+            ) or (
+                isinstance(kernel.get("phys_port_name"), str)
+                and _REPRESENTOR_PORT.fullmatch(kernel["phys_port_name"]) is not None
+            ):
+                # A switch function/representor can expose the PF's PCI parent
+                # and driver without representing a physical Ethernet socket.
+                reason = "unreviewed switch port or network function representor"
+            elif (
                 driver in _VIRTUAL_DRIVERS
                 or (_hex(function.get("vendor")), _hex(function.get("device"))) in _VIRTUAL_PCI
             ):
@@ -984,7 +1066,7 @@ def _interfaces(inventory):
                 _hex(function.get("class")) != 0x020000
                 or link.get("link_type") != "ether"
                 or _integer(kernel.get("type"), 1, 1) != 1
-                or capability.get("ethernet") is not True
+                or not _affirmative_hardware_capability(capability.get("ethernet"))
             ):
                 reason = "unproven physical Ethernet hardware"
             elif (link.get("linkinfo") or {}).get("info_kind") is not None:
@@ -1126,11 +1208,19 @@ def _validate_guests(inventory):
             raise DiscoveryError("Proxmox guest detail disagrees with its local registration")
         if "VM.Audit" not in inventory["api"]["permissions"].get("/vms/%s" % row["vmid"], {}):
             raise DiscoveryError("Proxmox guest lacks exact VM.Audit permission proof")
-    if (
-        inventory["completeness"].get("guests") is True
-        and inventory["api"]["permissions"].get("/vms", {}).get("VM.Audit") != 1
-    ):
-        raise DiscoveryError("Proxmox complete guest view lacks propagating VM.Audit proof")
+    local_registry = {
+        (row["type"], int(vmid))
+        for vmid, row in inventory["ssh"]["host"]["guest_registry"].get("ids", {}).items()
+        if row["node"] == inventory["node"]
+    }
+    if keys != local_registry:
+        raise DiscoveryError(
+            "Proxmox API guest visibility disagrees with authoritative local registrations"
+        )
+    if inventory["completeness"].get("guests") is not True:
+        raise DiscoveryError(
+            "Proxmox complete guest view lacks authoritative local registration proof"
+        )
 
 
 def _build(inventory, expected_node=None, expected_host_uuid=None):
@@ -1192,6 +1282,7 @@ def _build(inventory, expected_node=None, expected_host_uuid=None):
                 "live_addresses": copy.deepcopy(inventory["ssh"]["addresses"]),
                 "bridge_vlans": copy.deepcopy(inventory["ssh"]["bridge_vlans"]),
                 "configuration": copy.deepcopy(inventory["api"]["node_network"]),
+                "configuration_visibility": inventory["completeness"]["network_configuration"],
                 "pending_changes_present": inventory["api"]["node_network_changes"],
                 "configuration_state": (
                     "API configuration may include staged changes; Linux netlink is current runtime"
@@ -1296,7 +1387,10 @@ def _read(client):
             "host": True,
             "interfaces": True,
             "network": True,
-            "guests": True if perms["/vms"].get("VM.Audit") == 1 else "permission-scoped",
+            "network_configuration": "permission-scoped",
+            # Validated against the independent pmxcfs JSON registry before
+            # normalization. A propagating parent ACL can hide descendant denies.
+            "guests": True,
             "storage": "permission-scoped",
             "permission_scoped": True,
         },

@@ -1,5 +1,5 @@
 The IOS XE fixtures are reduced, sanitized RESTCONF JSON; the PAN-OS XML
-fixtures are described at the end of this document.
+and synthetic wireless fixtures are described below.
 
 The 71 interface names and presence states preserve the useful shape of the
 `iosxe_interfaces_oper_lab.json` fixture in `/opt/stacks/nautobot-testsuite`:
@@ -148,3 +148,19 @@ construct malformed membership, unsupported names, missing flags and parent
 evidence, generated/anycast and duplicate cases. Synthetic expansions are
 parser/planner checks, not live deployment evidence. The
 [IPAM contract](../../docs/panos-ipam-discovery.md) defines native eligibility.
+
+The nine `wlc_*.json` fixtures are copied unchanged from `nautobot-testsuite`
+commit `7a2bc1638fe23c5ac23fb9d718f5dc9b79eb4fb9` (Apache-2.0). They are synthetic
+examples shaped after the published IOS XE 17.12.1 wireless models, not captured
+live-controller evidence. They contain three current APs, a separate historical
+unjoined AP, explicit WTP/Ethernet MAC mappings, Ethernet observations, CDP/LLDP
+attachments, radios and configured tags. Exact software builds are retained.
+
+The original examples also preserve known schema differences: Ethernet rows use
+base WTP MACs although the published key describes Ethernet interface MACs; CDP
+`mac-addr` describes a radio MAC; duplex examples are textual although the model
+uses uint32. Tests exercise these differences without silently correcting the
+fixtures or turning them into native facts. Missing, unsupported and contradictory
+evidence remains unknown. Source hostname and advertised module inventory used
+by offline tests are synthetic in-memory responses. See the [9800 contract and
+field feedback procedure](../../docs/catalyst-9800-discovery.md).

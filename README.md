@@ -81,6 +81,20 @@ equal inventory snapshots before and after.
 The switching, speed, and connector increment is described below; these recorded
 worker results cover the earlier interface and serialized-component increments.
 
+## Catalyst 9800 managed AP discovery
+
+Controller and WAP inputs now use the native Controller/group relationship to
+discover the **entire current AP roster across sites**. Eligible new APs can be
+created, and proven AP locations and exact running software builds can replace
+existing values. APs need no direct credentials or connectivity. Missing source
+relationships stop before device connections; explicit admission and Location
+UUID rules control onboarding. See the [9800 contract and field feedback
+procedure](docs/catalyst-9800-discovery.md).
+
+Wireless payload fixtures are synthetic. This increment uses offline and native
+rollback validation, with actual controller-release behavior to be verified
+through field feedback. It does not claim direct 9800 lab results or HA support.
+
 ## Install and run
 
 The lab development copy is installed and enabled as **Device Discovery →
@@ -130,7 +144,11 @@ The job form contains these inputs:
 
 | Input | Default | Behavior |
 | --- | --- | --- |
-| Device | Required | Existing Device to verify and enrich |
+| Device | Required unless a logical Controller is selected | Existing Device, 9800 controller, or WAP seed |
+| 9800 logical Controller UUID | Blank | Existing native Controller; a WAP seed must resolve to the same configured Controller |
+| 9800 endpoint identity policy | Blank | JSON source binding; CL requires an explicit expected hostname |
+| 9800 AP admission and placement policy | Blank | Explicit catalogs, managed group, naming and existing Location UUID mappings for the full roster |
+| 9800 AP roster limit | 10000 | Exceeding the limit fails collection without applying a partial roster |
 | Dry run | Enabled | Collect, compare, and validate without inventory writes |
 | Verify TLS | Enabled | Verify the device HTTPS certificate |
 | RESTCONF port | 443 | Cisco HTTPS port |

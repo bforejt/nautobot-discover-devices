@@ -5,6 +5,7 @@ with verified TLS by default, redirect rejection, and sanitized diagnostics.
 """
 
 import ipaddress
+import json
 import re
 import ssl
 import time
@@ -19,9 +20,10 @@ from urllib3.exceptions import InsecureRequestWarning
 class RestconfError(RuntimeError):
     """An operator-safe transport failure, including an optional HTTP status."""
 
-    def __init__(self, message, status_code=None):
+    def __init__(self, message, status_code=None, *, filter_rejected=False):
         super().__init__(message)
         self.status_code = status_code
+        self.filter_rejected = filter_rejected
 
 
 class _LegacyTlsAdapter(HTTPAdapter):
@@ -55,11 +57,16 @@ def _host_for_url(host):
 class RestconfClient:
     """One device session; no method can change the remote device."""
 
-    def __init__(self, host, username, password, *, port=443, verify=True):
+    def __init__(self, host, username, password, *, port=443, verify=True, max_response_bytes=None):
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError("RESTCONF port must be between 1 and 65535")
         if not isinstance(verify, bool):
             raise ValueError("TLS verification must be a boolean")
+        if max_response_bytes is not None and (
+            type(max_response_bytes) is not int or not 1 <= max_response_bytes <= 128 * 1024 * 1024
+        ):
+            raise ValueError("RESTCONF response budget must be between 1 and 134217728 bytes")
+        self.max_response_bytes = max_response_bytes
         self.host = str(host)
         self.base = "https://%s:%s/restconf" % (_host_for_url(host), port)
         self.verify = verify
@@ -96,11 +103,13 @@ class RestconfClient:
             with warnings.catch_warnings():
                 if not self.verify:
                     warnings.simplefilter("ignore", InsecureRequestWarning)
+                options = {"stream": True} if self.max_response_bytes is not None else {}
                 response = self.session.get(
                     self.base + path,
                     verify=self.verify,
                     timeout=(10, timeout),
                     allow_redirects=False,
+                    **options,
                 )
             record["status"] = response.status_code
             return response, record
@@ -144,18 +153,83 @@ class RestconfClient:
                 raise RestconfError("GET %s: TLS handshake failed" % path) from None
         status = response.status_code
         if status == 404 and ok_404:
+            if self.max_response_bytes is not None:
+                response.close()
             return None
         if not 200 <= status < 300:
             record["error"] = "HTTP %s" % status
-            raise RestconfError("GET %s: HTTP %s" % (path, status), status_code=status)
-        if status == 204 or not response.content:
+            rejected = False
+            if status == 400 and "fields=" in parsed.query:
+                try:
+                    rejected = _filter_rejected(self._json_response(response, record))
+                except RestconfError:
+                    pass
+            elif self.max_response_bytes is not None:
+                response.close()
+            raise RestconfError(
+                "GET %s: HTTP %s" % (path, status),
+                status_code=status,
+                filter_rejected=rejected,
+            )
+        if status == 204:
+            if self.max_response_bytes is not None:
+                response.close()
             return {}
-        try:
-            payload = response.json()
-        except ValueError:
-            record["error"] = "Invalid JSON response"
-            raise RestconfError("GET %s: response is not JSON" % path, status_code=status) from None
+        payload = self._json_response(response, record)
         if not isinstance(payload, dict):
             record["error"] = "JSON object required"
             raise RestconfError("GET %s: JSON object required" % path, status_code=status)
         return payload
+
+    def _json_response(self, response, record):
+        """Bound streamed fleet responses before decoding, retaining no raw diagnostics."""
+        try:
+            if self.max_response_bytes is None:
+                return response.json() if response.content else {}
+            body = bytearray()
+            started = time.monotonic()
+            try:
+                for chunk in response.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    if len(body) + len(chunk) > self.max_response_bytes:
+                        record["error"] = "Response byte budget exceeded"
+                        raise RestconfError(
+                            "GET %s: response exceeds the configured byte budget; "
+                            "no complete inventory was collected" % record["path"]
+                        )
+                    body.extend(chunk)
+                record["response_bytes"] = len(body)
+                return json.loads(body) if body else {}
+            finally:
+                response.close()
+                record["elapsed_ms"] += int((time.monotonic() - started) * 1000)
+        except ValueError:
+            record["error"] = "Invalid JSON response"
+            raise RestconfError(
+                "GET %s: response is not JSON" % record["path"],
+                status_code=response.status_code,
+            ) from None
+        except requests.RequestException:
+            record["error"] = "Response stream failed"
+            raise RestconfError("GET %s: response stream failed" % record["path"]) from None
+
+
+def _filter_rejected(payload):
+    """Recognize an explicit RFC 8040 fields rejection without exporting error bodies."""
+    if not isinstance(payload, dict):
+        return False
+    errors = payload.get("ietf-restconf:errors", payload.get("errors"))
+    rows = errors.get("error") if isinstance(errors, dict) else None
+    if not isinstance(rows, list):
+        return False
+    return any(
+        isinstance(row, dict)
+        and row.get("error-tag") in ("invalid-value", "unknown-element", "operation-not-supported")
+        and re.search(
+            r"\b(?:fields|filter)\b",
+            str(row.get("error-message", "")) + " " + str(row.get("error-path", "")),
+            re.IGNORECASE,
+        )
+        for row in rows
+    )

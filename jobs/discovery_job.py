@@ -8,7 +8,7 @@ from nautobot.dcim.models import Device, Location
 from nautobot.extras.models import SecretsGroup, Status
 from nautobot.ipam.models import Namespace, VLANGroup
 
-from .adapters import cisco_iosxe, esxi, panos, proxmox
+from .adapters import cisco_9800, cisco_iosxe, esxi, panos, proxmox
 from .adapters.panos_management import normalize_management_policy
 from .credentials import CredentialsError, resolve_credentials
 from .esxi_guest_policy import normalize_esxi_guest_policy
@@ -25,7 +25,15 @@ from .transport_restconf import RestconfClient, RestconfError
 from .transport_ssh import PanosSshClient, SshError
 
 name = "Device Discovery"
-JOB_VERSION = "0.25.0-dev"
+JOB_VERSION = "0.26.0-dev"
+
+
+def _controller_source(device, *, controller_id=None, source_policy=None):
+    from .controller_sources import resolve_controller_source
+
+    return resolve_controller_source(
+        device, controller_id=controller_id, source_policy=source_policy
+    )
 
 
 def _resolve_panos_ipam_target(kind, identifier, namespace_id):
@@ -186,7 +194,50 @@ def _prefix_location(device, selected):
 
 
 class DiscoverDevice(Job):
-    device = ObjectVar(model=Device, description="Existing Device to verify and enrich.")
+    device = ObjectVar(
+        model=Device,
+        required=False,
+        description=(
+            "Existing Device, controller or WAP. A WAP selects its configured controller's "
+            "entire current AP roster, including other sites. Select a Device or logical "
+            "9800 Controller UUID."
+        ),
+    )
+    wireless_controller = TextVar(
+        required=False,
+        default="",
+        label="9800 logical Controller UUID",
+        description=(
+            "Existing native Controller UUID. Optional for an unambiguously linked controller "
+            "Device or WAP. A WAP and explicit Controller must resolve to the same source."
+        ),
+    )
+    wireless_source_policy = TextVar(
+        required=False,
+        default="",
+        label="9800 endpoint identity policy",
+        description=(
+            'JSON source binding; C9800-CL requires {"expected_hostname":"configured-wlc"}. '
+            "Physical sources require their controller Device's exact model and serial."
+        ),
+    )
+    wireless_policy = TextVar(
+        required=False,
+        default="",
+        label="9800 AP admission and placement policy",
+        description=(
+            "Explicit JSON catalog selections and Location UUID mappings for the full roster. "
+            "Eligible APs can be created and proven locations/software replaced. Missing "
+            "admission values defer new APs; see the 9800 discovery contract."
+        ),
+    )
+    wireless_max_aps = IntegerVar(
+        default=10000,
+        min_value=1,
+        max_value=10000,
+        label="9800 AP roster limit",
+        description="Exceeding this limit fails collection; partial rosters are never applied.",
+    )
     dryrun = DryRunVar(description="Preview changes without updating device inventory.")
     use_ntc_defaults = BooleanVar(
         label="Use NTC defaults when guessing",
@@ -467,6 +518,9 @@ class DiscoverDevice(Job):
     class Meta:
         name = "Discover Device"
         description = (
+            "9800 controller or WAP inputs discover the entire configured controller AP "
+            "roster across sites, creating eligible APs and updating proven AP locations "
+            "and running software. WAPs are never contacted directly. "
             "Verify Cisco IOS XE, PAN-OS, standalone ESXi or Proxmox identity and fill supported "
             "interfaces. "
             "ESXi and Proxmox can link explicitly selected existing NFV Devices through Hosted On; "
@@ -484,6 +538,10 @@ class DiscoverDevice(Job):
         time_limit = 660
         field_order = (
             "device",
+            "wireless_controller",
+            "wireless_source_policy",
+            "wireless_policy",
+            "wireless_max_aps",
             "dryrun",
             "use_ntc_defaults",
             "verify_tls",
@@ -525,7 +583,7 @@ class DiscoverDevice(Job):
 
     def run(
         self,
-        device,
+        device=None,
         dryrun=True,
         verify_tls=True,
         restconf_port=443,
@@ -563,12 +621,16 @@ class DiscoverDevice(Job):
         expected_proxmox_host_uuid="",
         proxmox_ssh_host_key="",
         proxmox_guest_mappings="",
+        wireless_controller="",
+        wireless_source_policy="",
+        wireless_policy="",
+        wireless_max_aps=10000,
     ):
-        device = Device.objects.get(pk=device.pk)
+        device = Device.objects.get(pk=device.pk) if device is not None else None
         report = {
             "schema_version": 1,
             "job_version": JOB_VERSION,
-            "device_id": str(device.pk),
+            "device_id": str(device.pk) if device is not None else None,
             "dry_run": dryrun,
             "use_ntc_defaults": use_ntc_defaults,
             "verify_tls": verify_tls,
@@ -581,9 +643,34 @@ class DiscoverDevice(Job):
             "vlan_group_name": vlan_group.name if vlan_group else None,
         }
         self.logger.info(
-            "Starting %s for %s.", "discovery preview" if dryrun else "discovery", device.name
+            "Starting %s for %s.",
+            "discovery preview" if dryrun else "discovery",
+            device.name if device is not None else wireless_controller,
         )
         try:
+            source = _controller_source(
+                device,
+                controller_id=wireless_controller or None,
+                source_policy=wireless_source_policy or None,
+            )
+            if source is not None:
+                self._run_wireless(
+                    source,
+                    report,
+                    wireless_policy,
+                    dryrun=dryrun,
+                    verify_tls=verify_tls,
+                    restconf_port=restconf_port,
+                    secrets_group=secrets_group,
+                    interface_status=interface_status,
+                    software_version_status=software_version_status,
+                    max_aps=wireless_max_aps,
+                )
+                return
+            if device is None:
+                raise ValueError("Select an existing Device or native 9800 Controller UUID")
+            if wireless_policy or wireless_source_policy or wireless_controller:
+                raise ValueError("9800 policies require a configured native wireless Controller")
             adapter = _adapter(device)
             if adapter in (esxi, proxmox):
                 if any(
@@ -1004,6 +1091,7 @@ class DiscoverDevice(Job):
                     SshError,
                     CredentialsError,
                     cisco_iosxe.DiscoveryError,
+                    cisco_9800.DiscoveryError,
                     panos.DiscoveryError,
                     InventoryError,
                 ),
@@ -1023,6 +1111,152 @@ class DiscoverDevice(Job):
                 "discovery_report": report,
             }
             self._attach_report(report)
+
+    def _run_wireless(
+        self,
+        source,
+        report,
+        policy_value,
+        *,
+        dryrun,
+        verify_tls,
+        restconf_port,
+        secrets_group,
+        interface_status,
+        software_version_status,
+        max_aps,
+    ):
+        from .nautobot_wireless import (
+            apply_wireless_discovery,
+            resolve_wireless_target,
+            snapshot_wireless_inventory,
+            validate_wireless_plan,
+        )
+        from .reconcile_wireless import build_wireless_plan
+        from .wireless_policy import normalize_wireless_policy
+
+        if type(dryrun) is not bool:
+            raise ValueError("Dry run must be true or false")
+        if type(verify_tls) is not bool:
+            raise ValueError("Verify HTTPS certificate must be true or false")
+        if type(restconf_port) is not int or not 1 <= restconf_port <= 65535:
+            raise ValueError("RESTCONF port must be between 1 and 65535")
+        if type(max_aps) is not int or not 1 <= max_aps <= 10000:
+            raise ValueError("9800 AP roster limit must be between 1 and 10000")
+        policy = normalize_wireless_policy(
+            policy_value, resolve_wireless_target, controller_id=source["controller_id"]
+        )
+        report.update(
+            controller_id=source["controller_id"],
+            transport="restconf",
+            wireless_policy=policy,
+            source_binding=source["source_snapshot"],
+            wireless_max_aps=max_aps,
+            max_response_bytes=32 * 1024 * 1024,
+            field_validation="pending-controller-feedback",
+        )
+        self.logger.info(
+            "Discovering the complete AP roster of controller %s, including other sites. "
+            "The selected WAP, group and controller Location do not restrict the roster.",
+            source["controller_id"],
+        )
+        username, password = resolve_credentials(
+            source["credential_device"],
+            override_group=secrets_group or source.get("secrets_group"),
+        )
+        client = RestconfClient(
+            source["host"],
+            username,
+            password,
+            port=source.get("port") or restconf_port,
+            verify=verify_tls,
+            max_response_bytes=32 * 1024 * 1024,
+        )
+        try:
+            discovery = cisco_9800.collect(
+                client,
+                controller_id=source["controller_id"],
+                source_policy=source["source_policy"],
+                max_aps=max_aps,
+            )
+            discovery["source_binding"] = source["source_snapshot"]
+            report["discovery"] = discovery
+        finally:
+            try:
+                client.close()
+            finally:
+                report["requests"] = client.trace
+        plan = build_wireless_plan(
+            discovery, snapshot_wireless_inventory(discovery, policy), policy
+        )
+        report["plan"] = plan
+        validate_wireless_plan(
+            plan,
+            interface_status=interface_status,
+            software_version_status=software_version_status,
+        )
+        if not dryrun:
+
+            def record_progress(progress):
+                report["plan"] = progress
+                report["batch_outcome"] = "incomplete"
+                report["applied"] = bool(
+                    progress["summary"].get("created") or progress["summary"].get("updated")
+                )
+
+            report["plan"] = apply_wireless_discovery(
+                discovery,
+                policy,
+                interface_status=interface_status,
+                software_version_status=software_version_status,
+                progress_callback=record_progress,
+            )
+            report["applied"] = True
+        report["batch_outcome"] = (
+            "preview"
+            if dryrun
+            else "mixed"
+            if report["plan"].get("partial")
+            or any(row.get("outcome") in {"failed", "unresolved"} for row in report["plan"]["aps"])
+            else "applied"
+        )
+        self._log_wireless_plan(report["plan"], dryrun=dryrun)
+        self.logger.info(
+            "Full-controller %s complete. Per-AP proposals, evidence and outcomes are "
+            "available under Advanced and in the report download.",
+            "preview" if dryrun else "discovery",
+        )
+
+    def _log_wireless_plan(self, plan, *, dryrun):
+        summary = plan.get("summary", {})
+        counters = (
+            ("created", "AP Devices"),
+            ("location_updates", "AP locations"),
+            ("software_updates", "AP software assignments"),
+            ("interface_creates", "AP interfaces"),
+            ("interface_updates", "AP interfaces"),
+        )
+        for key, noun in counters:
+            if summary.get(key):
+                self.logger.info(
+                    "%s %s %s.", "Would change" if dryrun else "Changed", summary[key], noun
+                )
+        unresolved = sum(bool(row.get("errors") or row.get("unresolved")) for row in plan["aps"])
+        if unresolved:
+            self.logger.warning(
+                "%s AP candidates have unresolved proposals; independent eligible APs remain "
+                "eligible. Review reasons under Advanced.",
+                unresolved,
+            )
+        failed = sum(row.get("outcome") == "failed" for row in plan["aps"])
+        if failed:
+            self.logger.warning(
+                "%s AP proposals failed; review per-AP reasons and %s outcomes.",
+                failed,
+                "preview" if dryrun else "mixed batch",
+            )
+        if not any(summary.get(key, 0) for key, _ in counters):
+            self.logger.info("No eligible AP inventory changes are needed.")
 
     def _log_plan(self, plan, dryrun):
         summary = plan["summary"]
@@ -1437,7 +1671,8 @@ class DiscoverDevice(Job):
     def _attach_report(self, report):
         try:
             self.create_file(
-                "discovery_%s.json" % report["device_id"],
+                "discovery_%s.json"
+                % (report["device_id"] or report.get("controller_id", "source")),
                 json.dumps(report, indent=2, sort_keys=True),
             )
         except Exception:
